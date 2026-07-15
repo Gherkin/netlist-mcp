@@ -1,9 +1,10 @@
 use core::fmt;
 use std::collections::HashMap;
 
-pub struct NetList {
-    components: Vec<Component>,
-    nets: Vec<Net>
+#[derive(Debug)]
+pub struct Netlist {
+    pub components: Vec<Component>,
+    pub nets: Vec<Net>
 }
 
 #[derive(Debug)]

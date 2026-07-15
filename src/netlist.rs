@@ -1,3 +1,4 @@
+use core::fmt;
 use std::collections::HashMap;
 
 pub struct NetList {
@@ -28,15 +29,17 @@ impl Component {
 
 #[derive(Debug)]
 pub struct Pin {
-    pub name: String,
+    pub number: String,
+    pub name: Option<String>,
     pub net: Option<Box<Net>>
 }
 
 impl Pin {
     pub fn new() -> Pin {
         return Pin {
-            name: String::new(),
-            net: Option::None
+            number: String::new(),
+            name: None,
+            net: None
         };
     }
 }

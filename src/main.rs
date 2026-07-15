@@ -1,14 +1,17 @@
+use std::any;
 use std::collections::HashMap;
 use std::env;
+use std::fmt::Display;
 use std::fs;
 use std::error::Error;
 use std::path::Path;
 
 mod netlist;
+use anyhow::{Context, ensure};
 use netlist::Component;
 
-use crate::NetListElem::NodeElem;
-use crate::Symbol::Unit;
+use anyhow::bail;
+
 
 #[derive(Debug)]
 #[derive(PartialEq)]
@@ -74,125 +77,165 @@ enum Symbol {
 #[derive(Debug)]
 #[derive(PartialEq)]
 enum NetListNode {
-    SingleNode(NetListElem),
-    DoubleNode(NetListElem, NetListElem),
-    ListNode(NetListElem, Vec<NetListElem>)
+    Symbol(Symbol),
+    Value(String),
+    List(Vec<NetListNode>)
 }
 
-#[derive(Debug)]
-#[derive(PartialEq)]
-enum NetListElem {
-    SymbolElem(Symbol),
-    NodeElem(Box<NetListNode>),
-    None
-} 
+impl NetListNode {
+    pub fn as_symbol(&self) -> anyhow::Result<&Symbol> {
+        match self {
+            NetListNode::Symbol(sym) => {
+                return Ok(sym);
+            }
+            _ => {
+                bail!("NetListNode is not a Symbol");
+            }
+        }
+    }
 
+    pub fn as_list(&self) -> anyhow::Result<&Vec<NetListNode>> {
+        match self {
+            NetListNode::List(list) => {
+                return Ok(list);
+            }
+            _ => {
+                bail!("NetListNode is not a List");
+            }
+        }
+    }
+
+    pub fn as_val(&self) -> anyhow::Result<&String> {
+        match self {
+            NetListNode::Value(val) => {
+                return Ok(val);
+            }
+            _ => {
+                bail!("NetListNode is not a Value");
+            }
+        }
+    }
+
+    pub fn key(&self) -> anyhow::Result<&Symbol> {
+        let NetListNode::List(list) = self else {
+            bail!("NetListNode is not a List");
+        };
+
+        let NetListNode::Symbol(sym) = &list[0] else {
+            bail!("First element on NetListNode::List is not a Symbol")
+        };
+
+        return Ok(sym);
+    }
+
+    pub fn list(&self) -> anyhow::Result<&[NetListNode]> {
+        let NetListNode::List(list) = self else {
+            bail!("NetListNode is not a List");
+        };
+
+        return list.get(1..).with_context(|| format!("List was too short with length {}", list.len()));
+
+    }
+    
+    pub fn get_child(&self, child: &Symbol) -> anyhow::Result<Vec<&NetListNode>> {
+        match self {
+            NetListNode::Symbol(sym) => {
+                if sym == child {
+                    return Ok(vec![self]);
+                };
+                bail!("NetListNode was leaf Symbol but was {:?} instead of {:?}", sym, child);
+            }
+            NetListNode::Value(_) => {
+                bail!("Leaf NetListNode was Value");
+            }
+            NetListNode::List(_) => {
+                let sym = self.key()?;
+
+                if sym == child {
+                    return Ok(vec![self]);
+                };
+
+                let result: Vec<&NetListNode> = self.list()?
+                    .into_iter()
+                    .map(|x| x.get_child(child))
+                    .filter_map(Result::ok)
+                    .flatten()
+                    .collect();
+
+                return Ok(result);
+            }
+        }
+
+    }
+
+    pub fn get_child_val(&self, child: &Symbol) -> anyhow::Result<Vec<&String>> {
+        let child_nodes = self.get_child(child)?;
+        let list: anyhow::Result<Vec<&String>> = child_nodes
+            .into_iter()
+            .map(|x| -> anyhow::Result<&String> {
+                let items = x.list()?;
+                let first = items.get(0).context("child node had no value")?;
+                first.as_val()
+            })
+            .collect();
+        
+        return list;
+    }
+
+}
 
 fn print_node(node: &NetListNode, depth: usize) {
     let indent = "  ".repeat(depth);
     match node {
-        NetListNode::SingleNode(a) => {
-            println!("{indent}Single:");
-            print_elem(a, depth + 1);
+        NetListNode::Symbol(a) => {
+            println!("{indent}{:?}", a);
         }
-        NetListNode::DoubleNode(a, b) => {
-            println!("{indent}Double:");
-            print_elem(a, depth + 1);
-            print_elem(b, depth + 1);
+        NetListNode::Value(a) => {
+            println!("{indent}\"{}\"", a);
         }
-        NetListNode::ListNode(a, rest) => {
-            println!("{indent}List:");
-            print_elem(a, depth + 1);
+        NetListNode::List(rest) => {
+            println!("{indent}[");
             for e in rest {
-                print_elem(e, depth + 1);
+                print_node(e, depth + 1);
             }
+            println!("{indent}]");
         }
     }
 }
 
-fn parse_component(node: &NetListNode) -> netlist::Component {
+fn parse_component(node: &NetListNode) -> anyhow::Result<netlist::Component> {
+    let sym = node.key()?;
+    ensure!(*sym == Symbol::Comp, "NetListNode passed was not Symbol::Comp but {sym:?}");
+
     let mut comp = netlist::Component::new();
+    comp.refdes = node.get_child_val(&Symbol::Ref)?.get(0)
+        .context("Comp Ref list was empty")?
+        .to_string();
+    comp.value = node.get_child_val(&Symbol::Value)?.get(0)
+        .context("Comp Value list was empty")?
+        .to_string();
+    comp.footprint = node.get_child_val(&Symbol::Footprint)?.get(0)
+        .context("Comp Footprint list was empty")?
+        .to_string();
 
-    print_node(node, 0);
-    let NetListNode::ListNode(key, list) = node else {
-        panic!("component wasnt list node!")
-    };
-    if *key != NetListElem::SymbolElem(Symbol::Comp) {
-        panic!("component node wasnt component!")
-    }
+    let pins: anyhow::Result<Vec<netlist::Pin>> = node.get_child(&Symbol::Pin)?
+        .into_iter()
+        .map(|x| -> anyhow::Result<netlist::Pin> {
+           Ok(netlist::Pin { 
+            number: x.get_child_val(&Symbol::Num)?
+                .get(0)
+                .with_context(|| format!("Pin {x:?} had no number"))?
+                .to_string(), 
+            name: x.get_child_val(&Symbol::Name)?
+                .get(0)
+                .map(|x| x.to_string()),
+            net: None
+        })})
+        .collect();
 
-    for elem in list {
-        let NetListElem::NodeElem(inner_node) = elem else { continue; };
-        match inner_node.as_ref() {
-            NetListNode::DoubleNode(key, val_elem) => {
-                let NetListElem::SymbolElem(sym) = key else { continue; };
+    comp.pins = pins?;
 
-                match val_elem {
-                    NetListElem::SymbolElem(val_sym) => {
-                        let NetListElem::SymbolElem(val_sym) = val_elem else { continue };
-                        let Symbol::Val(val) = val_sym else { continue };
-                        match sym {
-                            Symbol::Ref => {
-                                comp.refdes = val.clone();
-                            }
-                            Symbol::Value => {
-                                comp.value = val.clone();
-                            }
-                            Symbol::Footprint => {
-                                comp.footprint = val.clone();
-                            }
-                            other => ()
-                        }
-                    }
-                    NetListElem::NodeElem(val_node) => {
-                        let NetListNode::ListNode(_, unit_list) = val_node.as_ref() else { continue };
-                        let Symbol::Units = sym else { continue; }; 
-                        let mut pins: Vec<netlist::Pin> = Vec::new();
-                        for unit in unit_list {
-                            let NetListElem::NodeElem(unit_node) = unit else { continue; };
-                            let NetListNode::ListNode(_, pin_list) = unit_node.as_ref() else { continue; };
-                            for pin in pin_list {
-                                let NetListElem::NodeElem(pin_node) = pin else { continue; };
-                                let NetListNode::DoubleNode(pin_key, pin_val) = pin_node.as_ref() else { continue; };
-                                let NetListElem::SymbolElem(pin_sym) = pin_key else { continue; };
-                                let Symbol::Pin = pin_sym else { continue; };
-
-                                let NetListElem::NodeElem(pin_val_node) = pin_val else { continue; };
-                                let NetListNode::DoubleNode(_, pin_val_val_elem) = pin_val_node.as_ref() else { continue; };
-                                let NetListElem::SymbolElem(pin_val_val_sym) = pin_val_val_elem else { continue; };
-                                let Symbol::Val(actual_val) = pin_val_val_sym else { continue; };
-                                let mut pin = netlist::Pin::new();
-                                pin.name = actual_val.clone();
-                                pins.push(pin);
-
-
-                            }
-                        }
-                        comp.pins = pins;
-
-                    }
-                    other => ()
-                }
-            }
-            NetListNode::ListNode(key, list) => {
-                // TODO handle props
-                let NetListElem::SymbolElem(sym) = key else { continue; };
-
-            }
-            NetListNode::SingleNode(_) => { continue; }
-        }
-    }
-    println!("{:?}", comp);
-    return comp;
-}
-
-fn print_elem(elem: &NetListElem, depth: usize) {
-    let indent = "  ".repeat(depth);
-    match elem {
-        NetListElem::SymbolElem(sym) => println!("{indent}{:?}", sym),
-        NetListElem::NodeElem(boxed_node) => print_node(boxed_node, depth),
-        NetListElem::None => println!("{indent}None"),
-    }
+    return Ok(comp);
 }
 
 fn load_file<P: AsRef<Path>>(path: P) -> String {
@@ -289,45 +332,57 @@ fn scan_next(data: &mut &str) -> Option<Symbol> {
 }
 
 fn structurize(syms: &mut &[Symbol]) -> NetListNode {
-    if syms[0] != Symbol::ParenLeft {
-        println!("no left paren!");
-    }
+    let Symbol::ParenLeft = syms[0] else { 
+        panic!("no left paranthesis in structurize, misaligned")
+    };
+
     *syms = &syms[1..];
 
-    let key = match syms[0].clone() {
-        Symbol::ParenLeft => NetListElem::NodeElem(Box::new(structurize(syms))),
+    let key;
+    match syms[0].clone() {
+        Symbol::ParenLeft => {
+            panic!("two left paranthesis after each other in structurize!");
+        }
+        Symbol::ParenRight => {
+            panic!("empty node in structurize!");
+        }
+        Symbol::Val(v) => {
+            *syms = &syms[1..];
+            key = NetListNode::Value(v.clone());
+        }
         x => {
             *syms = &syms[1..];
-            NetListElem::SymbolElem(x)
+            key = NetListNode::Symbol(x.clone());
         },
     };
 
-    let mut val: Vec<NetListElem>= Vec::new();
+    let mut val: Vec<NetListNode> = Vec::new();
+    val.push(key);
     loop {
         let elem = match syms[0].clone() {
-            Symbol::ParenLeft => NetListElem::NodeElem(Box::new(structurize(syms))),
+            Symbol::ParenLeft => structurize(syms),
             Symbol::ParenRight => {
                 *syms = &syms[1..];
-                NetListElem::None
-            },
+                break;
+            }
+            Symbol ::Val(val) => {
+                *syms = &syms[1..];
+                NetListNode::Value(val)
+            }
             x => {
                 *syms = &syms[1..];
-                NetListElem::SymbolElem(x)
-            },
+                NetListNode::Symbol(x)
+            }
         };
-        if elem == NetListElem::None {
-            break;
-        }
         val.push(elem)
     }
 
-    if val.len() < 1 {
-        return NetListNode::SingleNode(key);
-    } else if val.len() == 1 {
-        return NetListNode::DoubleNode(key, val.remove(0));
+    if val.len() < 2 {
+        return val.pop().unwrap();
     } else {
-        return NetListNode::ListNode(key, val);
+        return NetListNode::List(val);
     }
+
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -347,38 +402,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             None => break,
         }
     }
-    println!("symbols: {}", syms.len());
     let mut slice: &[Symbol] = &syms;
     let nodetree : NetListNode = structurize(&mut slice);
     //print_node(&nodetree, 0);
 
-    let NetListNode::ListNode(_, list) = nodetree else {
-            print_node(&nodetree, 0);
-            panic!("Base node of kicad netlist wasnt list!");
-    };
-
-    for e in list {
-        let NetListElem::NodeElem(node) = e else {
-            continue;
-        };
-
-        let NetListNode::ListNode(key, comp_list) = *node else {
-            continue;
-        };
-
-        if key != NetListElem::SymbolElem(Symbol::Components) {
-            continue;
-        }
-
-        for comp_elem in comp_list {
-            let NetListElem::NodeElem(comp_node) = comp_elem else { break; };
-            parse_component(&comp_node);
-            break;
-        }
+    let comps = nodetree.get_child(&Symbol::Comp)?;
+    //print_node(comp_node, 0);
+    for comp_node in comps {
+        let comp = parse_component(comp_node)?;
+        println!();
+        println!("{:?}", comp);
 
     }
 
-    
 
     return Ok(());
 }

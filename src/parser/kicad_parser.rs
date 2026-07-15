@@ -1,7 +1,7 @@
 use anyhow::{Context, ensure};
 use anyhow::bail;
 
-use crate::netlist;
+use crate::parser::netlist;
 
 #[derive(Debug)]
 #[derive(PartialEq)]

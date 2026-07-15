@@ -3,8 +3,8 @@ use std::env;
 use std::path::Path;
 use std::fs;
 
-mod kicad_parser;
-mod netlist;
+mod parser;
+mod design;
 
 fn load_file<P: AsRef<Path>>(path: P) -> String {
     let mut data = fs::read_to_string(path).expect("this file should exist");
@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(())
     }
     let data = load_file(&args[1]);
-    let netlist = kicad_parser::parse_netlist(&data);
-    println!("{:?}", netlist);
+    let netlist = parser::kicad_parser::parse_netlist(&data)?;
+    let design = design::Design::from_netlist(netlist)?;
     return Ok(());
 }

@@ -12,6 +12,8 @@ use netlist::Component;
 
 use anyhow::bail;
 
+use crate::netlist::Pin;
+
 
 #[derive(Debug)]
 #[derive(PartialEq)]
@@ -47,6 +49,8 @@ enum Symbol {
     Units,
     Unit,
     Pins,
+    PinType,
+    PinFunction,
     Pin,
     LibSource,
     Libraries,
@@ -238,6 +242,58 @@ fn parse_component(node: &NetListNode) -> anyhow::Result<netlist::Component> {
     return Ok(comp);
 }
 
+fn parse_net(node: &NetListNode, comps: &mut Vec::<netlist::Component>) -> anyhow::Result<netlist::Net> {
+    let sym = node.key()?;
+    ensure!(*sym == Symbol::Net, "NetListNode passed was not Symbol::Comp but {sym:?}");
+
+    let code = node.get_child_val(&Symbol::Code)?
+        .get(0)
+        .context("Net Code list was empty")?
+        .to_string()
+        .parse::<usize>()?;
+
+    let name = node.get_child_val(&Symbol::Name)?
+        .get(0)
+        .context("Net Name list was empty")?
+        .to_string();
+
+    let net = netlist::Net {
+        code: code,
+        name: name
+    };
+
+
+    for node in node.get_child(&Symbol::Node)? {
+        let node_refdes = node.get_child_val(&Symbol::Ref)
+            .with_context(|| format!("Couldnt find refdes value of node {:?} on net {}", node, net.name))?
+            .get(0)
+            .with_context(|| format!("Net {} had a node with empty ref", net.name))?
+            .to_string();
+
+        let node_pin = node.get_child_val(&Symbol::Pin)
+            .with_context(|| format!("Couldnt find pin value of node {:?} on net {}", node, net.name))?
+            .get(0)
+            .with_context(|| format!("Net {} had a node with empty pin", net.name))?
+            .to_string();
+
+        let comp = comps.iter_mut()
+            .find(|x| x.refdes == node_refdes)
+            .with_context(|| format!("Node component {} in net {} has no corresponding component in component list", node_refdes, net.name))?;
+        
+        let pin = comp.pins
+            .iter_mut()
+            .find(|x| x.number == node_pin)
+            .with_context(|| format!("Node component {} pin {} in net {} has no corresponding pin in component list", node_refdes, node_pin, net.name))?;
+
+        pin.net = Some(net.code.clone());
+
+
+    }
+
+    return Ok(net);
+
+}
+
 fn load_file<P: AsRef<Path>>(path: P) -> String {
     let mut data = fs::read_to_string(path).expect("this file should exist");
     data.retain(|c| !c.is_whitespace());
@@ -290,7 +346,9 @@ fn scan_next(data: &mut &str) -> Option<Symbol> {
             "units" => Some(Symbol::Units),
             sub if sub == "unit" && &data[i..i + 1] != "s" => Some(Symbol::Unit),
             "pins" => Some(Symbol::Pins),
-            sub if sub == "pin" && &data[i..i + 1] != "s" => Some(Symbol::Pin),
+            "pintype" => Some(Symbol::PinType),
+            "pinfunction" => Some(Symbol::PinFunction),
+            sub if sub == "pin" && &data[i..i + 1] != "s" && &data[i..i + 1] != "t" && &data[i..i + 1] != "f" => Some(Symbol::Pin),
             "parts" => Some(Symbol::Parts),
             sub if sub == "part" && &data[i..i + 1] != "s" => Some(Symbol::Part),
             "nets" => Some(Symbol::Nets),
@@ -406,15 +464,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     let nodetree : NetListNode = structurize(&mut slice);
     //print_node(&nodetree, 0);
 
-    let comps = nodetree.get_child(&Symbol::Comp)?;
-    //print_node(comp_node, 0);
-    for comp_node in comps {
-        let comp = parse_component(comp_node)?;
-        println!();
-        println!("{:?}", comp);
+    let mut comps = nodetree.get_child(&Symbol::Comp)?
+        .into_iter()
+        .map(parse_component)
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
+    let nets = nodetree.get_child(&Symbol::Net)?
+        .into_iter()
+        .map(|n| parse_net(n, &mut comps)) 
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    for comp in &comps {
+        println!("{:?}", comp);
     }
 
-
+    for net in nets {
+        println!("{:?}", net);
+    }
     return Ok(());
 }

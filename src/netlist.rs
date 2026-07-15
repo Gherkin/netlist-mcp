@@ -31,7 +31,7 @@ impl Component {
 pub struct Pin {
     pub number: String,
     pub name: Option<String>,
-    pub net: Option<Box<Net>>
+    pub net: Option<usize>
 }
 
 impl Pin {
@@ -45,5 +45,6 @@ impl Pin {
 }
 #[derive(Debug)]
 pub struct Net {
-    name: String
+    pub code: usize,
+    pub name: String
 }

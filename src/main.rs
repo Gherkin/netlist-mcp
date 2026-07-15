@@ -1,19 +1,12 @@
-use std::any;
-use std::collections::HashMap;
 use std::env;
-use std::fmt::Display;
 use std::fs;
 use std::error::Error;
 use std::path::Path;
 
 mod netlist;
 use anyhow::{Context, ensure};
-use netlist::Component;
 
 use anyhow::bail;
-
-use crate::netlist::Pin;
-
 
 #[derive(Debug)]
 #[derive(PartialEq)]

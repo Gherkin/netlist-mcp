@@ -5,3 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.103"
+rmcp = { version = "2.2.0", features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["full"] }
+schemars = "1"        # JSON schema derive for tool params
+serde = { version = "1", features = ["derive"] }

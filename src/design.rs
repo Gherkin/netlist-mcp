@@ -156,7 +156,7 @@ pub struct Component {
     id: CompId,
     refdes: String,
     value: String,
-    footprint: String,
+    footprint: Option<String>,
     properties: HashMap<String, String>,
     pins: Vec<PinId>
 }

@@ -11,7 +11,7 @@ pub struct Netlist {
 pub struct Component {
     pub refdes: String,
     pub value: String,
-    pub footprint: String,
+    pub footprint: Option<String>,
     pub properties: HashMap<String, String>,
     pub pins: Vec<Pin>
 }
@@ -21,7 +21,7 @@ impl Component {
         return Component {
             refdes: String::new(),
             value: String::new(),
-            footprint: String::new(),
+            footprint: None,
             properties: HashMap::new(),
             pins: Vec::new()
         }

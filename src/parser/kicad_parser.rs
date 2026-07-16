@@ -171,8 +171,7 @@ fn parse_component(node: &NetListNode) -> anyhow::Result<netlist::Component> {
         .context("Comp Value list was empty")?
         .to_string();
     comp.footprint = node.get_child_val(&Token::Symbol("footprint".to_string()))?.get(0)
-        .context("Comp Footprint list was empty")?
-        .to_string();
+        .map(|x| x.to_string());
 
     let pins: anyhow::Result<Vec<netlist::Pin>> = node.get_child(&Token::Symbol("pin".to_string()))?
         .into_iter()

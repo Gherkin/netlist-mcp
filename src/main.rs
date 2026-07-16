@@ -11,8 +11,7 @@ mod parser;
 mod design;
 
 fn load_file<P: AsRef<Path>>(path: P) -> String {
-    let mut data = fs::read_to_string(path).expect("this file should exist");
-    data.retain(|c| !c.is_whitespace());
+    let data = fs::read_to_string(path).expect("this file should exist");
     return data
 }
 

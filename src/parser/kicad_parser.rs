@@ -3,85 +3,46 @@ use anyhow::bail;
 
 use crate::parser::netlist;
 
-#[derive(Debug)]
-#[derive(PartialEq)]
-#[derive(Clone)]
-enum Symbol {
-    ParenLeft,
-    ParenRight,
-    Export,
-    Version,
-    Design,
-    Source,
-    Date,
-    Tool,
-    Sheet,
-    Number,
-    Name,
-    Names,
-    Tstamps,
-    TitleBlock,
-    Title,
-    Company,
-    Rev,
-    Comment,
-    Value,
-    Components,
-    Comp,
-    Ref,
-    Footprints,
-    Footprint,
-    Description,
-    Fields,
-    Field,
-    Units,
-    Unit,
-    Pins,
-    PinType,
-    PinFunction,
-    Pin,
-    LibSource,
-    Libraries,
-    Library,
-    Logical,
-    Lib,
-    Parts,
-    Part,
-    Property,
-    Path,
-    Num,
-    Datasheet,
-    Groups,
-    Variants,
-    Docs,
-    Fp,
-    Type,
-    Uri,
-    Nets,
-    Net,
-    Code,
-    Class,
-    Node,
-    Function,
-    Val(String)
-}
+use crate::parser::kicad_scanner::Token;
+use crate::parser::kicad_scanner::Scanner;
 
 #[derive(Debug)]
 #[derive(PartialEq)]
 enum NetListNode {
-    Symbol(Symbol),
-    Value(String),
+    Atom(Token),
     List(Vec<NetListNode>)
 }
 
 impl NetListNode {
-    pub fn as_symbol(&self) -> anyhow::Result<&Symbol> {
+    pub fn atom_as_string(&self) -> anyhow::Result<&String> {
         match self {
-            NetListNode::Symbol(sym) => {
+            NetListNode::Atom(sym) => {
+                match sym {
+                    Token::Symbol(str) => {
+                        return Ok(str);
+                    },
+                    Token::Value(str) => {
+                        return Ok(str);
+                    }
+                    Token::LParen | Token::RParen => {
+                        bail!("Token was paranthesis!");
+                    }
+
+                }
+            }
+            _ => {
+                bail!("NetListNode is not a Atom");
+            }
+        }
+    }
+
+    pub fn as_token(&self) -> anyhow::Result<&Token> {
+        match self {
+            NetListNode::Atom(sym) => {
                 return Ok(sym);
             }
             _ => {
-                bail!("NetListNode is not a Symbol");
+                bail!("NetListNode is not a Atom");
             }
         }
     }
@@ -97,24 +58,17 @@ impl NetListNode {
         }
     }
 
-    pub fn as_val(&self) -> anyhow::Result<&String> {
-        match self {
-            NetListNode::Value(val) => {
-                return Ok(val);
-            }
-            _ => {
-                bail!("NetListNode is not a Value");
-            }
-        }
-    }
-
-    pub fn key(&self) -> anyhow::Result<&Symbol> {
+    pub fn key(&self) -> anyhow::Result<&Token> {
         let NetListNode::List(list) = self else {
             bail!("NetListNode is not a List");
         };
 
-        let NetListNode::Symbol(sym) = &list[0] else {
-            bail!("First element on NetListNode::List is not a Symbol")
+        let NetListNode::Atom(sym) = &list[0] else {
+            bail!("First element on NetListNode::List is not a Atom")
+        };
+
+        let Token::Symbol(_) = sym else {
+            bail!("Token wasnt symbol")
         };
 
         return Ok(sym);
@@ -129,16 +83,13 @@ impl NetListNode {
 
     }
     
-    pub fn get_child(&self, child: &Symbol) -> anyhow::Result<Vec<&NetListNode>> {
+    pub fn get_child(&self, child: &Token) -> anyhow::Result<Vec<&NetListNode>> {
         match self {
-            NetListNode::Symbol(sym) => {
+            NetListNode::Atom(sym) => {
                 if sym == child {
                     return Ok(vec![self]);
                 };
                 bail!("NetListNode was leaf Symbol but was {:?} instead of {:?}", sym, child);
-            }
-            NetListNode::Value(_) => {
-                bail!("Leaf NetListNode was Value");
             }
             NetListNode::List(_) => {
                 let sym = self.key()?;
@@ -160,14 +111,18 @@ impl NetListNode {
 
     }
 
-    pub fn get_child_val(&self, child: &Symbol) -> anyhow::Result<Vec<&String>> {
+    pub fn get_child_val(&self, child: &Token) -> anyhow::Result<Vec<&String>> {
         let child_nodes = self.get_child(child)?;
         let list: anyhow::Result<Vec<&String>> = child_nodes
             .into_iter()
             .map(|x| -> anyhow::Result<&String> {
                 let items = x.list()?;
                 let first = items.get(0).context("child node had no value")?;
-                first.as_val()
+                let sym = first.as_token()?;
+                let Token::Value(_) = sym else {
+                    bail!("Token wasnt Value");
+                };
+                return first.atom_as_string();
             })
             .collect();
         
@@ -179,11 +134,16 @@ impl NetListNode {
 fn print_node(node: &NetListNode, depth: usize) {
     let indent = "  ".repeat(depth);
     match node {
-        NetListNode::Symbol(a) => {
-            println!("{indent}{:?}", a);
-        }
-        NetListNode::Value(a) => {
-            println!("{indent}\"{}\"", a);
+        NetListNode::Atom(tok) => {
+            match tok {
+                Token::Symbol(a) => {
+                    println!("{indent}{:?}", a);
+                }
+                Token::Value(a) => {
+                    println!("{indent}\"{}\"", a);
+                }
+                _ => {}
+            }
         }
         NetListNode::List(rest) => {
             println!("{indent}[");
@@ -197,28 +157,32 @@ fn print_node(node: &NetListNode, depth: usize) {
 
 fn parse_component(node: &NetListNode) -> anyhow::Result<netlist::Component> {
     let sym = node.key()?;
-    ensure!(*sym == Symbol::Comp, "NetListNode passed was not Symbol::Comp but {sym:?}");
+    let Token::Symbol(str) = sym else {
+        bail!("NetListNode passed was not Symbol but {sym:?}")
+    };
+
+    ensure!(*str == "comp", "Token passed was not 'comp' but '{str}'");
 
     let mut comp = netlist::Component::new();
-    comp.refdes = node.get_child_val(&Symbol::Ref)?.get(0)
+    comp.refdes = node.get_child_val(&Token::Symbol("ref".to_string()))?.get(0)
         .context("Comp Ref list was empty")?
         .to_string();
-    comp.value = node.get_child_val(&Symbol::Value)?.get(0)
+    comp.value = node.get_child_val(&Token::Symbol("value".to_string()))?.get(0)
         .context("Comp Value list was empty")?
         .to_string();
-    comp.footprint = node.get_child_val(&Symbol::Footprint)?.get(0)
+    comp.footprint = node.get_child_val(&Token::Symbol("footprint".to_string()))?.get(0)
         .context("Comp Footprint list was empty")?
         .to_string();
 
-    let pins: anyhow::Result<Vec<netlist::Pin>> = node.get_child(&Symbol::Pin)?
+    let pins: anyhow::Result<Vec<netlist::Pin>> = node.get_child(&Token::Symbol("pin".to_string()))?
         .into_iter()
         .map(|x| -> anyhow::Result<netlist::Pin> {
            Ok(netlist::Pin { 
-            number: x.get_child_val(&Symbol::Num)?
+            number: x.get_child_val(&Token::Symbol("num".to_string()))?
                 .get(0)
                 .with_context(|| format!("Pin {x:?} had no number"))?
                 .to_string(), 
-            name: x.get_child_val(&Symbol::Name)?
+            name: x.get_child_val(&Token::Symbol("name".to_string()))?
                 .get(0)
                 .map(|x| x.to_string()),
             net: None
@@ -232,15 +196,15 @@ fn parse_component(node: &NetListNode) -> anyhow::Result<netlist::Component> {
 
 fn parse_net(node: &NetListNode, comps: &mut Vec::<netlist::Component>) -> anyhow::Result<netlist::Net> {
     let sym = node.key()?;
-    ensure!(*sym == Symbol::Net, "NetListNode passed was not Symbol::Comp but {sym:?}");
+    ensure!(*sym == Token::Symbol("net".to_string()), "NetListNode passed was not Symbol::Comp but {sym:?}");
 
-    let code = node.get_child_val(&Symbol::Code)?
+    let code = node.get_child_val(&Token::Symbol("code".to_string()))?
         .get(0)
         .context("Net Code list was empty")?
         .to_string()
         .parse::<usize>()?;
 
-    let name = node.get_child_val(&Symbol::Name)?
+    let name = node.get_child_val(&Token::Symbol("name".to_string()))?
         .get(0)
         .context("Net Name list was empty")?
         .to_string();
@@ -251,14 +215,14 @@ fn parse_net(node: &NetListNode, comps: &mut Vec::<netlist::Component>) -> anyho
     };
 
 
-    for node in node.get_child(&Symbol::Node)? {
-        let node_refdes = node.get_child_val(&Symbol::Ref)
+    for node in node.get_child(&Token::Symbol("node".to_string()))? {
+        let node_refdes = node.get_child_val(&Token::Symbol("ref".to_string()))
             .with_context(|| format!("Couldnt find refdes value of node {:?} on net {}", node, net.name))?
             .get(0)
             .with_context(|| format!("Net {} had a node with empty ref", net.name))?
             .to_string();
 
-        let node_pin = node.get_child_val(&Symbol::Pin)
+        let node_pin = node.get_child_val(&Token::Symbol("pin".to_string()))
             .with_context(|| format!("Couldnt find pin value of node {:?} on net {}", node, net.name))?
             .get(0)
             .with_context(|| format!("Net {} had a node with empty pin", net.name))?
@@ -282,117 +246,24 @@ fn parse_net(node: &NetListNode, comps: &mut Vec::<netlist::Component>) -> anyho
 
 }
 
-fn scan_next(data: &mut &str) -> Option<Symbol> {
-    if data.len() == 0 {
-        return None;
-    }
-    
-    // Check first char
-    let c = &data[..1];
-    if c == "(" {
-        *data = &data[1..];
-        return Some(Symbol::ParenLeft);
-    } else if c == ")" {
-        *data = &data[1..];
-        return Some(Symbol::ParenRight);
-    }
-
-    let mut i = 1;
-    loop {
-        i += 1;
-        let sub = &data[..i];
-
-        let sym: Option<Symbol> = match sub {
-            "export" => Some(Symbol::Export),
-            "version" => Some(Symbol::Version),
-            "design" => Some(Symbol::Design),
-            "source" => Some(Symbol::Source),
-            "date"   => Some(Symbol::Date),
-            "tool"   => Some(Symbol::Tool),
-            "sheet"  => Some(Symbol::Sheet),
-            "number" => Some(Symbol::Number),
-            sub if sub == "num" && &data[i..i + 1] != "b" => Some(Symbol::Num),
-            "names"   => Some(Symbol::Names),
-            sub if sub == "name" && &data[i..i + 1] != "s" => Some(Symbol::Name),
-            "tstamps" => Some(Symbol::Tstamps),
-            "title_block" => Some(Symbol::TitleBlock),
-            "comment" => Some(Symbol::Comment),
-            "value" => Some(Symbol::Value),
-            "components" => Some(Symbol::Components),
-            "ref" => Some(Symbol::Ref),
-            "footprints" => Some(Symbol::Footprints),
-            sub if sub == "footprint" && &data[i..i + 1] != "s" => Some(Symbol::Footprint),
-            "description" => Some(Symbol::Description),
-            "fields" => Some(Symbol::Fields),
-            sub if sub == "field" && &data[i..i + 1] != "s" => Some(Symbol::Field),
-            "units" => Some(Symbol::Units),
-            sub if sub == "unit" && &data[i..i + 1] != "s" => Some(Symbol::Unit),
-            "pins" => Some(Symbol::Pins),
-            "pintype" => Some(Symbol::PinType),
-            "pinfunction" => Some(Symbol::PinFunction),
-            sub if sub == "pin" && &data[i..i + 1] != "s" && &data[i..i + 1] != "t" && &data[i..i + 1] != "f" => Some(Symbol::Pin),
-            "parts" => Some(Symbol::Parts),
-            sub if sub == "part" && &data[i..i + 1] != "s" => Some(Symbol::Part),
-            "nets" => Some(Symbol::Nets),
-            sub if sub == "net" && &data[i..i + 1] != "s" => Some(Symbol::Net),
-            "property" => Some(Symbol::Property),
-            "path" => Some(Symbol::Path),
-            "datasheet" => Some(Symbol::Datasheet),
-            "groups" => Some(Symbol::Groups),
-            "variants" => Some(Symbol::Variants),
-            "docs" => Some(Symbol::Docs),
-            "fp" => Some(Symbol::Fp),
-            "type" => Some(Symbol::Type),
-            "logical" => Some(Symbol::Logical),
-            "uri" => Some(Symbol::Uri),
-            "code" => Some(Symbol::Code),
-            "class" => Some(Symbol::Class),
-            "libsource" => Some(Symbol::LibSource),
-            "libraries" => Some(Symbol::Libraries),
-            "library" => Some(Symbol::Library),
-            "node" => Some(Symbol::Node),
-            "function" => Some(Symbol::Function),
-            sub if sub == "lib" && &data[i..i + 1] != "s" && &data[i..i + 1] != "r" => Some(Symbol::Lib),
-            sub if sub == "comp" && &data[i..i + 1] != "a" && &data[i..i + 1] != "o" => Some(Symbol::Comp),
-            sub if sub == "title" && &data[i..i + 1] != "_" => Some(Symbol::Title),
-            "company" => Some(Symbol::Company),
-            "rev" => Some(Symbol::Rev),
-            sub if sub.starts_with("\"") && sub.ends_with("\"") => Some(Symbol::Val((&sub[1..sub.len() - 1]).to_string())),
-            _ => None,
-        };
-
-        match sym {
-            Some(symbol) => {
-                *data = &data[i..];
-                return Some(symbol)
-            },
-            None => continue,
-        };
-    }
-}
-
-fn structurize(syms: &mut &[Symbol]) -> NetListNode {
-    let Symbol::ParenLeft = syms[0] else { 
-        panic!("no left paranthesis in structurize, misaligned")
+fn structurize(syms: &mut &[Token]) -> anyhow::Result<NetListNode> {
+    let Token::LParen = syms[0] else { 
+        bail!("no left paranthesis in structurize, misaligned")
     };
 
     *syms = &syms[1..];
 
     let key;
     match syms[0].clone() {
-        Symbol::ParenLeft => {
-            panic!("two left paranthesis after each other in structurize!");
+        Token::LParen => {
+            bail!("two left paranthesis after each other in structurize!");
         }
-        Symbol::ParenRight => {
-            panic!("empty node in structurize!");
-        }
-        Symbol::Val(v) => {
-            *syms = &syms[1..];
-            key = NetListNode::Value(v.clone());
+        Token::RParen => {
+            bail!("empty node in structurize!");
         }
         x => {
             *syms = &syms[1..];
-            key = NetListNode::Symbol(x.clone());
+            key = NetListNode::Atom(x.clone());
         },
     };
 
@@ -400,57 +271,40 @@ fn structurize(syms: &mut &[Symbol]) -> NetListNode {
     val.push(key);
     loop {
         let elem = match syms[0].clone() {
-            Symbol::ParenLeft => structurize(syms),
-            Symbol::ParenRight => {
+            Token::LParen => structurize(syms)?,
+            Token::RParen => {
                 *syms = &syms[1..];
                 break;
             }
-            Symbol ::Val(val) => {
-                *syms = &syms[1..];
-                NetListNode::Value(val)
-            }
             x => {
                 *syms = &syms[1..];
-                NetListNode::Symbol(x)
+                NetListNode::Atom(x)
             }
         };
         val.push(elem)
     }
 
     if val.len() < 2 {
-        return val.pop().unwrap();
+        return Ok(val.pop().unwrap());
     } else {
-        return NetListNode::List(val);
+        return Ok(NetListNode::List(val));
     }
 
-}
-
-fn parse_symbol_tree(data: &String) -> Vec<Symbol> {
-    let mut cursor: &str = &data;
-
-    let mut syms: Vec<Symbol> = Vec::new();
-    loop {
-        let sym = scan_next(&mut cursor);
-        match sym {
-            Some(sym) => syms.push(sym),
-            None => break,
-        }
-    }
-    return syms;
 }
 
 pub fn parse_netlist(data: &String) -> anyhow::Result<netlist::Netlist> {
-    let syms = parse_symbol_tree(data);
+    let scanner = Scanner::new(data);
+    let syms: Vec<Token> = scanner.collect::<anyhow::Result<Vec<Token>>>()?;
 
-    let mut slice: &[Symbol] = &syms;
-    let nodetree : NetListNode = structurize(&mut slice);
+    let mut slice: &[Token] = &syms;
+    let nodetree : NetListNode = structurize(&mut slice)?;
 
-    let mut comps = nodetree.get_child(&Symbol::Comp)?
+    let mut comps = nodetree.get_child(&Token::Symbol("comp".to_string()))?
         .into_iter()
         .map(parse_component)
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let nets = nodetree.get_child(&Symbol::Net)?
+    let nets = nodetree.get_child(&Token::Symbol("net".to_string()))?
         .into_iter()
         .map(|n| parse_net(n, &mut comps)) 
         .collect::<anyhow::Result<Vec<_>>>()?;

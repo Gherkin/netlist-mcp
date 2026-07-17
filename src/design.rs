@@ -4,6 +4,8 @@ use std::fmt::format;
 use std::fmt::Display;
 use anyhow::Context;
 
+use serde::Serialize;
+
 use crate::parser::netlist;
 
 #[derive(Debug)]
@@ -71,6 +73,16 @@ impl Design {
         return Ok(self.net(net_id).name.clone());
     }
 
+    pub fn comp(&self, refdes: &String) -> anyhow::Result<String> {
+        let comp = self.component(
+            self.component_map
+                .get(refdes)
+                .with_context(|| format!("Refdes {} not found in component map", refdes))?
+        );
+        return Ok(serde_json::to_string_pretty(comp).context("error serializing comp")?);
+
+    }
+
     pub fn from_netlist(netlist: netlist::Netlist) -> anyhow::Result<Design> {
         let mut nets: Vec<Net> = Vec::new();
         let mut net_map: HashMap<String, NetId> = HashMap::new();
@@ -96,7 +108,7 @@ impl Design {
                 refdes: netlist_comp.refdes,
                 value: netlist_comp.value,
                 footprint: netlist_comp.footprint,
-                properties: HashMap::new(),
+                properties: netlist_comp.properties,
                 pins: Vec::new()
             };
             comp_map.insert(comp.refdes.clone(), CompId(i));
@@ -148,20 +160,20 @@ impl Design {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct CompId(usize);
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct Component {
     id: CompId,
     refdes: String,
     value: String,
     footprint: Option<String>,
-    properties: HashMap<String, String>,
+    properties: HashMap<String, Option<String>>,
     pins: Vec<PinId>
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct PinId(usize);
 
 #[derive(Debug)]

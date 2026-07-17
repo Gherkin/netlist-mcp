@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, ensure};
 use anyhow::bail;
 
@@ -74,6 +76,25 @@ impl NetListNode {
         return Ok(sym);
     }
 
+    pub fn val(&self) -> anyhow::Result<&String> {
+        let NetListNode::List(list) = self else {
+            bail!("NetListNode is not a List");
+        };
+
+        ensure!( list.len() == 2, format!("Not exactly two, but {}, children of node {:?}, val {:?}", list.len(), self, self));
+
+        let NetListNode::Atom(sym) = &list[1] else {
+            bail!("First element on NetListNode::List is not a Atom")
+        };
+
+        let Token::Value(val) = sym else {
+            bail!("Token wasnt value")
+        };
+        
+
+        return Ok(val);
+    }
+
     pub fn list(&self) -> anyhow::Result<&[NetListNode]> {
         let NetListNode::List(list) = self else {
             bail!("NetListNode is not a List");
@@ -81,6 +102,51 @@ impl NetListNode {
 
         return list.get(1..).with_context(|| format!("List was too short with length {}", list.len()));
 
+    }
+
+    fn equals_token(&self, tok: &Token) -> bool {
+        match self {
+            NetListNode::Atom(sym) => {
+                if sym == tok {
+                    return true;
+                };
+                return false;
+            }
+            _  => {
+                return false;
+            }
+        }
+    }
+
+    pub fn get_direct_child(&self, child: &Token) -> anyhow::Result<Vec<&NetListNode>> {
+        let NetListNode::List(list) = self else {
+            bail!("Node wasnt list {:?}", self);
+        };
+
+        return Ok(
+            list[1..].into_iter()
+                .filter_map(|x| match x {
+                    NetListNode::List(_) => {
+                        match x.key() {
+                            Ok(n) => {
+                                if n == child {
+                                return Some(Ok(x));
+
+                                }
+                                return None;
+                            },
+                            Err(e) => {
+                                return Some(Err(e));
+                            }
+                        }
+                    }
+                    _ => {
+                        return None;
+                    }
+                })
+                .collect::<anyhow::Result<Vec<&NetListNode>>>()
+                .context("empty lists in children")?
+        )
     }
     
     pub fn get_child(&self, child: &Token) -> anyhow::Result<Vec<&NetListNode>> {
@@ -111,22 +177,58 @@ impl NetListNode {
 
     }
 
-    pub fn get_child_val(&self, child: &Token) -> anyhow::Result<Vec<&String>> {
-        let child_nodes = self.get_child(child)?;
+    pub fn get_only_child(&self, child: &Token) -> anyhow::Result<&NetListNode> {
+        let vals = self.get_direct_child(child)?;
+        ensure!( vals.len() == 1, format!("Not one value child of node {:?}, val {:?}", self, child));
+
+        return Ok(vals.into_iter().next().unwrap())
+    }
+
+    pub fn get_maybe_only_child(&self, child: &Token) -> anyhow::Result<Option<&NetListNode>> {
+        let vals = self.get_direct_child(child)?;
+        match vals.len() {
+            0 => {
+                return Ok(None);
+            }
+            1 => {
+                return Ok(Some(vals.into_iter().next().unwrap()));
+            }
+            _ => {
+                bail!("More than one value child of node {:?}, val {:?}", self, child);
+            }
+        }
+    }
+
+    pub fn get_direct_child_val(&self, child: &Token) -> anyhow::Result<Vec<&String>> {
+        let child_nodes = self.get_direct_child(child)?;
         let list: anyhow::Result<Vec<&String>> = child_nodes
             .into_iter()
-            .map(|x| -> anyhow::Result<&String> {
-                let items = x.list()?;
-                let first = items.get(0).context("child node had no value")?;
-                let sym = first.as_token()?;
-                let Token::Value(_) = sym else {
-                    bail!("Token wasnt Value");
-                };
-                return first.atom_as_string();
-            })
+            .map(|x| x.val())
             .collect();
         
         return list;
+    }
+
+    pub fn get_only_child_val(&self, child: &Token) -> anyhow::Result<&String> {
+        let vals = self.get_direct_child_val(child)?;
+        ensure!( vals.len() == 1, format!("Not one value child but {} of node {:?}, val {:?}, found {:?}", vals.len(), self, child, vals));
+
+        return Ok(vals.into_iter().next().unwrap())
+    }
+
+    pub fn get_maybe_only_child_val(&self, child: &Token) -> anyhow::Result<Option<&String>> {
+        let vals = self.get_direct_child_val(child)?;
+        match vals.len() {
+            0 => {
+                return Ok(None);
+            }
+            1 => {
+                return Ok(Some(vals.into_iter().next().unwrap()));
+            }
+            _ => {
+                bail!("More than one value child of node {:?}, val {:?}", self, child);
+            }
+        }
     }
 
 }
@@ -164,25 +266,36 @@ fn parse_component(node: &NetListNode) -> anyhow::Result<netlist::Component> {
     ensure!(*str == "comp", "Token passed was not 'comp' but '{str}'");
 
     let mut comp = netlist::Component::new();
-    comp.refdes = node.get_child_val(&Token::Symbol("ref".to_string()))?.get(0)
-        .context("Comp Ref list was empty")?
+    comp.refdes = node.get_only_child_val(&Token::sym("ref"))
+        .with_context(|| format!("error looking for ref child of node {:?}", node))?
         .to_string();
-    comp.value = node.get_child_val(&Token::Symbol("value".to_string()))?.get(0)
-        .context("Comp Value list was empty")?
+    comp.value = node.get_only_child_val(&Token::sym("value"))
+        .with_context(|| format!("error looking for value child of node {:?}", node))?
         .to_string();
-    comp.footprint = node.get_child_val(&Token::Symbol("footprint".to_string()))?.get(0)
+    comp.footprint = node.get_maybe_only_child_val(&Token::sym("footprint"))
+        .with_context(|| format!("error looking for footprint child of node {:?}", node))?
         .map(|x| x.to_string());
 
-    let pins: anyhow::Result<Vec<netlist::Pin>> = node.get_child(&Token::Symbol("pin".to_string()))?
+    comp.description = node.get_maybe_only_child_val(&Token::sym("description"))
+        .with_context(|| format!("error looking for description child of node {:?}", node))?
+        .map(|x| x.to_string());
+
+    comp.sheet = node.get_maybe_only_child(&Token::sym("sheetpath"))
+        .with_context(|| format!("error looking for sheethpath child of node {:?}", node))?
+        .map(|x| x.get_only_child_val(&Token::sym("names")))
+        .transpose()
+        .with_context(|| format!("error looking for value child of sheethpath child of node {:?}", node))?
+        .map(|x| x.to_string());
+
+
+    let pins: anyhow::Result<Vec<netlist::Pin>> = node.get_child(&Token::sym("pin"))
+        .with_context(|| format!("error looking for pin child of node {:?}", node))?
         .into_iter()
         .map(|x| -> anyhow::Result<netlist::Pin> {
            Ok(netlist::Pin { 
-            number: x.get_child_val(&Token::Symbol("num".to_string()))?
-                .get(0)
-                .with_context(|| format!("Pin {x:?} had no number"))?
+            number: x.get_only_child_val(&Token::sym("num"))?
                 .to_string(), 
-            name: x.get_child_val(&Token::Symbol("name".to_string()))?
-                .get(0)
+            name: x.get_maybe_only_child_val(&Token::sym("name"))?
                 .map(|x| x.to_string()),
             net: None
         })})
@@ -190,22 +303,30 @@ fn parse_component(node: &NetListNode) -> anyhow::Result<netlist::Component> {
 
     comp.pins = pins?;
 
+    let props = node.get_child(&Token::sym("property"))
+        .with_context(|| format!("error looking for property child of node {:?}", node))?
+        .into_iter()
+        .map(|node| -> anyhow::Result<(String, Option<String>)> {
+            let key = node.get_only_child_val(&Token::sym("name"))?;
+            let value = node.get_maybe_only_child_val(&Token::sym("value"))?.map(|x| x.to_string());
+            Ok((key.to_string(), value))
+        })
+        .collect::<anyhow::Result<HashMap<String, Option<String>>>>()?;
+
+    comp.properties = props;
+
     return Ok(comp);
 }
 
 fn parse_net(node: &NetListNode, comps: &mut Vec::<netlist::Component>) -> anyhow::Result<netlist::Net> {
     let sym = node.key()?;
-    ensure!(*sym == Token::Symbol("net".to_string()), "NetListNode passed was not Symbol::Comp but {sym:?}");
+    ensure!(*sym == Token::sym("net"), "NetListNode passed was not Symbol::Comp but {sym:?}");
 
-    let code = node.get_child_val(&Token::Symbol("code".to_string()))?
-        .get(0)
-        .context("Net Code list was empty")?
+    let code = node.get_only_child_val(&Token::sym("code"))?
         .to_string()
         .parse::<usize>()?;
 
-    let name = node.get_child_val(&Token::Symbol("name".to_string()))?
-        .get(0)
-        .context("Net Name list was empty")?
+    let name = node.get_only_child_val(&Token::sym("name"))?
         .to_string();
 
     let net = netlist::Net {
@@ -214,17 +335,13 @@ fn parse_net(node: &NetListNode, comps: &mut Vec::<netlist::Component>) -> anyho
     };
 
 
-    for node in node.get_child(&Token::Symbol("node".to_string()))? {
-        let node_refdes = node.get_child_val(&Token::Symbol("ref".to_string()))
+    for node in node.get_child(&Token::sym("node"))? {
+        let node_refdes = node.get_only_child_val(&Token::sym("ref"))
             .with_context(|| format!("Couldnt find refdes value of node {:?} on net {}", node, net.name))?
-            .get(0)
-            .with_context(|| format!("Net {} had a node with empty ref", net.name))?
             .to_string();
 
-        let node_pin = node.get_child_val(&Token::Symbol("pin".to_string()))
+        let node_pin = node.get_only_child_val(&Token::sym("pin"))
             .with_context(|| format!("Couldnt find pin value of node {:?} on net {}", node, net.name))?
-            .get(0)
-            .with_context(|| format!("Net {} had a node with empty pin", net.name))?
             .to_string();
 
         let comp = comps.iter_mut()
@@ -298,12 +415,12 @@ pub fn parse_netlist(data: &String) -> anyhow::Result<netlist::Netlist> {
     let mut slice: &[Token] = &syms;
     let nodetree : NetListNode = structurize(&mut slice)?;
 
-    let mut comps = nodetree.get_child(&Token::Symbol("comp".to_string()))?
+    let mut comps = nodetree.get_child(&Token::sym("comp"))?
         .into_iter()
         .map(parse_component)
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    let nets = nodetree.get_child(&Token::Symbol("net".to_string()))?
+    let nets = nodetree.get_child(&Token::sym("net"))?
         .into_iter()
         .map(|n| parse_net(n, &mut comps)) 
         .collect::<anyhow::Result<Vec<_>>>()?;

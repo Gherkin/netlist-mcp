@@ -11,6 +11,12 @@ pub enum Token {
     Value(String)
 }
 
+impl Token {
+    pub fn sym(str: &str) -> Token {
+        return Token::Symbol(str.to_string());
+    }
+}
+
 pub struct Scanner<'a> {
     data: &'a str,
     iter: Peekable<CharIndices<'a>>

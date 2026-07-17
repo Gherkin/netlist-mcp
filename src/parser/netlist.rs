@@ -12,7 +12,9 @@ pub struct Component {
     pub refdes: String,
     pub value: String,
     pub footprint: Option<String>,
-    pub properties: HashMap<String, String>,
+    pub description: Option<String>,
+    pub sheet: Option<String>,
+    pub properties: HashMap<String, Option<String>>,
     pub pins: Vec<Pin>
 }
 
@@ -22,6 +24,8 @@ impl Component {
             refdes: String::new(),
             value: String::new(),
             footprint: None,
+            description: None,
+            sheet: None,
             properties: HashMap::new(),
             pins: Vec::new()
         }

@@ -41,6 +41,12 @@ struct NetOfPinParams {
     pin: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct Comp {
+    /// Component as "REFDES", e.g. "U1"
+    refdes: String,
+}
+
 #[derive(Clone)]
 struct NetlistServer {
     design: std::sync::Arc<Design>,
@@ -62,6 +68,15 @@ impl NetlistServer {
     fn get_net(&self, Parameters(p): Parameters<NetOfPinParams>) -> String {
         match self.design.net_of_pin(&p.pin) {
             Ok(net) => net,
+            Err(e) => format!("error: {e:#}"),
+        }
+    }
+
+    #[tool(description = "Get the properties of a component \
+        format is REFDES, e.g. 'U1'.")]
+    fn get_comp(&self, Parameters(p): Parameters<Comp>) -> String {
+        match self.design.comp(&p.refdes) {
+            Ok(comp) => comp,
             Err(e) => format!("error: {e:#}"),
         }
     }

@@ -22,8 +22,41 @@ pub struct Design {
 }
 
 impl Design {
+    pub fn pin_to_string(&self, pin_id: &PinId) -> String {
+        let pin = self.pin(pin_id);
+        let comp = self.comp(&pin.comp);
+        let mut out = String::new();
+        out.push_str(&format!("{}:{}", comp.refdes, pin.number));
+        match &pin.name {
+            Some(name) => {
+                out.push_str(&format!(" ({})", name));
+            }
+            None => {}
+        }
+
+        match &pin.net {
+            Some(net_id) => {
+                let net = self.net(&net_id);
+                out.push_str(&format!(" - {}", net.name));
+            }
+            None => {
+                out.push_str(" - Not Connected");
+            }
+        }
+        
+        return out;
+    }
+
+    pub fn comp(&self, comp_id: &CompId) -> &Component {
+        &self.components[comp_id.0 as usize]
+    }
+
     pub fn pin(&self, pin_id: &PinId) -> &Pin {
         &self.pins[pin_id.0 as usize]
+    }
+
+    pub fn net(&self, net_id: &NetId) -> &Net {
+        &self.nets[net_id.0 as usize]
     }
 
     pub fn pin_name(&self, pin_id: &PinId) -> String {
@@ -37,10 +70,6 @@ impl Design {
         let pin_id = self.pin_map.get(pin_name).with_context(|| format!("no pin named '{}'", pin_name))?;
 
         return Ok(self.pin(pin_id));
-    }
-
-    pub fn net(&self, net_id: &NetId) -> &Net {
-        &self.nets[net_id.0 as usize]
     }
 
     fn net_from_name(&self, net_name: &String) -> anyhow::Result<&Net> {
@@ -73,13 +102,30 @@ impl Design {
         return Ok(self.net(net_id).name.clone());
     }
 
-    pub fn comp(&self, refdes: &String) -> anyhow::Result<String> {
+    fn pin_sort_key(s: &str) -> (&str, u32) {
+        let split = s.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        let (prefix, digits) = s.split_at(split);
+        (prefix, digits.parse().unwrap_or(0))
+    }
+
+    pub fn comp_details(&self, refdes: &String) -> anyhow::Result<String> {
         let comp = self.component(
             self.component_map
                 .get(refdes)
                 .with_context(|| format!("Refdes {} not found in component map", refdes))?
         );
-        return Ok(serde_json::to_string_pretty(comp).context("error serializing comp")?);
+        let mut pins = comp.pins.iter()
+            .map(|x| (self.pin(x).number.clone(), self.pin_to_string(x))).collect::<Vec<_>>();
+        pins.sort_by(|x, y| Self::pin_sort_key(&x.0).cmp(&Self::pin_sort_key(&y.0)));
+        let pin_strings = pins.into_iter().map(|x| x.1).collect();
+        let json = &ComponentJson {
+                refdes: comp.refdes.clone(),
+                value: comp.value.clone(),
+                footprint: comp.footprint.clone(),
+                properties: comp.properties.clone(),
+                pins: pin_strings
+            };
+        return Ok(serde_json::to_string_pretty(json).context("error serializing comp")?);
 
     }
 
@@ -164,6 +210,15 @@ impl Design {
 pub struct CompId(usize);
 
 #[derive(Debug, Serialize)]
+pub struct ComponentJson {
+    refdes: String,
+    value: String,
+    footprint: Option<String>,
+    properties: HashMap<String, Option<String>>,
+    pins: Vec<String>
+}
+
+#[derive(Debug)]
 pub struct Component {
     id: CompId,
     refdes: String,

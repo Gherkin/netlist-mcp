@@ -75,7 +75,7 @@ impl NetlistServer {
     #[tool(description = "Get the properties of a component \
         format is REFDES, e.g. 'U1'.")]
     fn get_comp(&self, Parameters(p): Parameters<Comp>) -> String {
-        match self.design.comp(&p.refdes) {
+        match self.design.comp_details(&p.refdes) {
             Ok(comp) => comp,
             Err(e) => format!("error: {e:#}"),
         }
@@ -85,6 +85,7 @@ impl NetlistServer {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let design = load_design()?;
+dd    println!("{:?}", design.comp_details(&"U1".to_string()));
     let service = NetlistServer { design: Arc::new(design) }
         .serve(stdio()).await?;
     service.waiting().await?;

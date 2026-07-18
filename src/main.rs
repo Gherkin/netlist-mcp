@@ -184,7 +184,10 @@ impl NetlistServer {
         tree with per-subsystem part counts. Subsystems can then filter \
         filter_components / filter_nets.")]
     fn list_subsystems(&self) -> String {
-        "not implemented".to_string()
+        match self.design.list_subsystems() {
+            Ok(out) => out,
+            Err(e) => format!("error: {e:#}"),
+        }
     }
 
     #[tool(description = "Deterministic filter over components by refdes class, \

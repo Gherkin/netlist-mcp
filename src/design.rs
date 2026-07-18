@@ -385,6 +385,48 @@ impl Design {
             .context("error serializing filter_nets")?);
     }
 
+    /// Group components by their schematic sheet ("subsystem") and count them.
+    /// Components with no sheet (or an empty one) land in an `(unassigned)`
+    /// bucket with a null path. Sheets in this design are single-level, so a
+    /// flat grouping by the raw sheet string is correct — no tree needed.
+    pub fn list_subsystems(&self) -> anyhow::Result<String> {
+        let mut counts: HashMap<Option<String>, usize> = HashMap::new();
+        for comp in &self.components {
+            let key = comp.sheet
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned();
+            *counts.entry(key).or_insert(0) += 1;
+        }
+
+        let mut subsystems: Vec<SubsystemRow> = counts
+            .into_iter()
+            .map(|(sheet, component_count)| match sheet {
+                Some(path) => {
+                    let name = path.trim_matches('/').to_string();
+                    SubsystemRow { path: Some(path), name, component_count }
+                }
+                None => SubsystemRow {
+                    path: None,
+                    name: "(unassigned)".to_string(),
+                    component_count,
+                },
+            })
+            .collect();
+
+        subsystems.sort_by(|a, b| {
+            b.component_count.cmp(&a.component_count).then_with(|| a.name.cmp(&b.name))
+        });
+
+        let envelope = SubsystemEnvelope {
+            total_components: self.components.len(),
+            subsystem_count: subsystems.len(),
+            subsystems,
+        };
+        return Ok(serde_json::to_string_pretty(&envelope)
+            .context("error serializing list_subsystems")?);
+    }
+
     pub fn from_netlist(netlist: netlist::Netlist) -> anyhow::Result<Design> {
         let mut nets: Vec<Net> = Vec::new();
         let mut net_map: HashMap<String, NetId> = HashMap::new();
@@ -531,6 +573,22 @@ struct NetEnvelope {
     limit: u32,
     returned: usize,
     rows: Vec<NetRow>,
+}
+
+/// One subsystem bucket from `list_subsystems`: the raw sheet path (null for
+/// unassigned), a display name, and how many components sit on it.
+#[derive(Debug, Serialize)]
+struct SubsystemRow {
+    path: Option<String>,
+    name: String,
+    component_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SubsystemEnvelope {
+    total_components: usize,
+    subsystem_count: usize,
+    subsystems: Vec<SubsystemRow>,
 }
 
 /// One ranked find_components hit: the same compact row as filter_components plus

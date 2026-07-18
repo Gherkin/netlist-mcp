@@ -146,6 +146,81 @@ impl Design {
 
     }
 
+    /// Components one hop away from `refdes`: for each of its pins (in pin-number
+    /// order), the other components sharing that pin's net, grouped by net so a
+    /// GND/power rail's huge fanout doesn't drown the small signal nets. Each
+    /// group is capped at 25 neighbors (`truncated: true` if more existed).
+    pub fn neighbors(&self, refdes: &str) -> anyhow::Result<String> {
+        let comp_id = self.component_map
+            .get(refdes)
+            .with_context(|| format!("component {} not found", refdes))?;
+        let comp = self.component(comp_id);
+
+        let mut pins: Vec<&PinId> = comp.pins.iter().collect();
+        pins.sort_by(|x, y| {
+            Self::pin_sort_key(&self.pin(x).number).cmp(&Self::pin_sort_key(&self.pin(y).number))
+        });
+
+        let mut net_groups: Vec<NetGroup> = Vec::new();
+        for pin_id in pins {
+            let pin = self.pin(pin_id);
+            let Some(net_id) = &pin.net else {
+                // Unconnected pin — nothing to group.
+                continue;
+            };
+            let net = self.net(net_id);
+
+            let mut other_pins: Vec<&PinId> = net.pins
+                .iter()
+                .filter(|npid| self.pin(npid).comp.0 != comp_id.0)
+                .collect();
+            other_pins.sort_by(|a, b| {
+                let ac = self.component(&self.pin(a).comp);
+                let bc = self.component(&self.pin(b).comp);
+                Self::pin_sort_key(&ac.refdes)
+                    .cmp(&Self::pin_sort_key(&bc.refdes))
+                    .then_with(|| {
+                        Self::pin_sort_key(&self.pin(a).number)
+                            .cmp(&Self::pin_sort_key(&self.pin(b).number))
+                    })
+            });
+
+            let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+            let mut neighbors: Vec<NeighborRow> = Vec::new();
+            for npid in &other_pins {
+                let np = self.pin(npid);
+                let nc = self.component(&np.comp);
+                if !seen.insert((nc.refdes.clone(), np.number.clone())) {
+                    continue;
+                }
+                neighbors.push(NeighborRow {
+                    refdes: nc.refdes.clone(),
+                    value: nc.value.clone(),
+                    pin: self.pin_name(npid),
+                });
+            }
+
+            let truncated = neighbors.len() > 25;
+            neighbors.truncate(25);
+
+            net_groups.push(NetGroup {
+                pin: self.pin_name(pin_id),
+                net: net.name.clone(),
+                fanout: net.pins.len(),
+                truncated,
+                neighbors,
+            });
+        }
+
+        let envelope = NeighborsEnvelope {
+            refdes: comp.refdes.clone(),
+            value: comp.value.clone(),
+            net_groups,
+        };
+        return Ok(serde_json::to_string_pretty(&envelope)
+            .context("error serializing neighbors")?);
+    }
+
     pub fn filter_components(
         &self,
         query: Option<&str>,
@@ -554,6 +629,34 @@ struct FilterEnvelope {
     limit: u32,
     returned: usize,
     rows: Vec<FilterRow>,
+}
+
+/// One neighbor in a `neighbors` net group: the other component on the shared
+/// net, plus which of its pins carries it.
+#[derive(Debug, Serialize)]
+struct NeighborRow {
+    refdes: String,
+    value: String,
+    pin: String,
+}
+
+/// One net shared between the queried component and others: the queried
+/// component's own pin on it, the net's identity/fanout, and the (capped)
+/// neighbor list.
+#[derive(Debug, Serialize)]
+struct NetGroup {
+    pin: String,
+    net: String,
+    fanout: usize,
+    truncated: bool,
+    neighbors: Vec<NeighborRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct NeighborsEnvelope {
+    refdes: String,
+    value: String,
+    net_groups: Vec<NetGroup>,
 }
 
 /// One filter_nets hit: net identity, fanout, and the raw per-type pin histogram.

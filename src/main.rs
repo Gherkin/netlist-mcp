@@ -259,8 +259,11 @@ impl NetlistServer {
 
     #[tool(description = "List the components one hop away from a component — \
         those sharing any net with it. Cheap orientation before a full walk.")]
-    fn neighbors(&self, Parameters(_p): Parameters<NeighborsParams>) -> String {
-        "not implemented".to_string()
+    fn neighbors(&self, Parameters(p): Parameters<NeighborsParams>) -> String {
+        match self.design.neighbors(&p.refdes) {
+            Ok(out) => out,
+            Err(e) => format!("error: {e:#}"),
+        }
     }
 
     #[tool(description = "Report whether two pins are connected and, if so, the \

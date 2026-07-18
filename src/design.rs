@@ -29,7 +29,18 @@ impl Design {
         out.push_str(&format!("{}:{}", comp.refdes, pin.number));
         match &pin.name {
             Some(name) => {
-                out.push_str(&format!(" ({})", name));
+                if name.len() > 0 {
+                    out.push_str(&format!(" ({})", name));
+                }
+            }
+            None => {}
+        }
+
+        match &pin.pin_type {
+            Some(pin_type) => {
+                if pin_type.len() > 0 {
+                    out.push_str(&format!(" (type: {})", pin_type));
+                }
             }
             None => {}
         }
@@ -37,7 +48,11 @@ impl Design {
         match &pin.net {
             Some(net_id) => {
                 let net = self.net(&net_id);
-                out.push_str(&format!(" - {}", net.name));
+                if net.name.len() > 0 {
+                    out.push_str(&format!(" - {}", net.name));
+                } else {
+                    out.push_str(" - Not Connected");
+                }
             }
             None => {
                 out.push_str(" - Not Connected");

@@ -179,7 +179,7 @@ impl NetListNode {
 
     pub fn get_only_child(&self, child: &Token) -> anyhow::Result<&NetListNode> {
         let vals = self.get_direct_child(child)?;
-        ensure!( vals.len() == 1, format!("Not one value child of node {:?}, val {:?}", self, child));
+        ensure!( vals.len() == 1, format!("Not only one '{:?}' value child of node {:?}", child, self));
 
         return Ok(vals.into_iter().next().unwrap())
     }
@@ -257,7 +257,7 @@ fn print_node(node: &NetListNode, depth: usize) {
     }
 }
 
-fn parse_component(node: &NetListNode) -> anyhow::Result<netlist::Component> {
+fn parse_component(node: &NetListNode, base_tree: &NetListNode) -> anyhow::Result<netlist::Component> {
     let sym = node.key()?;
     let Token::Symbol(str) = sym else {
         bail!("NetListNode passed was not Symbol but {sym:?}")
@@ -287,9 +287,42 @@ fn parse_component(node: &NetListNode) -> anyhow::Result<netlist::Component> {
         .with_context(|| format!("error looking for value child of sheethpath child of node {:?}", node))?
         .map(|x| x.to_string());
 
+    let libsource = node.get_only_child(&Token::sym("libsource"))
+        .with_context(|| format!("error looking for libsource child of node {:?}", node))?;
+    let comp_lib = libsource
+        .get_only_child_val(&Token::sym("lib"))
+        .with_context(|| format!("error looking for lib child of libsource of node {:?}", node))?;
+    let comp_lib_part = libsource
+        .get_only_child_val(&Token::sym("part"))
+        .with_context(|| format!("error looking for part child of libsource of node {:?}", node))?;
 
-    let pins: anyhow::Result<Vec<netlist::Pin>> = node.get_child(&Token::sym("pin"))
-        .with_context(|| format!("error looking for pin child of node {:?}", node))?
+    let lib_part = base_tree.get_only_child(&Token::sym("libparts"))
+        .context("couldnt find libparts node")?
+        .get_direct_child(&Token::sym("libpart"))
+        .context("couldnt find any libpart under libparts")?
+        .into_iter()
+        .map(|libpart| -> anyhow::Result<(bool, &NetListNode)> {
+            let lib = libpart
+                .get_only_child_val(&Token::sym("lib"))
+                .with_context(|| format!("error looking for lib child of libsource of node {:?}", node))?;
+            let lib_part = libpart
+                .get_only_child_val(&Token::sym("part"))
+                .with_context(|| format!("error looking for part child of libsource of node {:?}", node))?;
+
+            return Ok((comp_lib == lib && comp_lib_part == lib_part, libpart));
+        })
+        .filter_map(|res| match res {
+            Ok((true, item)) => Some(Ok(item)),
+            Ok((false, _)) => None,
+            Err(e) => Some(Err(e))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    ensure!(lib_part.len() == 1, "more than one libpart {} with lib {} found!", comp_lib_part, comp_lib);
+
+    let lib_pins = lib_part.into_iter().next().unwrap()
+        .get_child(&Token::sym("pin"))
+        .with_context(|| format!("error looking for pin child of libpart {} in lib {}", comp_lib_part, comp_lib))?
         .into_iter()
         .map(|x| -> anyhow::Result<netlist::Pin> {
            Ok(netlist::Pin { 
@@ -301,9 +334,44 @@ fn parse_component(node: &NetListNode) -> anyhow::Result<netlist::Component> {
                 .map(|x| x.to_string()),
             net: None
         })})
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()
+        .with_context(|| format!("error looking for pin parameters of libpart {} in lib {}", comp_lib_part, comp_lib))?;
 
-    comp.pins = pins?;
+
+    let mut pins = node.get_child(&Token::sym("pin"))
+        .with_context(|| format!("error looking for pin child of node {:?}", node))?
+        .into_iter()
+        .map(|x| -> anyhow::Result<netlist::Pin> {
+           Ok(netlist::Pin {
+            number: x.get_only_child_val(&Token::sym("num"))?
+                .to_string(),
+            name: x.get_maybe_only_child_val(&Token::sym("name"))?
+                .map(|x| x.to_string()),
+            pin_type: x.get_maybe_only_child_val(&Token::sym("type"))?
+                .map(|x| x.to_string()),
+            net: None
+        })})
+        .collect::<anyhow::Result<Vec<_>>>()
+        .with_context(|| format!("error looking for pin parameters of libpart {} in lib {}", comp_lib_part, comp_lib))?;
+
+    for mut pin in &mut pins {
+        let Some(lib_pin) = lib_pins.iter().find(|lib_pin| pin.number == lib_pin.number) else {
+            continue;
+        };
+        match pin.name {
+            Some(_) => {}
+            None => {
+                pin.name = lib_pin.name.clone();
+            }
+        }
+        match pin.pin_type {
+            Some(_) => {}
+            None => {
+                pin.pin_type = lib_pin.pin_type.clone();
+            }
+        }
+    }
+    comp.pins = pins;
 
     let props = node.get_child(&Token::sym("property"))
         .with_context(|| format!("error looking for property child of node {:?}", node))?
@@ -419,7 +487,7 @@ pub fn parse_netlist(data: &String) -> anyhow::Result<netlist::Netlist> {
 
     let mut comps = nodetree.get_child(&Token::sym("comp"))?
         .into_iter()
-        .map(parse_component)
+        .map(|x| parse_component(x, &nodetree))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     let nets = nodetree.get_child(&Token::sym("net"))?

@@ -502,6 +502,190 @@ impl Design {
             .context("error serializing list_subsystems")?);
     }
 
+    /// Estimate the probability that `net` is a power/ground rail, as a
+    /// transparent weighted sum of three signals (power-typed pin fraction,
+    /// name pattern, decoupling-cap fraction) plus a high-fanout boost.
+    /// Returns the score in [0,1] and human-readable evidence strings for the
+    /// signals that fired. Public and reusable — `walk` uses this to decide
+    /// when to stop at a rail instead of enumerating it.
+    pub fn rail_score(&self, net: &Net) -> (f32, Vec<String>) {
+        let fanout = net.pins.len();
+        if fanout == 0 {
+            return (0.0, Vec::new());
+        }
+
+        let power_pins: i32 = net.pin_types.get("power_in").copied().unwrap_or(0)
+            + net.pin_types.get("power_out").copied().unwrap_or(0);
+        let power_frac = power_pins as f32 / fanout as f32;
+
+        let name_match = is_power_name(&net.name);
+
+        let cap_pins = net.pins
+            .iter()
+            .filter(|pid| {
+                let refdes = &self.component(&self.pin(pid).comp).refdes;
+                let prefix: String = refdes
+                    .chars()
+                    .take_while(|c| !c.is_ascii_digit())
+                    .collect::<String>()
+                    .to_uppercase();
+                prefix == "C"
+            })
+            .count();
+        let cap_frac = cap_pins as f32 / fanout as f32;
+
+        let fanout_boost = if fanout > 20 && (name_match || cap_frac > 0.3) {
+            RAIL_FANOUT_BOOST
+        } else {
+            0.0
+        };
+
+        let score = (RAIL_WEIGHT_POWER_FRAC * power_frac
+            + RAIL_WEIGHT_NAME_MATCH * (name_match as i32 as f32)
+            + RAIL_WEIGHT_CAP_FRAC * cap_frac
+            + fanout_boost)
+            .clamp(0.0, 1.0);
+
+        let mut evidence: Vec<String> = Vec::new();
+        if power_frac > 0.1 {
+            evidence.push(format!("{:.0}% power pins", power_frac * 100.0));
+        }
+        if name_match {
+            evidence.push("name matches power pattern".to_string());
+        }
+        if cap_frac > 0.1 {
+            evidence.push(format!("{:.0}% capacitors", cap_frac * 100.0));
+        }
+        if fanout_boost > 0.0 {
+            evidence.push(format!("high fanout ({fanout} pins)"));
+        }
+
+        (score, evidence)
+    }
+
+    /// Zero-knowledge orientation summary: counts, refdes-class histogram,
+    /// detected power rails (via `rail_score`), connectors, subsystems, and
+    /// the highest-fanout nets. Lists are capped — this is an overview, not
+    /// an exhaustive dump.
+    pub fn design_overview(&self) -> anyhow::Result<String> {
+        let counts = OverviewCounts {
+            components: self.components.len(),
+            nets: self.nets.len(),
+            pins: self.pins.len(),
+        };
+
+        // refdes_classes: histogram over leading-alpha class, count desc then class asc.
+        let mut class_counts: HashMap<String, usize> = HashMap::new();
+        for comp in &self.components {
+            let class = comp.refdes
+                .chars()
+                .take_while(|c| !c.is_ascii_digit())
+                .collect::<String>()
+                .to_uppercase();
+            *class_counts.entry(class).or_insert(0) += 1;
+        }
+        let mut refdes_classes: Vec<RefdesClassRow> = class_counts
+            .into_iter()
+            .map(|(class, count)| RefdesClassRow { class, count })
+            .collect();
+        refdes_classes.sort_by(|a, b| {
+            b.count.cmp(&a.count).then_with(|| a.class.cmp(&b.class))
+        });
+
+        // rails: every net scoring >= 0.5, sorted score desc then fanout desc, capped 25.
+        let mut rails: Vec<RailRow> = self.nets
+            .iter()
+            .filter_map(|net| {
+                let (score, evidence) = self.rail_score(net);
+                if score >= 0.5 {
+                    Some(RailRow {
+                        net: net.name.clone(),
+                        fanout: net.pins.len(),
+                        score: (score * 100.0).round() / 100.0,
+                        evidence,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        rails.sort_by(|a, b| {
+            b.score.partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.fanout.cmp(&a.fanout))
+        });
+        rails.truncate(25);
+
+        // connectors: refdes class J or P, natural refdes order, capped 50.
+        let mut connectors: Vec<&Component> = self.components
+            .iter()
+            .filter(|comp| {
+                let class = comp.refdes
+                    .chars()
+                    .take_while(|c| !c.is_ascii_digit())
+                    .collect::<String>()
+                    .to_uppercase();
+                class == "J" || class == "P"
+            })
+            .collect();
+        connectors.sort_by(|a, b| Self::pin_sort_key(&a.refdes).cmp(&Self::pin_sort_key(&b.refdes)));
+        let connectors: Vec<ConnectorRow> = connectors
+            .into_iter()
+            .take(50)
+            .map(|comp| ConnectorRow {
+                refdes: comp.refdes.clone(),
+                value: comp.value.clone(),
+                pin_count: comp.pins.len(),
+            })
+            .collect();
+
+        // subsystems: group by sheet, top 15 by count.
+        let mut sheet_counts: HashMap<Option<String>, usize> = HashMap::new();
+        for comp in &self.components {
+            let key = comp.sheet
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned();
+            *sheet_counts.entry(key).or_insert(0) += 1;
+        }
+        let mut subsystems: Vec<SubsystemSummaryRow> = sheet_counts
+            .into_iter()
+            .map(|(sheet, component_count)| {
+                let name = match &sheet {
+                    Some(path) => path.trim_matches('/').to_string(),
+                    None => "(unassigned)".to_string(),
+                };
+                SubsystemSummaryRow { name, component_count }
+            })
+            .collect();
+        subsystems.sort_by(|a, b| {
+            b.component_count.cmp(&a.component_count).then_with(|| a.name.cmp(&b.name))
+        });
+        subsystems.truncate(15);
+
+        // top_nets_by_fanout: top 15 by fanout.
+        let mut nets_by_fanout: Vec<&Net> = self.nets.iter().collect();
+        nets_by_fanout.sort_by(|a, b| {
+            b.pins.len().cmp(&a.pins.len()).then_with(|| a.name.cmp(&b.name))
+        });
+        let top_nets_by_fanout: Vec<NetFanoutRow> = nets_by_fanout
+            .into_iter()
+            .take(15)
+            .map(|net| NetFanoutRow { net: net.name.clone(), fanout: net.pins.len() })
+            .collect();
+
+        let envelope = OverviewEnvelope {
+            counts,
+            refdes_classes,
+            rails,
+            connectors,
+            subsystems,
+            top_nets_by_fanout,
+        };
+        return Ok(serde_json::to_string_pretty(&envelope)
+            .context("error serializing design_overview")?);
+    }
+
     pub fn from_netlist(netlist: netlist::Netlist) -> anyhow::Result<Design> {
         let mut nets: Vec<Net> = Vec::new();
         let mut net_map: HashMap<String, NetId> = HashMap::new();
@@ -694,6 +878,62 @@ struct SubsystemEnvelope {
     subsystems: Vec<SubsystemRow>,
 }
 
+#[derive(Debug, Serialize)]
+struct OverviewCounts {
+    components: usize,
+    nets: usize,
+    pins: usize,
+}
+
+/// One refdes-class bucket in `design_overview` (e.g. "C" -> 220 parts).
+#[derive(Debug, Serialize)]
+struct RefdesClassRow {
+    class: String,
+    count: usize,
+}
+
+/// One detected power/ground rail in `design_overview`, from `Design::rail_score`.
+#[derive(Debug, Serialize)]
+struct RailRow {
+    net: String,
+    fanout: usize,
+    score: f32,
+    evidence: Vec<String>,
+}
+
+/// One connector (refdes class J/P) in `design_overview`.
+#[derive(Debug, Serialize)]
+struct ConnectorRow {
+    refdes: String,
+    value: String,
+    pin_count: usize,
+}
+
+/// One subsystem bucket in `design_overview` (compact form of `SubsystemRow`,
+/// no raw sheet path — that detail belongs to `list_subsystems`).
+#[derive(Debug, Serialize)]
+struct SubsystemSummaryRow {
+    name: String,
+    component_count: usize,
+}
+
+/// One net in the `design_overview` fanout leaderboard.
+#[derive(Debug, Serialize)]
+struct NetFanoutRow {
+    net: String,
+    fanout: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct OverviewEnvelope {
+    counts: OverviewCounts,
+    refdes_classes: Vec<RefdesClassRow>,
+    rails: Vec<RailRow>,
+    connectors: Vec<ConnectorRow>,
+    subsystems: Vec<SubsystemSummaryRow>,
+    top_nets_by_fanout: Vec<NetFanoutRow>,
+}
+
 /// One ranked find_components hit: the same compact row as filter_components plus
 /// the two ranking fields.
 #[derive(Debug, Serialize)]
@@ -713,6 +953,48 @@ struct FindEnvelope {
 
 /// Drop candidates below this so pure noise doesn't surface.
 const SCORE_FLOOR: f32 = 0.15;
+
+// Hand-tuned priors for `Design::rail_score`. Kept as named consts so they
+// are easy to retune without hunting through the scoring logic.
+const RAIL_WEIGHT_POWER_FRAC: f32 = 0.45;
+const RAIL_WEIGHT_NAME_MATCH: f32 = 0.30;
+const RAIL_WEIGHT_CAP_FRAC: f32 = 0.25;
+const RAIL_FANOUT_BOOST: f32 = 0.15;
+
+/// Case-insensitive heuristic for "does this net name look like a power/ground
+/// rail?" Checks the segment after the last '/' against a set of common rail
+/// names, a leading +/- sign, or a supply-voltage token like "3v3"/"1v8".
+fn is_power_name(name: &str) -> bool {
+    const RAIL_NAMES: &[&str] = &[
+        "gnd", "gnda", "agnd", "dgnd", "pgnd", "vss", "vssa", "vcc", "vdd",
+        "vbat", "vbus", "vee", "vin",
+    ];
+
+    let segment = name.rsplit('/').next().unwrap_or(name).trim();
+    let lower = segment.to_lowercase();
+
+    if RAIL_NAMES.contains(&lower.as_str()) {
+        return true;
+    }
+    if segment.starts_with('+') || segment.starts_with('-') {
+        return true;
+    }
+
+    // Supply-voltage token: a digit immediately adjacent to a 'v', e.g.
+    // "3v3", "5v", "1v8", "3.3v".
+    let bytes = lower.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'v' {
+            let prev_digit = i > 0 && (bytes[i - 1].is_ascii_digit());
+            let next_digit = i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit();
+            if prev_digit || next_digit {
+                return true;
+            }
+        }
+    }
+
+    false
+}
 
 /// Normalize for comparison: lowercase, then keep only alphanumerics — strips
 /// spaces/dashes/dots/slashes so "ADS-1115" == "ads1115".

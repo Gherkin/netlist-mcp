@@ -177,7 +177,10 @@ impl NetlistServer {
         connectors, subsystems, and the highest-fanout nets. The zero-knowledge \
         first call for orienting in an unfamiliar design.")]
     fn design_overview(&self) -> String {
-        "not implemented".to_string()
+        match self.design.design_overview() {
+            Ok(out) => out,
+            Err(e) => format!("error: {e:#}"),
+        }
     }
 
     #[tool(description = "List the schematic's sheet hierarchy (subsystems) as a \

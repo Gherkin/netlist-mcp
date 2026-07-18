@@ -36,7 +36,8 @@ impl Component {
 pub struct Pin {
     pub number: String,
     pub name: Option<String>,
-    pub net: Option<usize>
+    pub net: Option<usize>,
+    pub pin_type: Option<String>
 }
 
 impl Pin {
@@ -44,7 +45,8 @@ impl Pin {
         return Pin {
             number: String::new(),
             name: None,
-            net: None
+            net: None,
+            pin_type: None
         };
     }
 }

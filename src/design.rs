@@ -139,7 +139,8 @@ impl Design {
                 id: NetId(i),
                 code: netlist_net.code,
                 name: netlist_net.name,
-                pins: Vec::new()
+                pins: Vec::new(),
+                pin_types: HashMap::new()
             };
             net_map.insert(net.name.clone(), NetId(i));
             nets.push(net);
@@ -175,6 +176,7 @@ impl Design {
                     comp: CompId(i),
                     number: netlist_pin.number,
                     name: netlist_pin.name,
+                    pin_type: netlist_pin.pin_type,
                     net: Some(NetId(net_id))
                 };
                 pin_map.insert(format!("{}:{}", comp.refdes.clone(), pin.number.clone()), PinId(j));
@@ -196,6 +198,20 @@ impl Design {
             };
 
             nets[net_no.0 as usize].pins.push(PinId(i));
+
+        }
+
+        for net in &mut nets {
+            let pin_types = net.pins
+                .iter()
+                .map(|x| &pins[x.0 as usize])
+                .map(|x| &x.pin_type)
+                .flatten()
+                .fold(HashMap::new(), |mut acc, x| {
+                    *acc.entry(x.clone()).or_insert(0) += 1;
+                    acc
+                });
+                net.pin_types = pin_types;
 
         }
 
@@ -245,6 +261,7 @@ pub struct Pin {
     pub comp: CompId,
     pub number: String,
     pub name: Option<String>,
+    pub pin_type: Option<String>,
     pub net: Option<NetId>
 }
 
@@ -256,5 +273,6 @@ pub struct Net {
     pub id: NetId,
     pub code: usize,
     pub name: String,
-    pub pins: Vec<PinId>
+    pub pins: Vec<PinId>,
+    pub pin_types: HashMap<String, i32>
 }

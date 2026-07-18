@@ -297,6 +297,8 @@ fn parse_component(node: &NetListNode) -> anyhow::Result<netlist::Component> {
                 .to_string(), 
             name: x.get_maybe_only_child_val(&Token::sym("name"))?
                 .map(|x| x.to_string()),
+            pin_type: x.get_maybe_only_child_val(&Token::sym("type"))?
+                .map(|x| x.to_string()),
             net: None
         })})
         .collect();

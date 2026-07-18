@@ -190,31 +190,7 @@ impl Design {
 
                 // query: every term must appear in the searchable bundle.
                 if let Some(terms) = &query_terms {
-                    let mut bundle = String::new();
-                    bundle.push_str(&comp.refdes.to_lowercase());
-                    bundle.push(' ');
-                    bundle.push_str(&comp.value.to_lowercase());
-                    bundle.push(' ');
-                    if let Some(d) = &comp.description {
-                        bundle.push_str(&d.to_lowercase());
-                        bundle.push(' ');
-                    }
-                    if let Some(f) = &comp.footprint {
-                        bundle.push_str(&f.to_lowercase());
-                        bundle.push(' ');
-                    }
-                    if let Some(s) = &comp.sheet {
-                        bundle.push_str(&s.to_lowercase());
-                        bundle.push(' ');
-                    }
-                    for (k, v) in &comp.properties {
-                        bundle.push_str(&k.to_lowercase());
-                        bundle.push(' ');
-                        if let Some(val) = v {
-                            bundle.push_str(&val.to_lowercase());
-                            bundle.push(' ');
-                        }
-                    }
+                    let bundle = comp.search_bundle();
                     if !terms.iter().all(|t| bundle.contains(t.as_str())) {
                         return false;
                     }
@@ -252,6 +228,161 @@ impl Design {
         };
         return Ok(serde_json::to_string_pretty(&envelope)
             .context("error serializing filter_components")?);
+    }
+
+    /// The front door for locating components: score every component against the
+    /// query over the same searchable bundle `filter_components` uses, keep those
+    /// above a small floor, and return the top `limit` ranked by confidence.
+    ///
+    /// Confidence is a max over transparent tiers (see `score_component`); the
+    /// `match_reason` carries which tier fired. The reverse-join base-match tier
+    /// is the one thing this tool does that `filter_components` cannot: it catches
+    /// an over-complete MPN from the datasheet store ("TLA2518IRTERQ1") against a
+    /// shorter netlist value ("TLA2518IRTER"), where containment fails.
+    pub fn find_components(&self, query: &str, limit: u32) -> anyhow::Result<String> {
+        // Blank query is not an error — the front door just yields nothing.
+        let query_lower = query.to_lowercase();
+        let query_squash = squash(query);
+        let terms: Vec<&str> = query_lower.split_whitespace().collect();
+
+        let mut scored: Vec<(f32, String, &Component)> = if query_lower.trim().is_empty() {
+            Vec::new()
+        } else {
+            self.components
+                .iter()
+                .filter_map(|comp| {
+                    score_component(&query_squash, &terms, comp)
+                        .map(|(score, reason)| (score, reason, comp))
+                })
+                .filter(|(score, _, _)| *score >= SCORE_FLOOR)
+                .collect()
+        };
+
+        // Confidence descending, then break ties by significance. A query that
+        // only matches a page/sheet name (e.g. "adc") ties every part on that
+        // sheet at the same confidence; prefer higher-pin-count parts (ICs,
+        // connectors) over 2-pin passives — a generic agent asking for "adc"
+        // wants the ADC, not the 50 decoupling caps that share its sheet. Pin
+        // count is a data-driven proxy for "primary part". Natural refdes order
+        // (R2 before R10) is the final tie-break for parts of equal size.
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.2.pins.len().cmp(&a.2.pins.len()))
+                .then_with(|| Self::pin_sort_key(&a.2.refdes).cmp(&Self::pin_sort_key(&b.2.refdes)))
+        });
+
+        let candidates: Vec<Candidate> = scored
+            .into_iter()
+            .take(limit as usize)
+            .map(|(score, reason, comp)| Candidate {
+                row: FilterRow {
+                    refdes: comp.refdes.clone(),
+                    value: comp.value.clone(),
+                    description: comp.description.clone(),
+                    footprint: comp.footprint.clone(),
+                    sheet: comp.sheet.clone(),
+                    keywords: comp.properties.get("ki_keywords").cloned().flatten(),
+                    pin_count: comp.pins.len(),
+                },
+                confidence: score,
+                match_reason: reason,
+            })
+            .collect();
+
+        let envelope = FindEnvelope {
+            query: query.to_string(),
+            returned: candidates.len(),
+            candidates,
+        };
+        return Ok(serde_json::to_string_pretty(&envelope)
+            .context("error serializing find_components")?);
+    }
+
+    /// The `sheet` of every component that owns a pin on this net. A net has no
+    /// sheet of its own; its subsystem is derived from what it connects. Used by
+    /// `filter_nets`' subsystem predicate. Duplicates are not deduped — the callers
+    /// only ask `any(...)`.
+    fn net_component_sheets<'a>(&'a self, net: &'a Net) -> impl Iterator<Item = &'a str> {
+        net.pins
+            .iter()
+            .filter_map(move |pid| self.component(&self.pin(pid).comp).sheet.as_deref())
+    }
+
+    /// Net-side counterpart of `filter_components`: deterministic, exhaustive,
+    /// no scoring. Filter by name substring and/or subsystem (AND-combined,
+    /// case-insensitive), sort, paginate, and serialize a compact envelope.
+    pub fn filter_nets(
+        &self,
+        name: Option<&str>,
+        subsystem: Option<&str>,
+        sort_by_fanout: bool,
+        limit: u32,
+        offset: u32,
+    ) -> anyhow::Result<String> {
+        // Empty/whitespace-only name is treated as no filter.
+        let name_lc = name
+            .map(|n| n.to_lowercase())
+            .filter(|n| !n.trim().is_empty());
+        let subsystem_lc = subsystem.map(|s| s.trim_matches('/').to_lowercase());
+
+        let mut matches: Vec<&Net> = self.nets
+            .iter()
+            .filter(|net| {
+                // name: case-insensitive substring against the net name.
+                if let Some(n) = &name_lc {
+                    if !net.name.to_lowercase().contains(n.as_str()) {
+                        return false;
+                    }
+                }
+
+                // subsystem: any connected component's sheet contains the filter,
+                // '/' trimmed on both sides (same normalization as filter_components).
+                if let Some(sub) = &subsystem_lc {
+                    let hit = self.net_component_sheets(net).any(|sheet| {
+                        sheet.trim_matches('/').to_lowercase().contains(sub.as_str())
+                    });
+                    if !hit {
+                        return false;
+                    }
+                }
+
+                true
+            })
+            .collect();
+
+        // Default (sort_by_fanout): fanout descending, tie-break net name ascending.
+        // Otherwise: alphabetical by net name.
+        if sort_by_fanout {
+            matches.sort_by(|a, b| {
+                b.pins.len().cmp(&a.pins.len()).then_with(|| a.name.cmp(&b.name))
+            });
+        } else {
+            matches.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+
+        let total = matches.len();
+        let rows: Vec<NetRow> = matches
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .map(|net| NetRow {
+                name: net.name.clone(),
+                code: net.code,
+                fanout: net.pins.len(),
+                pin_types: net.pin_types.clone(),
+            })
+            .collect();
+
+        let envelope = NetEnvelope {
+            total,
+            offset,
+            limit,
+            returned: rows.len(),
+            rows,
+        };
+        return Ok(serde_json::to_string_pretty(&envelope)
+            .context("error serializing filter_nets")?);
     }
 
     pub fn from_netlist(netlist: netlist::Netlist) -> anyhow::Result<Design> {
@@ -383,6 +514,105 @@ struct FilterEnvelope {
     rows: Vec<FilterRow>,
 }
 
+/// One filter_nets hit: net identity, fanout, and the raw per-type pin histogram.
+/// Member pins are deliberately not expanded — that is get_net's job.
+#[derive(Debug, Serialize)]
+struct NetRow {
+    name: String,
+    code: usize,
+    fanout: usize,
+    pin_types: HashMap<String, i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct NetEnvelope {
+    total: usize,
+    offset: u32,
+    limit: u32,
+    returned: usize,
+    rows: Vec<NetRow>,
+}
+
+/// One ranked find_components hit: the same compact row as filter_components plus
+/// the two ranking fields.
+#[derive(Debug, Serialize)]
+struct Candidate {
+    #[serde(flatten)]
+    row: FilterRow,
+    confidence: f32,
+    match_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FindEnvelope {
+    query: String,
+    returned: usize,
+    candidates: Vec<Candidate>,
+}
+
+/// Drop candidates below this so pure noise doesn't surface.
+const SCORE_FLOOR: f32 = 0.15;
+
+/// Normalize for comparison: lowercase, then keep only alphanumerics — strips
+/// spaces/dashes/dots/slashes so "ADS-1115" == "ads1115".
+fn squash(s: &str) -> String {
+    s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+/// Bidirectional prefix match on already-squashed strings, requiring at least
+/// `min` shared chars. Either string being a prefix of the other counts — this
+/// is the reverse-join tier that catches partial *and* over-complete MPNs.
+fn base_match(a: &str, b: &str, min: usize) -> bool {
+    if a.len().min(b.len()) < min {
+        return false;
+    }
+    a.starts_with(b) || b.starts_with(a)
+}
+
+/// Score one component against a query as the highest-scoring signal that fires.
+/// Tiers are checked in descending-confidence order, so the first hit is the max;
+/// the returned reason names that tier. `None` means nothing fired.
+fn score_component(query_squash: &str, terms: &[&str], comp: &Component) -> Option<(f32, String)> {
+    let value_squash = squash(&comp.value);
+    let refdes_squash = squash(&comp.refdes);
+
+    // Tier 1: exact identity.
+    if !query_squash.is_empty() && (query_squash == value_squash || query_squash == refdes_squash) {
+        let which = if query_squash == value_squash { "value" } else { "refdes" };
+        return Some((1.0, format!("exact {which}")));
+    }
+
+    // Tier 2: reverse-join base-match against value (min 4 shared chars).
+    if base_match(&value_squash, query_squash, 4) {
+        let reason = if value_squash.starts_with(query_squash) {
+            "value base-match (field starts with query)"
+        } else {
+            "value base-match (query starts with field)"
+        };
+        return Some((0.85, reason.to_string()));
+    }
+
+    // Tier 3: value substring (not prefix-anchored — those fell into tier 2).
+    if !query_squash.is_empty() && value_squash.contains(query_squash) {
+        return Some((0.65, "value substring".to_string()));
+    }
+
+    // Tiers 4 & 5: whitespace terms against the searchable bundle.
+    if !terms.is_empty() {
+        let bundle = comp.search_bundle();
+        let matched = terms.iter().filter(|t| bundle.contains(**t)).count();
+        let n = terms.len();
+        if matched == n {
+            return Some((0.55, "all terms matched".to_string()));
+        } else if matched > 0 {
+            let score = 0.20 + 0.25 * (matched as f32 / n as f32);
+            return Some((score, format!("matched {matched}/{n} terms")));
+        }
+    }
+
+    None
+}
+
 #[derive(Debug)]
 pub struct Component {
     id: CompId,
@@ -393,6 +623,37 @@ pub struct Component {
     sheet: Option<String>,
     properties: HashMap<String, Option<String>>,
     pins: Vec<PinId>
+}
+
+impl Component {
+    /// The component's searchable text: its own local fields lowercased and
+    /// space-joined. Shared by filter_components and find_components so the two
+    /// tools agree on what is searchable. Property *values* are included; keys
+    /// carry no signal.
+    fn search_bundle(&self) -> String {
+        let mut bundle = String::new();
+        bundle.push_str(&self.refdes.to_lowercase());
+        bundle.push(' ');
+        bundle.push_str(&self.value.to_lowercase());
+        bundle.push(' ');
+        if let Some(d) = &self.description {
+            bundle.push_str(&d.to_lowercase());
+            bundle.push(' ');
+        }
+        if let Some(f) = &self.footprint {
+            bundle.push_str(&f.to_lowercase());
+            bundle.push(' ');
+        }
+        if let Some(s) = &self.sheet {
+            bundle.push_str(&s.to_lowercase());
+            bundle.push(' ');
+        }
+        for val in self.properties.values().flatten() {
+            bundle.push_str(&val.to_lowercase());
+            bundle.push(' ');
+        }
+        bundle
+    }
 }
 
 #[derive(Debug, Serialize)]

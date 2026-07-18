@@ -67,7 +67,7 @@ struct FilterComponentsParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct FindNetsParams {
+struct FilterNetsParams {
     /// Substring / pattern to match against net names.
     #[serde(default)]
     name: Option<String>,
@@ -182,7 +182,7 @@ impl NetlistServer {
 
     #[tool(description = "List the schematic's sheet hierarchy (subsystems) as a \
         tree with per-subsystem part counts. Subsystems can then filter \
-        filter_components / find_nets.")]
+        filter_components / filter_nets.")]
     fn list_subsystems(&self) -> String {
         "not implemented".to_string()
     }
@@ -208,10 +208,25 @@ impl NetlistServer {
         }
     }
 
-    #[tool(description = "Find nets by name pattern and/or subsystem, optionally \
-        sorted by fanout. Returns compact rows (net name, pin count).")]
-    fn find_nets(&self, Parameters(_p): Parameters<FindNetsParams>) -> String {
-        "not implemented".to_string()
+    #[tool(description = "Deterministic filter over nets by name substring and/or \
+        subsystem, sorted by fanout (default) or name. Returns compact rows (net \
+        name, code, fanout, pin-type distribution). This is where connectivity \
+        words resolve — e.g. 'spi' finds the SPI nets, which find_components \
+        cannot (SPI lives in net names, not component fields).")]
+    fn filter_nets(&self, Parameters(p): Parameters<FilterNetsParams>) -> String {
+        let sort_by_fanout = p.sort_by_fanout.unwrap_or(true);
+        let limit = p.limit.unwrap_or(50);
+        let offset = p.offset.unwrap_or(0);
+        match self.design.filter_nets(
+            p.name.as_deref(),
+            p.subsystem.as_deref(),
+            sort_by_fanout,
+            limit,
+            offset,
+        ) {
+            Ok(out) => out,
+            Err(e) => format!("error: {e:#}"),
+        }
     }
 
     #[tool(description = "The main way to locate components: give a part \
@@ -221,8 +236,12 @@ impl NetlistServer {
         numbers, so it also serves as the reverse leg of the datasheet-RAG \
         handoff. Reach for this first; drop to filter_components when you need an \
         exhaustive count or the ranking is noisy.")]
-    fn find_components(&self, Parameters(_p): Parameters<FindComponentsParams>) -> String {
-        "not implemented".to_string()
+    fn find_components(&self, Parameters(p): Parameters<FindComponentsParams>) -> String {
+        let limit = p.limit.unwrap_or(10);
+        match self.design.find_components(&p.query, limit) {
+            Ok(out) => out,
+            Err(e) => format!("error: {e:#}"),
+        }
     }
 
     #[tool(description = "Walk the connectivity from a pin or net through 2-pin \

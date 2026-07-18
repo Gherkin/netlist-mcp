@@ -48,8 +48,8 @@ struct GetComponentParams {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct FindComponentsParams {
-    /// Free-text match over refdes, value, description, keywords and footprint.
+struct FilterComponentsParams {
+    /// Substring/all-terms match over refdes, value, description, keywords and footprint.
     #[serde(default)]
     query: Option<String>,
     /// Restrict to a refdes class, e.g. "U", "R", "C", "J".
@@ -86,10 +86,11 @@ struct FindNetsParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct ResolvePartParams {
-    /// A messy identity or functional string to resolve to components in this
-    /// design, e.g. an MPN from a datasheet ("ADS1115IDGSR") or a description
-    /// ("16-bit I2C ADC"). Returns ranked candidates with a confidence.
+struct FindComponentsParams {
+    /// What to look for — a part identity or a rough description, e.g. an MPN
+    /// from the datasheet store ("ADS1115IDGSR"), a value ("10k"), or a loose
+    /// idea ("the MCU"). Matching is fuzzy; returns ranked candidates with a
+    /// confidence, best first.
     query: String,
     /// Max candidates to return (default 10).
     #[serde(default)]
@@ -181,16 +182,18 @@ impl NetlistServer {
 
     #[tool(description = "List the schematic's sheet hierarchy (subsystems) as a \
         tree with per-subsystem part counts. Subsystems can then filter \
-        find_components / find_nets.")]
+        filter_components / find_nets.")]
     fn list_subsystems(&self) -> String {
         "not implemented".to_string()
     }
 
-    #[tool(description = "Find components by structured filter/search over \
-        refdes, value, description, keywords, footprint, refdes class and \
-        subsystem. Returns a flat, paginated list of compact rows. Use this to \
-        turn a rough idea into concrete refdes handles.")]
-    fn find_components(&self, Parameters(_p): Parameters<FindComponentsParams>) -> String {
+    #[tool(description = "Deterministic filter over components by refdes class, \
+        subsystem, and substring/all-terms query across refdes/value/description/\
+        keywords/footprint. Returns a flat, paginated list — every match, no \
+        ranking. Use for enumeration/counting ('how many 0402 caps in the power \
+        sheet') or as a fallback when find_components returns noise. For turning \
+        a rough idea into a handle, prefer find_components.")]
+    fn filter_components(&self, Parameters(_p): Parameters<FilterComponentsParams>) -> String {
         "not implemented".to_string()
     }
 
@@ -200,12 +203,14 @@ impl NetlistServer {
         "not implemented".to_string()
     }
 
-    #[tool(description = "Resolve a messy part identity or functional \
-        description (e.g. an MPN from the datasheet store, or 'a 16-bit ADC') to \
-        components in this design. Returns ranked candidates with a confidence \
-        and the reason each matched. Reverse leg of the datasheet-RAG handoff; \
-        matching is fuzzy, never exact.")]
-    fn resolve_part(&self, Parameters(_p): Parameters<ResolvePartParams>) -> String {
+    #[tool(description = "The main way to locate components: give a part \
+        identity or a rough description (an MPN from the datasheet store, a \
+        value, or 'the MCU') and get ranked candidates with a confidence and the \
+        reason each matched. Fuzzy — tolerant of partial/over-complete part \
+        numbers, so it also serves as the reverse leg of the datasheet-RAG \
+        handoff. Reach for this first; drop to filter_components when you need an \
+        exhaustive count or the ranking is noisy.")]
+    fn find_components(&self, Parameters(_p): Parameters<FindComponentsParams>) -> String {
         "not implemented".to_string()
     }
 

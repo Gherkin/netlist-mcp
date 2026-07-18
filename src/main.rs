@@ -85,7 +85,7 @@ impl NetlistServer {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let design = load_design()?;
-dd    println!("{:?}", design.comp_details(&"U1".to_string()));
+    design.comp_details(&"U1".to_string());
     let service = NetlistServer { design: Arc::new(design) }
         .serve(stdio()).await?;
     service.waiting().await?;

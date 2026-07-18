@@ -285,8 +285,11 @@ impl NetlistServer {
     #[tool(description = "Report whether two pins are connected and, if so, the \
         parts on the path between them. Expensive; prefer walk for open-ended \
         tracing.")]
-    fn path_between(&self, Parameters(_p): Parameters<PathBetweenParams>) -> String {
-        "not implemented".to_string()
+    fn path_between(&self, Parameters(p): Parameters<PathBetweenParams>) -> String {
+        match self.design.path_between(&p.from, &p.to) {
+            Ok(out) => out,
+            Err(e) => format!("error: {e:#}"),
+        }
     }
 }
 

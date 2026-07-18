@@ -923,6 +923,122 @@ impl Design {
         }
     }
 
+    /// Report whether two pins are connected through the signal/passthrough
+    /// graph (same semantics as `walk`: through 2-pin series R/L/FB/C, never
+    /// through ICs, never across power rails) and, if so, the series parts on
+    /// the path. Reuses `walk_bfs` from `from`'s net/component, then looks for
+    /// `to` among the reached endpoints (or, failing that, among the rails
+    /// reached, in case the only route is a shared power/ground net).
+    pub fn path_between(&self, from: &str, to: &str) -> anyhow::Result<String> {
+        let from_pin_id = self
+            .pin_map
+            .get(from)
+            .with_context(|| format!("no pin named '{}'", from))?;
+        let to_pin_id = self
+            .pin_map
+            .get(to)
+            .with_context(|| format!("no pin named '{}'", to))?;
+
+        let from_pin = self.pin(from_pin_id);
+        let to_pin = self.pin(to_pin_id);
+
+        let from_net_id = match &from_pin.net {
+            Some(n) => NetId(n.0),
+            None => {
+                return Self::path_between_envelope(
+                    from, to, false, None, Vec::new(),
+                    Some("from pin is unconnected".to_string()),
+                );
+            }
+        };
+
+        // Trivial: same pin, or already on the same net (no passthrough hop
+        // needed at all).
+        if from_pin_id.0 == to_pin_id.0 {
+            return Self::path_between_envelope(from, to, true, Some(0), Vec::new(), None);
+        }
+        if let Some(to_net) = &to_pin.net {
+            if to_net.0 == from_net_id.0 {
+                return Self::path_between_envelope(from, to, true, Some(0), Vec::new(), None);
+            }
+        }
+
+        let from_comp = CompId(from_pin.comp.0);
+        let to_canonical = self.pin_name(to_pin_id);
+
+        // max_endpoints is effectively unbounded here: we need to search the
+        // whole reachable set for `to`, not stop at the first handful.
+        let data = self.walk_bfs(&from_net_id, Some(&from_comp), 6, 100_000, true);
+
+        if let Some(ep) = data.endpoints.iter().find(|e| e.pin == to_canonical) {
+            return Self::path_between_envelope(
+                from,
+                to,
+                true,
+                Some(ep.distance),
+                Self::clone_via(&ep.via),
+                None,
+            );
+        }
+
+        // Not directly reached, but maybe the only route is through a shared
+        // rail (power/ground) — match by the `to` pin's net name.
+        if let Some(to_net_id) = &to_pin.net {
+            let to_net_name = &self.net(to_net_id).name;
+            if let Some(rail) = data.rails_reached.iter().find(|r| &r.net == to_net_name) {
+                return Self::path_between_envelope(
+                    from,
+                    to,
+                    true,
+                    Some(rail.via.len() as u32),
+                    Self::clone_via(&rail.via),
+                    Some(format!(
+                        "only via rail {} (shared power/ground, not a signal path)",
+                        rail.net
+                    )),
+                );
+            }
+        }
+
+        Self::path_between_envelope(
+            from,
+            to,
+            false,
+            None,
+            Vec::new(),
+            Some("no passthrough path within depth 6 (rails are not crossed)".to_string()),
+        )
+    }
+
+    fn clone_via(via: &[ViaPart]) -> Vec<ViaPart> {
+        via.iter()
+            .map(|v| ViaPart {
+                refdes: v.refdes.clone(),
+                value: v.value.clone(),
+                class: v.class.clone(),
+            })
+            .collect()
+    }
+
+    fn path_between_envelope(
+        from: &str,
+        to: &str,
+        connected: bool,
+        distance: Option<u32>,
+        via: Vec<ViaPart>,
+        note: Option<String>,
+    ) -> anyhow::Result<String> {
+        let envelope = PathBetweenEnvelope {
+            from: from.to_string(),
+            to: to.to_string(),
+            connected,
+            distance,
+            via,
+            note,
+        };
+        Ok(serde_json::to_string_pretty(&envelope).context("error serializing path_between")?)
+    }
+
     pub fn from_netlist(netlist: netlist::Netlist) -> anyhow::Result<Design> {
         let mut nets: Vec<Net> = Vec::new();
         let mut net_map: HashMap<String, NetId> = HashMap::new();
@@ -1252,6 +1368,19 @@ struct WalkEnvelope {
     rails_reached: Vec<RailReached>,
     large_nets: Vec<LargeNet>,
     truncated: bool,
+}
+
+/// The `path_between` output envelope. `via` is empty for a direct same-net
+/// (or same-pin) connection; `distance` is the passthrough hop count, null
+/// when not connected.
+#[derive(Debug, Serialize)]
+struct PathBetweenEnvelope {
+    from: String,
+    to: String,
+    connected: bool,
+    distance: Option<u32>,
+    via: Vec<ViaPart>,
+    note: Option<String>,
 }
 
 /// Drop candidates below this so pure noise doesn't surface.

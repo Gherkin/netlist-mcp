@@ -686,6 +686,243 @@ impl Design {
             .context("error serializing design_overview")?);
     }
 
+    /// Refdes class = leading non-digit prefix, uppercased. e.g. "R40" -> "R",
+    /// "TP3" -> "TP". Shared by walk's passthrough/endpoint classification.
+    fn refdes_class(refdes: &str) -> String {
+        refdes
+            .chars()
+            .take_while(|c| !c.is_ascii_digit())
+            .collect::<String>()
+            .to_uppercase()
+    }
+
+    /// Map a via chain of passthrough components to the compact {refdes,value,class}
+    /// rows the walk envelope reports.
+    fn via_parts(&self, via: &[CompId]) -> Vec<ViaPart> {
+        via.iter()
+            .map(|c| {
+                let comp = self.component(c);
+                ViaPart {
+                    refdes: comp.refdes.clone(),
+                    value: comp.value.clone(),
+                    class: Self::refdes_class(&comp.refdes),
+                }
+            })
+            .collect()
+    }
+
+    /// Connectivity traversal: from a pin or net, follow the bipartite net<->pin
+    /// graph THROUGH 2-pin series passives (R/L/FB/C) to the real opaque endpoints
+    /// (ICs, connectors, transistors, ...), stopping at power rails and huge nets
+    /// which are reported but never enumerated. Topological, not electrical.
+    ///
+    /// `include_topology` is accepted for API stability but ignored here — output
+    /// is a flat endpoint list, not a branch tree.
+    ///
+    /// The BFS core lives in `walk_bfs`; a future `path_between` reuses it.
+    pub fn walk(
+        &self,
+        start: &str,
+        max_depth: u32,
+        max_endpoints: u32,
+        stop_at_power: bool,
+        _include_topology: bool,
+    ) -> anyhow::Result<String> {
+        // Resolve the start: "REFDES:PIN" is a pin (start_comp excluded from
+        // endpoints), otherwise a net name.
+        let (start_net_id, start_comp): (NetId, Option<CompId>) = if start.contains(':') {
+            let pin_id = self
+                .pin_map
+                .get(start)
+                .with_context(|| format!("no pin named '{}'", start))?;
+            let pin = self.pin(pin_id);
+            let net_id = pin
+                .net
+                .as_ref()
+                .with_context(|| format!("pin '{}' has no net", start))?;
+            (NetId(net_id.0), Some(CompId(pin.comp.0)))
+        } else {
+            let net_id = self
+                .net_map
+                .get(start)
+                .with_context(|| format!("no net called '{}'", start))?;
+            (NetId(net_id.0), None)
+        };
+
+        let start_net_name = self.net(&start_net_id).name.clone();
+
+        let mut data = self.walk_bfs(
+            &start_net_id,
+            start_comp.as_ref(),
+            max_depth,
+            max_endpoints,
+            stop_at_power,
+        );
+
+        // Order endpoints: distance asc, then natural refdes (R2 before R10),
+        // then natural pin number within a component.
+        data.endpoints.sort_by(|a, b| {
+            a.distance
+                .cmp(&b.distance)
+                .then_with(|| {
+                    Self::pin_sort_key(&a.component.refdes)
+                        .cmp(&Self::pin_sort_key(&b.component.refdes))
+                })
+                .then_with(|| {
+                    let an = a.pin.rsplit(':').next().unwrap_or("");
+                    let bn = b.pin.rsplit(':').next().unwrap_or("");
+                    Self::pin_sort_key(an).cmp(&Self::pin_sort_key(bn))
+                })
+        });
+
+        let envelope = WalkEnvelope {
+            start: start.to_string(),
+            start_net: start_net_name,
+            endpoints: data.endpoints,
+            rails_reached: data.rails_reached,
+            large_nets: data.large_nets,
+            truncated: data.truncated,
+        };
+        return Ok(serde_json::to_string_pretty(&envelope).context("error serializing walk")?);
+    }
+
+    /// BFS traversal core shared by `walk` (and, later, `path_between`). Alternates
+    /// net -> pins -> owning component -> (through a passthrough?) -> other net.
+    /// Rails (score >= 0.5 when `stop_at_power`) and large nets (fanout > 40) are
+    /// terminal. Cycles are cut by `visited_nets` / `visited_comps`.
+    fn walk_bfs(
+        &self,
+        start_net: &NetId,
+        start_comp: Option<&CompId>,
+        max_depth: u32,
+        max_endpoints: u32,
+        stop_at_power: bool,
+    ) -> WalkData {
+        let start_net_idx = start_net.0;
+        let start_comp_idx = start_comp.map(|c| c.0);
+
+        let mut visited_nets: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut visited_comps: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut endpoint_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let mut endpoints: Vec<WalkEndpoint> = Vec::new();
+        let mut rails_reached: Vec<RailReached> = Vec::new();
+        let mut large_nets: Vec<LargeNet> = Vec::new();
+        let mut truncated = false;
+
+        let mut queue: std::collections::VecDeque<(usize, Vec<CompId>, u32)> =
+            std::collections::VecDeque::new();
+        queue.push_back((start_net_idx, Vec::new(), 0));
+
+        while let Some((net_idx, via, depth)) = queue.pop_front() {
+            if !visited_nets.insert(net_idx) {
+                continue;
+            }
+            let net = self.net(&NetId(net_idx));
+
+            // Terminal checks apply to every net except the start net, which is
+            // always expanded once.
+            if net_idx != start_net_idx {
+                if stop_at_power {
+                    let (score, _evidence) = self.rail_score(net);
+                    if score >= 0.5 {
+                        rails_reached.push(RailReached {
+                            net: net.name.clone(),
+                            score: (score * 100.0).round() / 100.0,
+                            via: self.via_parts(&via),
+                        });
+                        continue;
+                    }
+                }
+                if net.pins.len() > 40 {
+                    large_nets.push(LargeNet {
+                        net: net.name.clone(),
+                        fanout: net.pins.len(),
+                        via: self.via_parts(&via),
+                    });
+                    continue;
+                }
+            }
+
+            for pin_id in &net.pins {
+                let pin = self.pin(pin_id);
+                let comp_id = &pin.comp;
+
+                // At the start net, never walk back into the start component.
+                if via.is_empty() && Some(comp_id.0) == start_comp_idx {
+                    continue;
+                }
+                // Already-traversed passthrough — avoid bouncing back.
+                if visited_comps.contains(&comp_id.0) {
+                    continue;
+                }
+
+                let comp = self.component(comp_id);
+                let class = Self::refdes_class(&comp.refdes);
+                let is_passthrough =
+                    comp.pins.len() == 2 && matches!(class.as_str(), "R" | "L" | "FB" | "C");
+
+                if is_passthrough {
+                    // The OTHER pin: this comp's pin whose net differs from the
+                    // current one. Exactly one such Some(net) pin => traverse.
+                    let others: Vec<usize> = comp
+                        .pins
+                        .iter()
+                        .filter_map(|p| self.pin(p).net.as_ref().map(|n| n.0))
+                        .filter(|n| *n != net_idx)
+                        .collect();
+                    if others.len() != 1 {
+                        // NC other pin, or both pins on the same net -> dead end.
+                        continue;
+                    }
+                    let other_net = others[0];
+                    visited_comps.insert(comp_id.0);
+                    if depth < max_depth {
+                        let mut next_via = via.clone();
+                        next_via.push(CompId(comp_id.0));
+                        queue.push_back((other_net, next_via, depth + 1));
+                    } else {
+                        // Depth-limited branch.
+                        truncated = true;
+                    }
+                } else {
+                    // Endpoint. Never report the start component.
+                    if Some(comp_id.0) == start_comp_idx {
+                        continue;
+                    }
+                    let pin_key = self.pin_name(pin_id);
+                    if !endpoint_seen.insert(pin_key.clone()) {
+                        continue;
+                    }
+                    if endpoints.len() >= max_endpoints as usize {
+                        truncated = true;
+                        continue;
+                    }
+                    endpoints.push(WalkEndpoint {
+                        pin: pin_key,
+                        pin_name: pin.name.clone(),
+                        pin_type: pin.pin_type.clone(),
+                        component: EndpointComponent {
+                            refdes: comp.refdes.clone(),
+                            value: comp.value.clone(),
+                            description: comp.description.clone(),
+                            sheet: comp.sheet.clone(),
+                        },
+                        via: self.via_parts(&via),
+                        distance: depth,
+                    });
+                }
+            }
+        }
+
+        WalkData {
+            endpoints,
+            rails_reached,
+            large_nets,
+            truncated,
+        }
+    }
+
     pub fn from_netlist(netlist: netlist::Netlist) -> anyhow::Result<Design> {
         let mut nets: Vec<Net> = Vec::new();
         let mut net_map: HashMap<String, NetId> = HashMap::new();
@@ -781,7 +1018,7 @@ impl Design {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct CompId(usize);
 
 #[derive(Debug, Serialize)]
@@ -949,6 +1186,72 @@ struct FindEnvelope {
     query: String,
     returned: usize,
     candidates: Vec<Candidate>,
+}
+
+/// Internal result of the `walk_bfs` traversal core, before the endpoints are
+/// sorted and wrapped in the public envelope.
+struct WalkData {
+    endpoints: Vec<WalkEndpoint>,
+    rails_reached: Vec<RailReached>,
+    large_nets: Vec<LargeNet>,
+    truncated: bool,
+}
+
+/// One series part traversed on the way to an endpoint or terminal net.
+#[derive(Debug, Serialize)]
+struct ViaPart {
+    refdes: String,
+    value: String,
+    class: String,
+}
+
+/// The owning component of a reached endpoint pin (compact identity only).
+#[derive(Debug, Serialize)]
+struct EndpointComponent {
+    refdes: String,
+    value: String,
+    description: Option<String>,
+    sheet: Option<String>,
+}
+
+/// One opaque endpoint reached by `walk`: the specific pin, its function, the
+/// owning component, the series parts traversed (`via`), and hop distance.
+#[derive(Debug, Serialize)]
+struct WalkEndpoint {
+    pin: String,
+    pin_name: Option<String>,
+    pin_type: Option<String>,
+    component: EndpointComponent,
+    via: Vec<ViaPart>,
+    distance: u32,
+}
+
+/// A power/ground rail the walk stopped at (reported, never enumerated).
+#[derive(Debug, Serialize)]
+struct RailReached {
+    net: String,
+    score: f32,
+    via: Vec<ViaPart>,
+}
+
+/// A high-fanout net (> 40 pins) the walk stopped at — catches supply rails that
+/// score just under the rail threshold so they can't explode.
+#[derive(Debug, Serialize)]
+struct LargeNet {
+    net: String,
+    fanout: usize,
+    via: Vec<ViaPart>,
+}
+
+/// The `walk` output envelope.
+#[derive(Debug, Serialize)]
+struct WalkEnvelope {
+    start: String,
+    start_net: String,
+    endpoints: Vec<WalkEndpoint>,
+    rails_reached: Vec<RailReached>,
+    large_nets: Vec<LargeNet>,
+    truncated: bool,
 }
 
 /// Drop candidates below this so pure noise doesn't surface.

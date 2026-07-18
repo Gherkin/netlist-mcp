@@ -256,8 +256,21 @@ impl NetlistServer {
         the walk and are reported, never enumerated. Returns endpoints with the \
         parts traversed to reach each. Topological, not electrical. The primary \
         'what is actually connected to this?' tool.")]
-    fn walk(&self, Parameters(_p): Parameters<WalkParams>) -> String {
-        "not implemented".to_string()
+    fn walk(&self, Parameters(p): Parameters<WalkParams>) -> String {
+        let max_depth = p.max_depth.unwrap_or(4);
+        let max_endpoints = p.max_endpoints.unwrap_or(50);
+        let stop_at_power = p.stop_at_power.unwrap_or(true);
+        let include_topology = p.include_topology.unwrap_or(false);
+        match self.design.walk(
+            &p.start,
+            max_depth,
+            max_endpoints,
+            stop_at_power,
+            include_topology,
+        ) {
+            Ok(out) => out,
+            Err(e) => format!("error: {e:#}"),
+        }
     }
 
     #[tool(description = "List the components one hop away from a component — \

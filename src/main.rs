@@ -193,8 +193,19 @@ impl NetlistServer {
         ranking. Use for enumeration/counting ('how many 0402 caps in the power \
         sheet') or as a fallback when find_components returns noise. For turning \
         a rough idea into a handle, prefer find_components.")]
-    fn filter_components(&self, Parameters(_p): Parameters<FilterComponentsParams>) -> String {
-        "not implemented".to_string()
+    fn filter_components(&self, Parameters(p): Parameters<FilterComponentsParams>) -> String {
+        let limit = p.limit.unwrap_or(50);
+        let offset = p.offset.unwrap_or(0);
+        match self.design.filter_components(
+            p.query.as_deref(),
+            p.refdes_class.as_deref(),
+            p.subsystem.as_deref(),
+            limit,
+            offset,
+        ) {
+            Ok(out) => out,
+            Err(e) => format!("error: {e:#}"),
+        }
     }
 
     #[tool(description = "Find nets by name pattern and/or subsystem, optionally \

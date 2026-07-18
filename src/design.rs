@@ -146,6 +146,114 @@ impl Design {
 
     }
 
+    pub fn filter_components(
+        &self,
+        query: Option<&str>,
+        refdes_class: Option<&str>,
+        subsystem: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> anyhow::Result<String> {
+        // Split the query into lowercased terms; treat empty/whitespace-only as no filter.
+        let query_terms: Option<Vec<String>> = query
+            .map(|q| q.split_whitespace().map(|t| t.to_lowercase()).collect::<Vec<_>>())
+            .filter(|terms: &Vec<String>| !terms.is_empty());
+        let refdes_class_lc = refdes_class.map(|c| c.to_lowercase());
+        let subsystem_lc = subsystem.map(|s| s.trim_matches('/').to_lowercase());
+
+        let mut matches: Vec<&Component> = self.components
+            .iter()
+            .filter(|comp| {
+                // refdes_class: leading non-digit prefix of refdes, case-insensitive.
+                if let Some(class) = &refdes_class_lc {
+                    let prefix = comp.refdes
+                        .chars()
+                        .take_while(|c| !c.is_ascii_digit())
+                        .collect::<String>()
+                        .to_lowercase();
+                    if &prefix != class {
+                        return false;
+                    }
+                }
+
+                // subsystem: case-insensitive substring against sheet, '/' trimmed.
+                if let Some(sub) = &subsystem_lc {
+                    let sheet_norm = comp.sheet
+                        .as_deref()
+                        .unwrap_or("")
+                        .trim_matches('/')
+                        .to_lowercase();
+                    if !sheet_norm.contains(sub.as_str()) {
+                        return false;
+                    }
+                }
+
+                // query: every term must appear in the searchable bundle.
+                if let Some(terms) = &query_terms {
+                    let mut bundle = String::new();
+                    bundle.push_str(&comp.refdes.to_lowercase());
+                    bundle.push(' ');
+                    bundle.push_str(&comp.value.to_lowercase());
+                    bundle.push(' ');
+                    if let Some(d) = &comp.description {
+                        bundle.push_str(&d.to_lowercase());
+                        bundle.push(' ');
+                    }
+                    if let Some(f) = &comp.footprint {
+                        bundle.push_str(&f.to_lowercase());
+                        bundle.push(' ');
+                    }
+                    if let Some(s) = &comp.sheet {
+                        bundle.push_str(&s.to_lowercase());
+                        bundle.push(' ');
+                    }
+                    for (k, v) in &comp.properties {
+                        bundle.push_str(&k.to_lowercase());
+                        bundle.push(' ');
+                        if let Some(val) = v {
+                            bundle.push_str(&val.to_lowercase());
+                            bundle.push(' ');
+                        }
+                    }
+                    if !terms.iter().all(|t| bundle.contains(t.as_str())) {
+                        return false;
+                    }
+                }
+
+                true
+            })
+            .collect();
+
+        // Natural refdes order: prefix, then numeric suffix (R2 before R10).
+        matches.sort_by(|a, b| Self::pin_sort_key(&a.refdes).cmp(&Self::pin_sort_key(&b.refdes)));
+
+        let total = matches.len();
+        let rows: Vec<FilterRow> = matches
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .map(|comp| FilterRow {
+                refdes: comp.refdes.clone(),
+                value: comp.value.clone(),
+                description: comp.description.clone(),
+                footprint: comp.footprint.clone(),
+                sheet: comp.sheet.clone(),
+                keywords: comp.properties.get("ki_keywords").cloned().flatten(),
+                pin_count: comp.pins.len(),
+            })
+            .collect();
+
+        let envelope = FilterEnvelope {
+            total,
+            offset,
+            limit,
+            returned: rows.len(),
+            rows,
+        };
+        return Ok(serde_json::to_string_pretty(&envelope)
+            .context("error serializing filter_components")?);
+    }
+
     pub fn from_netlist(netlist: netlist::Netlist) -> anyhow::Result<Design> {
         let mut nets: Vec<Net> = Vec::new();
         let mut net_map: HashMap<String, NetId> = HashMap::new();
@@ -253,6 +361,26 @@ pub struct ComponentJson {
     sheet: Option<String>,
     properties: HashMap<String, Option<String>>,
     pins: Vec<String>
+}
+
+#[derive(Debug, Serialize)]
+struct FilterRow {
+    refdes: String,
+    value: String,
+    description: Option<String>,
+    footprint: Option<String>,
+    sheet: Option<String>,
+    keywords: Option<String>,
+    pin_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct FilterEnvelope {
+    total: usize,
+    offset: u32,
+    limit: u32,
+    returned: usize,
+    rows: Vec<FilterRow>,
 }
 
 #[derive(Debug)]

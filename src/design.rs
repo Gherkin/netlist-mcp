@@ -121,6 +121,8 @@ impl Design {
         let json = &ComponentJson {
                 refdes: comp.refdes.clone(),
                 value: comp.value.clone(),
+                description: comp.description.clone(),
+                sheet: comp.sheet.clone(),
                 footprint: comp.footprint.clone(),
                 properties: comp.properties.clone(),
                 pins: pin_strings
@@ -154,6 +156,8 @@ impl Design {
                 refdes: netlist_comp.refdes,
                 value: netlist_comp.value,
                 footprint: netlist_comp.footprint,
+                description: netlist_comp.description,
+                sheet: netlist_comp.sheet,
                 properties: netlist_comp.properties,
                 pins: Vec::new()
             };
@@ -214,6 +218,8 @@ pub struct ComponentJson {
     refdes: String,
     value: String,
     footprint: Option<String>,
+    description: Option<String>,
+    sheet: Option<String>,
     properties: HashMap<String, Option<String>>,
     pins: Vec<String>
 }
@@ -224,6 +230,8 @@ pub struct Component {
     refdes: String,
     value: String,
     footprint: Option<String>,
+    description: Option<String>,
+    sheet: Option<String>,
     properties: HashMap<String, Option<String>>,
     pins: Vec<PinId>
 }

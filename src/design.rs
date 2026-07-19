@@ -149,6 +149,7 @@ impl Design {
             .collect();
 
         let role = self.net_role(net_ref);
+        let hierarchy = Self::net_hierarchy(&net_ref.name);
 
         let envelope = NetDetail {
             net: net_ref.name.clone(),
@@ -159,6 +160,7 @@ impl Design {
             pin_types: net_ref.pin_types.clone(),
             subsystems,
             role,
+            hierarchy,
             offset,
             limit,
             returned: members.len(),
@@ -498,11 +500,16 @@ impl Design {
             .into_iter()
             .skip(offset as usize)
             .take(limit as usize)
-            .map(|net| NetRow {
-                name: net.name.clone(),
-                code: net.code,
-                fanout: net.pins.len(),
-                pin_types: net.pin_types.clone(),
+            .map(|net| {
+                let hierarchy = Self::net_hierarchy(&net.name);
+                NetRow {
+                    name: net.name.clone(),
+                    code: net.code,
+                    fanout: net.pins.len(),
+                    pin_types: net.pin_types.clone(),
+                    sheet_path: hierarchy.sheet_path,
+                    depth: hierarchy.depth,
+                }
             })
             .collect();
 
@@ -669,6 +676,29 @@ impl Design {
             ic_pin_count: counts.ic,
             passive_only,
         }
+    }
+
+    /// Pure, structural decomposition of a net name by its '/'-separated
+    /// hierarchy. Splits on '/' and drops empty segments (so a leading '/'
+    /// and any repeated slashes are both handled cleanly). Does not infer
+    /// intended connectivity, scope, or cross-sheet bridging — only reports
+    /// the name's literal segment structure. Reused by `get_net` (embedded
+    /// as `hierarchy`) and `filter_nets` (compact `sheet_path`/`depth`
+    /// fields on each row).
+    pub fn net_hierarchy(name: &str) -> NetHierarchy {
+        let rooted = name.starts_with('/');
+        let segments: Vec<&str> = name.split('/').filter(|s| !s.is_empty()).collect();
+
+        let local_name = segments.last().copied().unwrap_or(name).to_string();
+        let depth = segments.len().saturating_sub(1);
+        let sheet_path = if segments.len() > 1 {
+            Some(format!("/{}", segments[..segments.len() - 1].join("/")))
+        } else {
+            None
+        };
+        let scope_hint = if rooted { "hierarchical" } else { "flat" };
+
+        NetHierarchy { rooted, local_name, sheet_path, depth, scope_hint }
     }
 
     /// Scan every net and bucket it into FACTUAL, non-exclusive categories
@@ -1395,6 +1425,7 @@ struct NetDetail {
     pin_types: HashMap<String, i32>,
     subsystems: Vec<String>,
     role: NetRole,
+    hierarchy: NetHierarchy,
     offset: u32,
     limit: u32,
     returned: usize,
@@ -1420,6 +1451,31 @@ pub struct NetRole {
     /// True if every pin's owning component is a passive class (R/L/C/FB) —
     /// i.e. no IC, connector, or other class touches this net.
     pub passive_only: bool,
+}
+
+/// Structural decomposition of a net name by its '/'-separated hierarchy.
+/// This is a naming-structure HINT derived purely from the name string — it
+/// is NOT an authoritative statement of electrical or schematic scope.
+/// KiCad's netlist export does not cleanly distinguish global vs. local
+/// nets, so this deliberately makes no claim about intended connectivity or
+/// cross-sheet relationships; it only reports what the name's slash
+/// structure looks like. See `Design::net_hierarchy`.
+#[derive(Debug, Serialize, Clone)]
+pub struct NetHierarchy {
+    /// True if the net name starts with '/' (KiCad's hierarchical-path prefix).
+    pub rooted: bool,
+    /// The last '/'-separated segment of the name (the whole name if flat).
+    pub local_name: String,
+    /// All-but-last '/'-separated segments, rejoined with a leading '/', or
+    /// `None` when there is only one segment (no path prefix).
+    pub sheet_path: Option<String>,
+    /// Count of path segments before `local_name` (0 for flat names like
+    /// `GND` and for single-segment rooted names like `/FOO#`).
+    pub depth: usize,
+    /// "flat" if the name has no leading '/' (typically a power/global
+    /// label such as GND or +3.3V), else "hierarchical". A naming-structure
+    /// hint only — not a verified or guaranteed scope.
+    pub scope_hint: &'static str,
 }
 
 /// Internal per-net tally of owning-component classes, computed by
@@ -1540,12 +1596,16 @@ struct NeighborsEnvelope {
 
 /// One filter_nets hit: net identity, fanout, and the raw per-type pin histogram.
 /// Member pins are deliberately not expanded — that is get_net's job.
+/// `sheet_path`/`depth` are the compact half of `NetHierarchy` (see
+/// `Design::net_hierarchy`) — a naming-structure hint, not a scope guarantee.
 #[derive(Debug, Serialize)]
 struct NetRow {
     name: String,
     code: usize,
     fanout: usize,
     pin_types: HashMap<String, i32>,
+    sheet_path: Option<String>,
+    depth: usize,
 }
 
 #[derive(Debug, Serialize)]

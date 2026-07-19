@@ -1515,6 +1515,18 @@ struct PathBetweenEnvelope {
 /// Drop candidates below this so pure noise doesn't surface.
 const SCORE_FLOOR: f32 = 0.15;
 
+// Field weights for the fallback term-match tier in `score_component` (see
+// `term_match_score`). Named consts so the relative trust placed in each
+// field is visible and easy to retune. `sheet` is deliberately the lowest —
+// a sheet is a schematic LOCATION, not a part identity, so a query that only
+// matches a page name (e.g. "adc" hitting `/ADC1/`) must not compete with a
+// query that actually matches the part's own value/keywords/description.
+const TERM_WEIGHT_VALUE: f32 = 0.60;
+const TERM_WEIGHT_KEYWORDS: f32 = 0.58;
+const TERM_WEIGHT_DESCRIPTION: f32 = 0.48;
+const TERM_WEIGHT_FOOTPRINT: f32 = 0.32;
+const TERM_WEIGHT_SHEET: f32 = 0.25;
+
 // Hand-tuned priors for `Design::rail_score`. Kept as named consts so they
 // are easy to retune without hunting through the scoring logic.
 const RAIL_WEIGHT_POWER_FRAC: f32 = 0.45;
@@ -1601,19 +1613,90 @@ fn score_component(query_squash: &str, terms: &[&str], comp: &Component) -> Opti
         return Some((0.65, "value substring".to_string()));
     }
 
-    // Tiers 4 & 5: whitespace terms against the searchable bundle.
-    if !terms.is_empty() {
-        let bundle = comp.search_bundle();
-        let matched = terms.iter().filter(|t| bundle.contains(**t)).count();
-        let n = terms.len();
+    // Tiers 4 & 5: field-weighted, token-aware term matching (see
+    // `term_match_score`) — replaces the old flat "terms against the
+    // flattened bundle" tier so a query that only hits a component's sheet
+    // name doesn't score the same as one that hits its value or keywords.
+    term_match_score(terms, comp)
+}
+
+/// Lowercase `s` and split on runs of non-alphanumeric characters into tokens.
+/// Used by `term_match_score` so a term matches whole tokens (or a token
+/// prefix), never a mid-word substring — "res" must not match "pressure".
+fn tokenize(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// A query term "matches" a field if any of the field's tokens equals the
+/// term or starts with it (prefix match: "adc" matches token "adc1", "spi"
+/// matches "spi6").
+fn term_matches_field(term: &str, tokens: &[String]) -> bool {
+    tokens.iter().any(|tok| tok == term || tok.starts_with(term))
+}
+
+/// Field-weighted, token-aware fallback for `score_component`, reached only
+/// when the exact/base-match/substring tiers (1-3) didn't fire. Scores each
+/// named field independently (value, keywords, description, footprint,
+/// sheet — see the `TERM_WEIGHT_*` consts) rather than one flattened bundle,
+/// so the `match_reason` can name exactly which field earned the score.
+///
+/// If every query term matches a single field's tokens, that field "fires"
+/// at its full weight; the max weight among firing fields wins. Otherwise
+/// the best partial (highest `weight * matched/total` among fields with at
+/// least one matching term) sets a capped score, kept below the weakest
+/// full-field fire (`sheet` at `TERM_WEIGHT_SHEET`) so partial matches never
+/// masquerade as a real field hit. `None` if nothing matches at all.
+fn term_match_score(terms: &[&str], comp: &Component) -> Option<(f32, String)> {
+    if terms.is_empty() {
+        return None;
+    }
+    let n = terms.len();
+
+    let keywords = comp.properties.get("ki_keywords").and_then(|v| v.as_deref());
+    let fields: [(&str, f32, Option<&str>); 5] = [
+        ("value", TERM_WEIGHT_VALUE, Some(comp.value.as_str())),
+        ("keywords", TERM_WEIGHT_KEYWORDS, keywords),
+        ("description", TERM_WEIGHT_DESCRIPTION, comp.description.as_deref()),
+        ("footprint", TERM_WEIGHT_FOOTPRINT, comp.footprint.as_deref()),
+        ("sheet", TERM_WEIGHT_SHEET, comp.sheet.as_deref()),
+    ];
+
+    let mut best_full: Option<(f32, &str)> = None;
+    let mut best_partial: Option<(f32, usize, &str)> = None; // (weight*ratio, matched, field)
+
+    for (label, weight, text) in fields {
+        let Some(text) = text else { continue };
+        let tokens = tokenize(text);
+        if tokens.is_empty() {
+            continue;
+        }
+        let matched = terms.iter().filter(|t| term_matches_field(t, &tokens)).count();
+        if matched == 0 {
+            continue;
+        }
         if matched == n {
-            return Some((0.55, "all terms matched".to_string()));
-        } else if matched > 0 {
-            let score = 0.20 + 0.25 * (matched as f32 / n as f32);
-            return Some((score, format!("matched {matched}/{n} terms")));
+            if best_full.is_none_or(|(w, _)| weight > w) {
+                best_full = Some((weight, label));
+            }
+        } else {
+            let ratio_weighted = weight * (matched as f32 / n as f32);
+            if best_partial.is_none_or(|(rw, _, _)| ratio_weighted > rw) {
+                best_partial = Some((ratio_weighted, matched, label));
+            }
         }
     }
 
+    if let Some((weight, label)) = best_full {
+        return Some((weight, format!("all terms in {label}")));
+    }
+    if let Some((ratio_weighted, matched, label)) = best_partial {
+        let score = 0.15 + 0.30 * ratio_weighted;
+        return Some((score, format!("matched {matched}/{n} terms in {label}")));
+    }
     None
 }
 

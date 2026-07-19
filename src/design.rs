@@ -1261,6 +1261,7 @@ impl Design {
             large_nets,
             dead_ends,
             truncated,
+            reached_net_count: visited_nets.len(),
         }
     }
 
@@ -1289,6 +1290,7 @@ impl Design {
                 return Self::path_between_envelope(
                     from, to, false, None, Vec::new(),
                     Some("from pin is unconnected".to_string()),
+                    None,
                 );
             }
         };
@@ -1296,11 +1298,11 @@ impl Design {
         // Trivial: same pin, or already on the same net (no passthrough hop
         // needed at all).
         if from_pin_id.0 == to_pin_id.0 {
-            return Self::path_between_envelope(from, to, true, Some(0), Vec::new(), None);
+            return Self::path_between_envelope(from, to, true, Some(0), Vec::new(), None, None);
         }
         if let Some(to_net) = &to_pin.net {
             if to_net.0 == from_net_id.0 {
-                return Self::path_between_envelope(from, to, true, Some(0), Vec::new(), None);
+                return Self::path_between_envelope(from, to, true, Some(0), Vec::new(), None, None);
             }
         }
 
@@ -1318,6 +1320,7 @@ impl Design {
                 true,
                 Some(ep.distance),
                 Self::clone_via(&ep.via),
+                None,
                 None,
             );
         }
@@ -1337,10 +1340,12 @@ impl Design {
                         "only via rail {} (shared power/ground, not a signal path)",
                         rail.net
                     )),
+                    None,
                 );
             }
         }
 
+        let diagnosis = self.path_diagnosis(to_pin_id, &data);
         Self::path_between_envelope(
             from,
             to,
@@ -1348,6 +1353,7 @@ impl Design {
             None,
             Vec::new(),
             Some("no passthrough path within depth 6 (rails are not crossed)".to_string()),
+            Some(diagnosis),
         )
     }
 
@@ -1368,6 +1374,7 @@ impl Design {
         distance: Option<u32>,
         via: Vec<ViaPart>,
         note: Option<String>,
+        diagnosis: Option<PathDiagnosis>,
     ) -> anyhow::Result<String> {
         let envelope = PathBetweenEnvelope {
             from: from.to_string(),
@@ -1376,8 +1383,39 @@ impl Design {
             distance,
             via,
             note,
+            diagnosis,
         };
         Ok(serde_json::to_string_pretty(&envelope).context("error serializing path_between")?)
+    }
+
+    /// Build the `diagnosis` attached to a negative `path_between` result:
+    /// the boundary of `from`'s reachable region, read off the `WalkData`
+    /// `path_between` already computed from `from` (no second walk). Purely
+    /// descriptive of what `from` reaches — never a suggestion that `to`
+    /// should be joined to it.
+    fn path_diagnosis(&self, to_pin_id: &PinId, data: &WalkData) -> PathDiagnosis {
+        let to_pin = self.pin(to_pin_id);
+        let to_net = to_pin.net.as_ref().map(|n| self.net(n).name.clone());
+
+        let sample = data
+            .endpoints
+            .iter()
+            .take(12)
+            .map(|e| DiagnosisReach {
+                pin: e.pin.clone(),
+                kind: e.kind.clone(),
+            })
+            .collect();
+
+        PathDiagnosis {
+            to_net,
+            from_reachable_nets: data.reached_net_count,
+            from_reaches: FromReaches {
+                count: data.endpoints.len(),
+                sample,
+            },
+            from_rails: data.rails_reached.iter().map(|r| r.net.clone()).collect(),
+        }
     }
 
     pub fn from_netlist(netlist: netlist::Netlist) -> anyhow::Result<Design> {
@@ -1824,6 +1862,11 @@ struct WalkData {
     large_nets: Vec<LargeNet>,
     dead_ends: Vec<DeadEnd>,
     truncated: bool,
+    /// Count of distinct nets `walk_bfs` visited (its `visited_nets` set size)
+    /// — the size of the connected component reached from the start, used by
+    /// `path_between`'s negative-result diagnosis. Does not affect walk/BFS
+    /// behavior.
+    reached_net_count: usize,
 }
 
 /// One series part traversed on the way to an endpoint or terminal net.
@@ -1903,7 +1946,8 @@ struct WalkEnvelope {
 
 /// The `path_between` output envelope. `via` is empty for a direct same-net
 /// (or same-pin) connection; `distance` is the passthrough hop count, null
-/// when not connected.
+/// when not connected. `diagnosis` is only populated when `connected` is
+/// false and a `from`-side walk was actually performed.
 #[derive(Debug, Serialize)]
 struct PathBetweenEnvelope {
     from: String,
@@ -1912,6 +1956,40 @@ struct PathBetweenEnvelope {
     distance: Option<u32>,
     via: Vec<ViaPart>,
     note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnosis: Option<PathDiagnosis>,
+}
+
+/// One endpoint in a `path_diagnosis` reachability sample: just enough to
+/// place it (pin + broad function kind), matching `WalkEndpoint::kind`.
+#[derive(Debug, Serialize)]
+struct DiagnosisReach {
+    pin: String,
+    kind: String,
+}
+
+/// Capped sample of the endpoints `from` can reach, plus the true total.
+#[derive(Debug, Serialize)]
+struct FromReaches {
+    count: usize,
+    sample: Vec<DiagnosisReach>,
+}
+
+/// Factual description of the boundary of `from`'s reachable region, attached
+/// to a negative `path_between` result so the caller can see where `from`'s
+/// connectivity actually stops instead of a bare `false`. Never states or
+/// implies that nets *should* be joined — purely a report of what `from`
+/// already reaches.
+#[derive(Debug, Serialize)]
+struct PathDiagnosis {
+    /// The net `to` sits on, or null if `to` pin has no net at all.
+    to_net: Option<String>,
+    /// Distinct nets in `from`'s connected component (the BFS's visited-net
+    /// count).
+    from_reachable_nets: usize,
+    from_reaches: FromReaches,
+    /// Power/ground rail net names `from`'s walk reached.
+    from_rails: Vec<String>,
 }
 
 /// Drop candidates below this so pure noise doesn't surface.

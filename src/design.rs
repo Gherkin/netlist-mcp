@@ -934,6 +934,21 @@ impl Design {
             .to_uppercase()
     }
 
+    /// Map a refdes class to `walk`'s endpoint `kind` tag: a broad function
+    /// grouping for opaque endpoints. Rails are reported separately
+    /// (`rails_reached`), so there is no "rail" kind here.
+    fn endpoint_kind(class: &str) -> String {
+        match class {
+            "U" => "ic",
+            "J" | "P" => "connector",
+            "D" => "diode",
+            "Q" => "transistor",
+            "TP" => "test_point",
+            _ => "other",
+        }
+        .to_string()
+    }
+
     /// Map a via chain of passthrough components to the compact {refdes,value,class}
     /// rows the walk envelope reports.
     fn via_parts(&self, via: &[CompId]) -> Vec<ViaPart> {
@@ -1019,6 +1034,7 @@ impl Design {
             endpoints: data.endpoints,
             rails_reached: data.rails_reached,
             large_nets: data.large_nets,
+            dead_ends: data.dead_ends,
             truncated: data.truncated,
         };
         return Ok(serde_json::to_string_pretty(&envelope).context("error serializing walk")?);
@@ -1028,6 +1044,13 @@ impl Design {
     /// net -> pins -> owning component -> (through a passthrough?) -> other net.
     /// Rails (score >= 0.5 when `stop_at_power`) and large nets (fanout > 40) are
     /// terminal. Cycles are cut by `visited_nets` / `visited_comps`.
+    ///
+    /// Also surfaces `dead_ends`: branches that fizzle out through a passthrough
+    /// (never the start net itself) instead of reaching a real endpoint — a
+    /// passthrough whose far pin is NC/single-pin ("dangling"), or a reached net
+    /// with no active (U/J/P/Q) component on it ("passive_only"). These are
+    /// additive/diagnostic and never change which endpoints/rails/large_nets are
+    /// reported.
     fn walk_bfs(
         &self,
         start_net: &NetId,
@@ -1042,10 +1065,12 @@ impl Design {
         let mut visited_nets: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut visited_comps: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut endpoint_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut dead_end_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let mut endpoints: Vec<WalkEndpoint> = Vec::new();
         let mut rails_reached: Vec<RailReached> = Vec::new();
         let mut large_nets: Vec<LargeNet> = Vec::new();
+        let mut dead_ends: Vec<DeadEnd> = Vec::new();
         let mut truncated = false;
 
         let mut queue: std::collections::VecDeque<(usize, Vec<CompId>, u32)> =
@@ -1080,6 +1105,44 @@ impl Design {
                     });
                     continue;
                 }
+
+                // passive_only dead end: this net was reached through at least
+                // one passthrough (via is never empty here) and carries no
+                // active (U/J/P/Q) endpoint — only passives and/or test points.
+                let mut has_active = false;
+                let mut passive_seen: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                let mut passive_parts: Vec<ViaPart> = Vec::new();
+                for pin_id in &net.pins {
+                    let pin = self.pin(pin_id);
+                    let comp = self.component(&pin.comp);
+                    let class = Self::refdes_class(&comp.refdes);
+                    match class.as_str() {
+                        "U" | "J" | "P" | "Q" => has_active = true,
+                        "R" | "L" | "C" | "FB" => {
+                            if passive_seen.insert(pin.comp.0) {
+                                passive_parts.push(ViaPart {
+                                    refdes: comp.refdes.clone(),
+                                    value: comp.value.clone(),
+                                    class,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !has_active
+                    && dead_end_seen.insert(net.name.clone())
+                    && dead_ends.len() < max_endpoints as usize
+                {
+                    dead_ends.push(DeadEnd {
+                        net: Some(net.name.clone()),
+                        fanout: net.pins.len(),
+                        via: self.via_parts(&via),
+                        parts: passive_parts,
+                        reason: "only passives, no active endpoint".to_string(),
+                    });
+                }
             }
 
             for pin_id in &net.pins {
@@ -1101,24 +1164,62 @@ impl Design {
                     comp.pins.len() == 2 && matches!(class.as_str(), "R" | "L" | "FB" | "C");
 
                 if is_passthrough {
-                    // The OTHER pin: this comp's pin whose net differs from the
-                    // current one. Exactly one such Some(net) pin => traverse.
-                    let others: Vec<usize> = comp
-                        .pins
-                        .iter()
-                        .filter_map(|p| self.pin(p).net.as_ref().map(|n| n.0))
-                        .filter(|n| *n != net_idx)
-                        .collect();
-                    if others.len() != 1 {
-                        // NC other pin, or both pins on the same net -> dead end.
+                    // The OTHER pin on this 2-pin component (not the one we
+                    // arrived on).
+                    let other_pin_id = comp.pins.iter().find(|p| p.0 != pin_id.0);
+                    let other_pin_has_no_net = other_pin_id
+                        .map(|p| self.pin(p).net.is_none())
+                        .unwrap_or(false);
+                    let other_net_idx: Option<usize> = other_pin_id
+                        .and_then(|p| self.pin(p).net.as_ref().map(|n| n.0))
+                        .filter(|n| *n != net_idx);
+
+                    visited_comps.insert(comp_id.0);
+
+                    if other_pin_has_no_net {
+                        // Far pin is NC -> dangling, goes nowhere.
+                        let mut via_here = via.clone();
+                        via_here.push(CompId(comp_id.0));
+                        let key = format!("nc:{}", comp.refdes);
+                        if dead_end_seen.insert(key) && dead_ends.len() < max_endpoints as usize {
+                            dead_ends.push(DeadEnd {
+                                net: None,
+                                fanout: 0,
+                                via: self.via_parts(&via_here),
+                                parts: Vec::new(),
+                                reason: "dangling (goes nowhere)".to_string(),
+                            });
+                        }
                         continue;
                     }
-                    let other_net = others[0];
-                    visited_comps.insert(comp_id.0);
+                    let Some(other_net_idx) = other_net_idx else {
+                        // Both leads land on the same net (short/loop) —
+                        // nothing further to traverse.
+                        continue;
+                    };
+                    let other_net = self.net(&NetId(other_net_idx));
+                    if other_net.pins.len() == 1 {
+                        // Far pin's net has fanout 1 (only that pin) ->
+                        // dangling, goes nowhere.
+                        let mut via_here = via.clone();
+                        via_here.push(CompId(comp_id.0));
+                        if dead_end_seen.insert(other_net.name.clone())
+                            && dead_ends.len() < max_endpoints as usize
+                        {
+                            dead_ends.push(DeadEnd {
+                                net: Some(other_net.name.clone()),
+                                fanout: 1,
+                                via: self.via_parts(&via_here),
+                                parts: Vec::new(),
+                                reason: "dangling (goes nowhere)".to_string(),
+                            });
+                        }
+                        continue;
+                    }
                     if depth < max_depth {
                         let mut next_via = via.clone();
                         next_via.push(CompId(comp_id.0));
-                        queue.push_back((other_net, next_via, depth + 1));
+                        queue.push_back((other_net_idx, next_via, depth + 1));
                     } else {
                         // Depth-limited branch.
                         truncated = true;
@@ -1146,6 +1247,7 @@ impl Design {
                             description: comp.description.clone(),
                             sheet: comp.sheet.clone(),
                         },
+                        kind: Self::endpoint_kind(&class),
                         via: self.via_parts(&via),
                         distance: depth,
                     });
@@ -1157,6 +1259,7 @@ impl Design {
             endpoints,
             rails_reached,
             large_nets,
+            dead_ends,
             truncated,
         }
     }
@@ -1719,6 +1822,7 @@ struct WalkData {
     endpoints: Vec<WalkEndpoint>,
     rails_reached: Vec<RailReached>,
     large_nets: Vec<LargeNet>,
+    dead_ends: Vec<DeadEnd>,
     truncated: bool,
 }
 
@@ -1747,8 +1851,25 @@ struct WalkEndpoint {
     pin_name: Option<String>,
     pin_type: Option<String>,
     component: EndpointComponent,
+    /// Broad function grouping derived from the endpoint's refdes class:
+    /// "ic", "connector", "diode", "transistor", "test_point", or "other".
+    kind: String,
     via: Vec<ViaPart>,
     distance: u32,
+}
+
+/// A branch that fizzled out instead of reaching a real endpoint: reached
+/// only through at least one passthrough (`via` non-empty, never the start
+/// net). Either a passthrough whose far pin is NC or lands on a single-pin
+/// net ("dangling"), or a reached net with no active (U/J/P/Q) component on
+/// it ("passive_only").
+#[derive(Debug, Serialize)]
+struct DeadEnd {
+    net: Option<String>,
+    fanout: usize,
+    via: Vec<ViaPart>,
+    parts: Vec<ViaPart>,
+    reason: String,
 }
 
 /// A power/ground rail the walk stopped at (reported, never enumerated).
@@ -1776,6 +1897,7 @@ struct WalkEnvelope {
     endpoints: Vec<WalkEndpoint>,
     rails_reached: Vec<RailReached>,
     large_nets: Vec<LargeNet>,
+    dead_ends: Vec<DeadEnd>,
     truncated: bool,
 }
 

@@ -1127,7 +1127,7 @@ impl Design {
             comp_map.insert(comp.refdes.clone(), CompId(i));
 
             for netlist_pin in netlist_comp.pins {
-                let net_no = netlist_pin.net.context("no net code for pin!")?;
+                let net_no = netlist_pin.net.with_context(|| format!("no net code for pin {}:{}! netlist pin: {:?}", comp.refdes, netlist_pin.number, netlist_pin))?;
                 let net_id = nets
                     .iter()
                     .position(|y: &Net| net_no == y.code)

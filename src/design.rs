@@ -82,6 +82,7 @@ impl Design {
         let envelope = ComponentDetail {
             refdes: comp.refdes.clone(),
             value: comp.value.clone(),
+            value_norm: comp.value_norm.clone(),
             description: comp.description.clone(),
             keywords: comp.properties.get("ki_keywords").cloned().flatten(),
             footprint: comp.footprint.clone(),
@@ -345,6 +346,7 @@ impl Design {
             .map(|comp| FilterRow {
                 refdes: comp.refdes.clone(),
                 value: comp.value.clone(),
+                value_norm: comp.value_norm.clone(),
                 description: comp.description.clone(),
                 footprint: comp.footprint.clone(),
                 sheet: comp.sheet.clone(),
@@ -413,6 +415,7 @@ impl Design {
                 row: FilterRow {
                     refdes: comp.refdes.clone(),
                     value: comp.value.clone(),
+                    value_norm: comp.value_norm.clone(),
                     description: comp.description.clone(),
                     footprint: comp.footprint.clone(),
                     sheet: comp.sheet.clone(),
@@ -1295,10 +1298,12 @@ impl Design {
         let mut pin_map: HashMap<String, PinId> = HashMap::new();
         let mut j: usize = 0;
         for (i, netlist_comp) in netlist.components.into_iter().enumerate() {
+            let value_norm = normalize_value(&netlist_comp.value, &Self::refdes_class(&netlist_comp.refdes));
             let mut comp = Component {
                 id: CompId(i),
                 refdes: netlist_comp.refdes,
                 value: netlist_comp.value,
+                value_norm,
                 footprint: netlist_comp.footprint,
                 description: netlist_comp.description,
                 sheet: netlist_comp.sheet,
@@ -1388,6 +1393,7 @@ struct ComponentPinRow {
 struct ComponentDetail {
     refdes: String,
     value: String,
+    value_norm: Option<ValueNorm>,
     description: Option<String>,
     keywords: Option<String>,
     footprint: Option<String>,
@@ -1550,6 +1556,7 @@ struct PinDetail {
 struct FilterRow {
     refdes: String,
     value: String,
+    value_norm: Option<ValueNorm>,
     description: Option<String>,
     footprint: Option<String>,
     sheet: Option<String>,
@@ -1989,11 +1996,181 @@ pub struct Component {
     id: CompId,
     refdes: String,
     value: String,
+    value_norm: Option<ValueNorm>,
     footprint: Option<String>,
     description: Option<String>,
     sheet: Option<String>,
     properties: HashMap<String, Option<String>>,
     pins: Vec<PinId>
+}
+
+/// Best-effort normalization of a passive's raw `value` string into a base-unit
+/// magnitude plus a canonical display form. `value` stays authoritative — this
+/// is a derived convenience field so callers can group/count/compare passives
+/// (e.g. "33 pF" and "33p") without reparsing free text themselves.
+#[derive(Debug, Serialize, Clone)]
+pub struct ValueNorm {
+    /// The value in base SI units (ohms for R, farads for C, henries for L).
+    pub magnitude: f64,
+    /// The base unit symbol: "Ω", "F", or "H".
+    pub unit: String,
+    /// A normalized display string using the SI prefix that puts the
+    /// mantissa in [1, 1000), e.g. "348kΩ", "33pF", "4.7µF", "0Ω".
+    pub canonical: String,
+}
+
+/// SI prefix letter -> multiplier. Case-sensitive: lowercase 'm' is milli,
+/// uppercase 'M' is mega; 'u' and 'µ' both mean micro.
+fn si_prefix(c: char) -> Option<f64> {
+    match c {
+        'p' => Some(1e-12),
+        'n' => Some(1e-9),
+        'u' | 'µ' => Some(1e-6),
+        'm' => Some(1e-3),
+        'k' => Some(1e3),
+        'M' => Some(1e6),
+        'G' => Some(1e9),
+        _ => None,
+    }
+}
+
+/// True if `c` is the class's own base-unit letter (case-insensitive), or the
+/// ohm sign for resistors.
+fn is_unit_char(c: char, unit_letter: char) -> bool {
+    (unit_letter == 'R' && c == 'Ω') || c.to_ascii_uppercase() == unit_letter
+}
+
+/// Strip a trailing long-form unit word ("ohm"/"ohms", case-insensitive) —
+/// only resistors spell the unit out as a word in practice.
+fn strip_long_unit_word(tok: &str, unit_letter: char) -> &str {
+    if unit_letter != 'R' {
+        return tok;
+    }
+    let lower = tok.to_lowercase();
+    if lower.ends_with("ohms") {
+        &tok[..tok.len() - 4]
+    } else if lower.ends_with("ohm") {
+        &tok[..tok.len() - 3]
+    } else {
+        tok
+    }
+}
+
+/// Parse one value token ("348k", "4R7", "0.1uF", "10R", "100n") into a
+/// base-unit magnitude. Handles a trailing SI-prefix/unit suffix ("100n",
+/// "0.1uF") and the decimal-marker style where the prefix or unit letter
+/// stands in for the decimal point ("4k7" -> 4700, "4R7" -> 4.7). Returns
+/// `None` when the token carries no usable leading digits (e.g. "placeholder",
+/// bare "R").
+fn parse_value_token(tok: &str, unit_letter: char) -> Option<f64> {
+    let tok = strip_long_unit_word(tok, unit_letter);
+    if tok.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = tok.chars().collect();
+    let marker_pos = chars.iter().position(|&c| si_prefix(c).is_some() || is_unit_char(c, unit_letter));
+
+    let Some(pos) = marker_pos else {
+        return tok.parse::<f64>().ok();
+    };
+
+    let int_part: String = chars[..pos].iter().collect();
+    if int_part.is_empty() {
+        return None;
+    }
+    let marker_mult = si_prefix(chars[pos]).unwrap_or(1.0);
+    let tail: String = chars[pos + 1..].iter().collect();
+
+    if tail.is_empty() {
+        int_part.parse::<f64>().ok().map(|n| n * marker_mult)
+    } else if tail.chars().all(|c| c.is_ascii_digit()) {
+        // Decimal-marker style: the marker itself acts as the decimal point.
+        format!("{int_part}.{tail}").parse::<f64>().ok().map(|n| n * marker_mult)
+    } else {
+        // e.g. "0.1uF": marker 'u' consumed, tail "F" must itself be the unit letter.
+        let tail_chars: Vec<char> = tail.chars().collect();
+        let tail_is_unit = tail_chars.len() == 1 && is_unit_char(tail_chars[0], unit_letter);
+        if tail_is_unit {
+            int_part.parse::<f64>().ok().map(|n| n * marker_mult)
+        } else {
+            None
+        }
+    }
+}
+
+/// A bare unit token with no leading digits, e.g. "pF" in "33 pF" — used only
+/// as a fallback when the value's first token is a plain number and a later
+/// token spells out the prefix/unit.
+fn parse_unit_only_token(tok: &str, unit_letter: char) -> Option<f64> {
+    let tok = strip_long_unit_word(tok, unit_letter);
+    let chars: Vec<char> = tok.chars().collect();
+    match chars.len() {
+        1 if is_unit_char(chars[0], unit_letter) => Some(1.0),
+        2 if is_unit_char(chars[1], unit_letter) => si_prefix(chars[0]),
+        _ => None,
+    }
+}
+
+/// Render a base-unit magnitude as a canonical display string using the SI
+/// prefix that puts the mantissa in roughly [1, 1000).
+fn format_canonical(magnitude: f64, unit_symbol: &str) -> String {
+    if magnitude == 0.0 {
+        return format!("0{unit_symbol}");
+    }
+    const PREFIXES: &[(f64, &str)] = &[
+        (1e9, "G"), (1e6, "M"), (1e3, "k"), (1.0, ""),
+        (1e-3, "m"), (1e-6, "µ"), (1e-9, "n"), (1e-12, "p"),
+    ];
+    let abs = magnitude.abs();
+    let chosen = PREFIXES.iter()
+        .find(|(threshold, _)| abs >= *threshold)
+        .unwrap_or_else(|| PREFIXES.last().unwrap());
+    let mantissa = magnitude / chosen.0;
+    let rounded = (mantissa * 1000.0).round() / 1000.0;
+    let mantissa_str = if rounded.fract() == 0.0 {
+        format!("{}", rounded as i64)
+    } else {
+        format!("{:.3}", rounded).trim_end_matches('0').trim_end_matches('.').to_string()
+    };
+    format!("{mantissa_str}{}{unit_symbol}", chosen.1)
+}
+
+/// Best-effort parse of a passive's raw `value` into a normalized magnitude.
+/// Only meaningful for R/C/L (resistors/capacitors/inductors); any other
+/// `refdes_class` returns `None`. The FIRST whitespace-separated token in
+/// `value` is taken as the value token; later tokens (ratings like "50V",
+/// dielectric codes like "C0G") are ignored for the magnitude, except that
+/// when the first token is a bare number, a later token may supply the
+/// prefix/unit (e.g. "33 pF").
+pub fn normalize_value(value: &str, refdes_class: &str) -> Option<ValueNorm> {
+    let (unit_symbol, unit_letter) = match refdes_class {
+        "R" => ("Ω", 'R'),
+        "C" => ("F", 'F'),
+        "L" => ("H", 'H'),
+        _ => return None,
+    };
+
+    let mut tokens = value.split_whitespace();
+    let first = tokens.next()?;
+    let stripped = strip_long_unit_word(first, unit_letter);
+    if stripped.is_empty() {
+        return None;
+    }
+    let has_marker = stripped.chars().any(|c| si_prefix(c).is_some() || is_unit_char(c, unit_letter));
+
+    let magnitude = if has_marker {
+        parse_value_token(first, unit_letter)?
+    } else {
+        let bare: f64 = stripped.parse().ok()?;
+        let mult = tokens.find_map(|t| parse_unit_only_token(t, unit_letter)).unwrap_or(1.0);
+        bare * mult
+    };
+
+    Some(ValueNorm {
+        magnitude,
+        unit: unit_symbol.to_string(),
+        canonical: format_canonical(magnitude, unit_symbol),
+    })
 }
 
 impl Component {
@@ -2050,4 +2227,80 @@ pub struct Net {
     pub name: String,
     pub pins: Vec<PinId>,
     pub pin_types: HashMap<String, i32>
+}
+
+#[cfg(test)]
+mod value_norm_tests {
+    use super::normalize_value;
+
+    #[test]
+    fn parses_pf_written_as_trailing_token() {
+        let v = normalize_value("33 pF", "C").expect("should parse");
+        assert_eq!(v.canonical, "33pF");
+        assert!((v.magnitude - 33e-12).abs() < 1e-20);
+    }
+
+    #[test]
+    fn parses_pf_written_as_prefix_suffix() {
+        let v = normalize_value("33p", "C").expect("should parse");
+        assert_eq!(v.canonical, "33pF");
+        assert!((v.magnitude - 33e-12).abs() < 1e-20);
+    }
+
+    #[test]
+    fn parses_kilohm_resistor() {
+        let v = normalize_value("348k", "R").expect("should parse");
+        assert_eq!(v.canonical, "348kΩ");
+        assert!((v.magnitude - 348000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parses_microfarad_with_voltage_rating() {
+        let v = normalize_value("4.7u 25V", "C").expect("should parse");
+        assert_eq!(v.canonical, "4.7µF");
+        assert!((v.magnitude - 4.7e-6).abs() < 1e-15);
+    }
+
+    #[test]
+    fn zero_ohm_resistor() {
+        let v = normalize_value("0", "R").expect("should parse");
+        assert_eq!(v.canonical, "0Ω");
+        assert_eq!(v.magnitude, 0.0);
+    }
+
+    #[test]
+    fn decimal_marker_style_resistor() {
+        let v = normalize_value("4k7", "R").expect("should parse");
+        assert!((v.magnitude - 4700.0).abs() < 1e-9);
+
+        let v = normalize_value("4R7", "R").expect("should parse");
+        assert!((v.magnitude - 4.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trailing_unit_letter_on_resistor() {
+        let v = normalize_value("10R", "R").expect("should parse");
+        assert!((v.magnitude - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prefix_and_unit_letter_concatenated() {
+        let v = normalize_value("0.1uF", "C").expect("should parse");
+        assert!((v.magnitude - 1e-7).abs() < 1e-15);
+    }
+
+    #[test]
+    fn rejects_placeholder_junk() {
+        assert!(normalize_value("placeholder", "C").is_none());
+    }
+
+    #[test]
+    fn rejects_bare_class_letter() {
+        assert!(normalize_value("R", "R").is_none());
+    }
+
+    #[test]
+    fn non_passive_class_returns_none() {
+        assert!(normalize_value("STM32F407VGT6", "U").is_none());
+    }
 }

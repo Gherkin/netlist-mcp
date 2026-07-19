@@ -22,50 +22,6 @@ pub struct Design {
 }
 
 impl Design {
-    pub fn pin_to_string(&self, pin_id: &PinId) -> String {
-        let pin = self.pin(pin_id);
-        let comp = self.comp(&pin.comp);
-        let mut out = String::new();
-        out.push_str(&format!("{}:{}", comp.refdes, pin.number));
-        match &pin.name {
-            Some(name) => {
-                if name.len() > 0 {
-                    out.push_str(&format!(" ({})", name));
-                }
-            }
-            None => {}
-        }
-
-        match &pin.pin_type {
-            Some(pin_type) => {
-                if pin_type.len() > 0 {
-                    out.push_str(&format!(" (type: {})", pin_type));
-                }
-            }
-            None => {}
-        }
-
-        match &pin.net {
-            Some(net_id) => {
-                let net = self.net(&net_id);
-                if net.name.len() > 0 {
-                    out.push_str(&format!(" - {}", net.name));
-                } else {
-                    out.push_str(" - Not Connected");
-                }
-            }
-            None => {
-                out.push_str(" - Not Connected");
-            }
-        }
-        
-        return out;
-    }
-
-    pub fn comp(&self, comp_id: &CompId) -> &Component {
-        &self.components[comp_id.0 as usize]
-    }
-
     pub fn pin(&self, pin_id: &PinId) -> &Pin {
         &self.pins[pin_id.0 as usize]
     }
@@ -81,40 +37,8 @@ impl Design {
         return format!("{}:{}", comp.refdes, pin.number);
     }
 
-    fn pin_from_name(&self, pin_name: &String) -> anyhow::Result<&Pin> {
-        let pin_id = self.pin_map.get(pin_name).with_context(|| format!("no pin named '{}'", pin_name))?;
-
-        return Ok(self.pin(pin_id));
-    }
-
-    fn net_from_name(&self, net_name: &String) -> anyhow::Result<&Net> {
-        let net_id = self.net_map.get(net_name).with_context(|| format!("no net called '{}'", net_name))?;
-
-        return Ok(self.net(net_id))
-    }
-    
     pub fn component(&self, comp_id: &CompId) -> &Component {
         &self.components[comp_id.0 as usize]
-    }
-
-    pub fn pins_on_net(&self, net_name: &String) -> anyhow::Result<Vec<String>> {
-        let net = self.net_from_name(net_name)?;
-
-        let pin_names = net.pins
-            .iter()
-            .map(|x| self.pin_name(x))
-            .collect();
-
-        return Ok(pin_names);
-    }
-
-    pub fn net_of_pin(&self, pin_name: &String) -> anyhow::Result<String> {
-        let pin = self.pin_from_name(pin_name)?;
-        
-        // Fix if None should mean NC
-        let net_id = pin.net.as_ref().with_context(|| format!("no net for pin {}", pin_name))?;
-
-        return Ok(self.net(net_id).name.clone());
     }
 
     fn pin_sort_key(s: &str) -> (&str, u32) {
@@ -123,27 +47,157 @@ impl Design {
         (prefix, digits.parse().unwrap_or(0))
     }
 
-    pub fn comp_details(&self, refdes: &String) -> anyhow::Result<String> {
+    /// Full detail on one component: identity, keywords (from `ki_keywords`),
+    /// footprint, subsystem, the full property map, and its pins — sorted by
+    /// `pin_sort_key` and paginated — each with name/type/net (net is the net
+    /// name, or null if unconnected).
+    pub fn comp_details(&self, refdes: &str, limit: u32, offset: u32) -> anyhow::Result<String> {
         let comp = self.component(
             self.component_map
                 .get(refdes)
                 .with_context(|| format!("Refdes {} not found in component map", refdes))?
         );
-        let mut pins = comp.pins.iter()
-            .map(|x| (self.pin(x).number.clone(), self.pin_to_string(x))).collect::<Vec<_>>();
-        pins.sort_by(|x, y| Self::pin_sort_key(&x.0).cmp(&Self::pin_sort_key(&y.0)));
-        let pin_strings = pins.into_iter().map(|x| x.1).collect();
-        let json = &ComponentJson {
+
+        let mut pin_ids: Vec<&PinId> = comp.pins.iter().collect();
+        pin_ids.sort_by(|a, b| {
+            Self::pin_sort_key(&self.pin(a).number).cmp(&Self::pin_sort_key(&self.pin(b).number))
+        });
+
+        let pin_count = pin_ids.len();
+        let pins: Vec<ComponentPinRow> = pin_ids
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .map(|pid| {
+                let pin = self.pin(pid);
+                ComponentPinRow {
+                    pin: self.pin_name(pid),
+                    name: pin.name.clone(),
+                    pin_type: pin.pin_type.clone(),
+                    net: pin.net.as_ref().map(|nid| self.net(nid).name.clone()),
+                }
+            })
+            .collect();
+
+        let envelope = ComponentDetail {
+            refdes: comp.refdes.clone(),
+            value: comp.value.clone(),
+            description: comp.description.clone(),
+            keywords: comp.properties.get("ki_keywords").cloned().flatten(),
+            footprint: comp.footprint.clone(),
+            sheet: comp.sheet.clone(),
+            properties: comp.properties.clone(),
+            pin_count,
+            offset,
+            limit,
+            returned: pins.len(),
+            pins,
+        };
+        return Ok(serde_json::to_string_pretty(&envelope).context("error serializing comp_details")?);
+    }
+
+    /// Full detail on one net: identity/fanout, rail-score with evidence (via
+    /// `rail_score`), the pin-type histogram, the distinct connected subsystems
+    /// (via `net_component_sheets`), and paginated member pins — sorted by
+    /// owning component's refdes then pin number. Accepts a net name (via
+    /// `net_map`) or a net code (parsed from the string).
+    pub fn net_details(&self, net: &str, limit: u32, offset: u32) -> anyhow::Result<String> {
+        let net_ref: &Net = self.net_map.get(net)
+            .map(|id| self.net(id))
+            .or_else(|| {
+                net.parse::<usize>().ok()
+                    .and_then(|code| self.nets.iter().find(|n| n.code == code))
+            })
+            .with_context(|| format!("no net named or coded '{}'", net))?;
+
+        let (score, evidence) = self.rail_score(net_ref);
+
+        let mut subsystems: Vec<String> = self.net_component_sheets(net_ref)
+            .map(|s| s.to_string())
+            .collect();
+        subsystems.sort();
+        subsystems.dedup();
+
+        let mut pin_ids: Vec<&PinId> = net_ref.pins.iter().collect();
+        pin_ids.sort_by(|a, b| {
+            let ac = self.component(&self.pin(a).comp);
+            let bc = self.component(&self.pin(b).comp);
+            Self::pin_sort_key(&ac.refdes)
+                .cmp(&Self::pin_sort_key(&bc.refdes))
+                .then_with(|| {
+                    Self::pin_sort_key(&self.pin(a).number)
+                        .cmp(&Self::pin_sort_key(&self.pin(b).number))
+                })
+        });
+
+        let fanout = pin_ids.len();
+        let members: Vec<NetMemberRow> = pin_ids
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .map(|pid| {
+                let pin = self.pin(pid);
+                let comp = self.component(&pin.comp);
+                NetMemberRow {
+                    pin: self.pin_name(pid),
+                    refdes: comp.refdes.clone(),
+                    value: comp.value.clone(),
+                    pin_name: pin.name.clone(),
+                    pin_type: pin.pin_type.clone(),
+                }
+            })
+            .collect();
+
+        let envelope = NetDetail {
+            net: net_ref.name.clone(),
+            code: net_ref.code,
+            fanout,
+            rail_score: (score * 100.0).round() / 100.0,
+            rail_evidence: evidence,
+            pin_types: net_ref.pin_types.clone(),
+            subsystems,
+            offset,
+            limit,
+            returned: members.len(),
+            members,
+        };
+        return Ok(serde_json::to_string_pretty(&envelope).context("error serializing net_details")?);
+    }
+
+    /// Full detail on one pin (REFDES:PIN): its name/function, electrical type,
+    /// owning component, and the net it sits on (name/code/fanout/rail_score),
+    /// or null if the pin is unconnected.
+    pub fn pin_details(&self, pin_name: &str) -> anyhow::Result<String> {
+        let pin_id = self.pin_map
+            .get(pin_name)
+            .with_context(|| format!("no pin named '{}'", pin_name))?;
+        let pin = self.pin(pin_id);
+        let comp = self.component(&pin.comp);
+
+        let net = pin.net.as_ref().map(|net_id| {
+            let net = self.net(net_id);
+            let (score, _evidence) = self.rail_score(net);
+            PinNetInfo {
+                name: net.name.clone(),
+                code: net.code,
+                fanout: net.pins.len(),
+                rail_score: (score * 100.0).round() / 100.0,
+            }
+        });
+
+        let envelope = PinDetail {
+            pin: self.pin_name(pin_id),
+            name: pin.name.clone(),
+            pin_type: pin.pin_type.clone(),
+            component: PinComponentInfo {
                 refdes: comp.refdes.clone(),
                 value: comp.value.clone(),
                 description: comp.description.clone(),
                 sheet: comp.sheet.clone(),
-                footprint: comp.footprint.clone(),
-                properties: comp.properties.clone(),
-                pins: pin_strings
-            };
-        return Ok(serde_json::to_string_pretty(json).context("error serializing comp")?);
-
+            },
+            net,
+        };
+        return Ok(serde_json::to_string_pretty(&envelope).context("error serializing pin_details")?);
     }
 
     /// Components one hop away from `refdes`: for each of its pins (in pin-number
@@ -1137,15 +1191,90 @@ impl Design {
 #[derive(Debug, Serialize, Clone)]
 pub struct CompId(usize);
 
+/// One pin in a `get_component` detail response.
 #[derive(Debug, Serialize)]
-pub struct ComponentJson {
+struct ComponentPinRow {
+    pin: String,
+    name: Option<String>,
+    #[serde(rename = "type")]
+    pin_type: Option<String>,
+    net: Option<String>,
+}
+
+/// The `get_component` output envelope: full identity/properties plus a
+/// paginated, structured pin list.
+#[derive(Debug, Serialize)]
+struct ComponentDetail {
     refdes: String,
     value: String,
-    footprint: Option<String>,
     description: Option<String>,
+    keywords: Option<String>,
+    footprint: Option<String>,
     sheet: Option<String>,
     properties: HashMap<String, Option<String>>,
-    pins: Vec<String>
+    pin_count: usize,
+    offset: u32,
+    limit: u32,
+    returned: usize,
+    pins: Vec<ComponentPinRow>,
+}
+
+/// One member pin in a `get_net` detail response: the pin itself plus its
+/// owning component's identity and the pin's own name/type.
+#[derive(Debug, Serialize)]
+struct NetMemberRow {
+    pin: String,
+    refdes: String,
+    value: String,
+    pin_name: Option<String>,
+    #[serde(rename = "type")]
+    pin_type: Option<String>,
+}
+
+/// The `get_net` output envelope: identity/fanout, rail-score with evidence,
+/// pin-type histogram, connected subsystems, and paginated members.
+#[derive(Debug, Serialize)]
+struct NetDetail {
+    net: String,
+    code: usize,
+    fanout: usize,
+    rail_score: f32,
+    rail_evidence: Vec<String>,
+    pin_types: HashMap<String, i32>,
+    subsystems: Vec<String>,
+    offset: u32,
+    limit: u32,
+    returned: usize,
+    members: Vec<NetMemberRow>,
+}
+
+/// The owning component of a `get_pin` detail response (compact identity only).
+#[derive(Debug, Serialize)]
+struct PinComponentInfo {
+    refdes: String,
+    value: String,
+    description: Option<String>,
+    sheet: Option<String>,
+}
+
+/// The net of a `get_pin` detail response, or absent if the pin is unconnected.
+#[derive(Debug, Serialize)]
+struct PinNetInfo {
+    name: String,
+    code: usize,
+    fanout: usize,
+    rail_score: f32,
+}
+
+/// The `get_pin` output envelope.
+#[derive(Debug, Serialize)]
+struct PinDetail {
+    pin: String,
+    name: Option<String>,
+    #[serde(rename = "type")]
+    pin_type: Option<String>,
+    component: PinComponentInfo,
+    net: Option<PinNetInfo>,
 }
 
 #[derive(Debug, Serialize)]

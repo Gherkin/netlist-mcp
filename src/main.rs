@@ -33,12 +33,24 @@ use rmcp::{tool, tool_router, ServiceExt,
 struct GetNetParams {
     /// Net name (e.g. "SPI_CLK" or "/power/+3V3") or net code as a string.
     net: String,
+    /// Max member pins to return (default 200).
+    #[serde(default)]
+    limit: Option<u32>,
+    /// Member offset for pagination (default 0).
+    #[serde(default)]
+    offset: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct GetComponentParams {
     /// Component reference designator, e.g. "U1".
     refdes: String,
+    /// Max pins to return (default 200).
+    #[serde(default)]
+    limit: Option<u32>,
+    /// Pin offset for pagination (default 0).
+    #[serde(default)]
+    offset: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -142,30 +154,37 @@ struct NetlistServer {
 
 #[tool_router(server_handler)]
 impl NetlistServer {
-    #[tool(description = "Detail on one net: its member pins (REFDES:PIN). \
-        Accepts a net name or a net code. (TODO: fanout, subsystem, rail score, \
-        owning-component value inline, pagination.)")]
+    #[tool(description = "Full detail on one net: identity, fanout, rail-score \
+        with evidence, pin-type histogram, connected subsystems, and paginated \
+        member pins (each with owning component, value, pin name/function, and \
+        type). Accepts a net name or a net code.")]
     fn get_net(&self, Parameters(p): Parameters<GetNetParams>) -> String {
-        match self.design.pins_on_net(&p.net) {
-            Ok(pins) => pins.join(", "),
+        let limit = p.limit.unwrap_or(200);
+        let offset = p.offset.unwrap_or(0);
+        match self.design.net_details(&p.net, limit, offset) {
+            Ok(out) => out,
             Err(e) => format!("error: {e:#}"),
         }
     }
 
-    #[tool(description = "Detail on one pin (REFDES:PIN): the net it is on. \
-        (TODO: pin name/function, electrical type, owning component.)")]
+    #[tool(description = "Full detail on one pin (REFDES:PIN): its name/function, \
+        electrical type, owning component, and the net it sits on (name, code, \
+        fanout, rail score) — or a null net if the pin is unconnected.")]
     fn get_pin(&self, Parameters(p): Parameters<GetPinParams>) -> String {
-        match self.design.net_of_pin(&p.pin) {
-            Ok(net) => net,
+        match self.design.pin_details(&p.pin) {
+            Ok(out) => out,
             Err(e) => format!("error: {e:#}"),
         }
     }
 
-    #[tool(description = "Full detail on one component: its properties. \
-        (TODO: identity bundle, footprint, subsystem, pins with type, pagination.)")]
+    #[tool(description = "Full detail on one component: identity, keywords, \
+        footprint, subsystem, the full property map, and paginated pins (each \
+        with name, electrical type, and net).")]
     fn get_component(&self, Parameters(p): Parameters<GetComponentParams>) -> String {
-        match self.design.comp_details(&p.refdes) {
-            Ok(comp) => comp,
+        let limit = p.limit.unwrap_or(200);
+        let offset = p.offset.unwrap_or(0);
+        match self.design.comp_details(&p.refdes, limit, offset) {
+            Ok(out) => out,
             Err(e) => format!("error: {e:#}"),
         }
     }
@@ -296,7 +315,6 @@ impl NetlistServer {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let design = load_design()?;
-    design.comp_details(&"U1".to_string());
     let service = NetlistServer { design: Arc::new(design) }
         .serve(stdio()).await?;
     service.waiting().await?;

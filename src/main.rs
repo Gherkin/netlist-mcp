@@ -26,8 +26,9 @@ fn load_design() -> anyhow::Result<Design> {
     return Ok(design);
 }
 
-use rmcp::{tool, tool_router, ServiceExt,
-           handler::server::wrapper::Parameters, transport::stdio};
+use rmcp::{tool, tool_router, tool_handler, ServerHandler, ServiceExt,
+           handler::server::wrapper::Parameters, transport::stdio,
+           model::{ServerInfo, ServerCapabilities}};
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct GetNetParams {
@@ -152,7 +153,7 @@ struct NetlistServer {
     design: std::sync::Arc<Design>,
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl NetlistServer {
     #[tool(description = "Full detail on one net: identity, fanout, rail-score \
         with evidence, pin-type histogram, connected subsystems, and paginated \
@@ -188,8 +189,6 @@ impl NetlistServer {
             Err(e) => format!("error: {e:#}"),
         }
     }
-
-    // -- Placeholders: rest of the target surface (see tools_todo.md) --------
 
     #[tool(description = "Summarize the whole design: component counts, a \
         refdes-class histogram, detected power rails (with confidence), \
@@ -309,6 +308,62 @@ impl NetlistServer {
             Ok(out) => out,
             Err(e) => format!("error: {e:#}"),
         }
+    }
+}
+
+const SERVER_INSTRUCTIONS: &str = "\
+Tools for exploring a KiCad electrical netlist: discover parts, search, and \
+trace connectivity. Work in a funnel — orient, then locate, then inspect, then \
+trace.
+
+Handles used throughout: a component is a REFDES (e.g. \"U8\"); a pin is \
+REFDES:PIN (e.g. \"U8:5\"); a net is its name (e.g. \"/ADC1/CS\", \"GND\") or its \
+integer code.
+
+ORIENT (start here when you don't know the design):
+- design_overview: counts, a refdes-class histogram, detected power rails (with \
+  confidence + evidence), connectors, subsystems, and the busiest nets. Your \
+  first call in an unfamiliar design.
+- list_subsystems: the schematic's sheets (subsystems) with part counts.
+
+LOCATE (turn a rough idea into concrete handles):
+- find_components: THE front door. Give a part identity or rough description (an \
+  MPN, a value like \"10k\", or \"the MCU\") and get ranked candidates with a \
+  confidence. Fuzzy and tolerant of partial/over-complete part numbers. Reach \
+  for this first.
+- filter_components: deterministic filter (refdes class, subsystem, substring \
+  query). Use for exhaustive/counting questions (\"how many 0402 caps in the \
+  power sheet\") or when find_components is noisy.
+- filter_nets: find nets by name substring / subsystem. This is where \
+  connectivity words resolve — \"spi\" finds SPI nets, which find_components \
+  cannot (SPI lives in net names, not component fields).
+
+INSPECT (full detail on a known handle):
+- get_component (by REFDES), get_net (by name or code), get_pin (by REFDES:PIN). \
+  These return structured detail: pins with electrical type, net fanout, rail \
+  score, connected subsystems, etc.
+
+TRACE (connectivity — the point of this server):
+- walk: THE tool for \"what is actually connected to this pin?\". From a pin or \
+  net it passes THROUGH series parts (resistors, inductors, ferrites, caps) to \
+  the real endpoints (ICs, connectors), and stops at power/ground rails instead \
+  of enumerating them. Topological, not electrical.
+- neighbors: the parts one hop away, grouped by shared net (rails appear as one \
+  capped group). Cheap orientation before a walk.
+- path_between: whether two pins are connected through series parts (not across \
+  rails), and the parts on the path.
+
+Notes: a component's `value` is usually its manufacturer part number for ICs (a \
+spec like \"10k\" for passives); `keywords` mirrors it. To find a part by \
+function you can't match locally, look its MPN up in a datasheet source, then \
+find_components that MPN here. Rail detection and fuzzy matching are heuristic — \
+scores and confidences are hints, not guarantees.";
+
+#[tool_handler]
+impl ServerHandler for NetlistServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(SERVER_INSTRUCTIONS)
     }
 }
 

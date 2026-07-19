@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "netlist": {
+      "command": "/Users/hectorwallen/git/kicad-netlist-parser/target/debug/kicad-netlist-parser",
+      "args": [
+        "/Users/hectorwallen/git/kicad-netlist-parser/medium_netlist.net"
+      ]
+    }
+  }
+}

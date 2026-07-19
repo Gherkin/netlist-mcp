@@ -233,6 +233,76 @@ impl NetListNode {
 
 }
 
+/// Decodes KiCad's `{token}` escape sequences used inside label/net names
+/// and other string fields (e.g. `{slash}` -> `/`). Unknown `{...}`
+/// sequences are passed through unchanged, since they are not part of the
+/// known KiCad `UnescapeString` token set.
+fn unescape_kicad(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(rel_end) = s[i..].find('}') {
+                let end = i + rel_end;
+                let token = &s[i + 1..end];
+                let replacement = match token {
+                    "slash" => Some("/"),
+                    "backslash" => Some("\\"),
+                    "dblquote" => Some("\""),
+                    "lt" => Some("<"),
+                    "gt" => Some(">"),
+                    "colon" => Some(":"),
+                    "space" => Some(" "),
+                    "tab" => Some("\t"),
+                    "return" => Some("\r"),
+                    "newline" => Some("\n"),
+                    "brace" => Some("{"),
+                    _ => None,
+                };
+
+                if let Some(replacement) = replacement {
+                    out.push_str(replacement);
+                    i = end + 1;
+                    continue;
+                }
+            }
+
+            // Not a known token (or no closing brace) - emit '{' literally.
+            out.push('{');
+            i += 1;
+            continue;
+        }
+
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod unescape_kicad_tests {
+    use super::unescape_kicad;
+
+    #[test]
+    fn decodes_slash_token() {
+        assert_eq!(unescape_kicad("LED1{slash}REGOFF"), "LED1/REGOFF");
+    }
+
+    #[test]
+    fn leaves_string_without_braces_unchanged() {
+        assert_eq!(unescape_kicad("plain_value"), "plain_value");
+    }
+
+    #[test]
+    fn leaves_unknown_token_unchanged() {
+        assert_eq!(unescape_kicad("{frobnicate}"), "{frobnicate}");
+    }
+}
+
 fn print_node(node: &NetListNode, depth: usize) {
     let indent = "  ".repeat(depth);
     match node {
@@ -269,16 +339,15 @@ fn parse_component(node: &NetListNode, base_tree: &NetListNode) -> anyhow::Resul
     comp.refdes = node.get_only_child_val(&Token::sym("ref"))
         .with_context(|| format!("error looking for ref child of node {:?}", node))?
         .to_string();
-    comp.value = node.get_only_child_val(&Token::sym("value"))
-        .with_context(|| format!("error looking for value child of node {:?}", node))?
-        .to_string();
+    comp.value = unescape_kicad(node.get_only_child_val(&Token::sym("value"))
+        .with_context(|| format!("error looking for value child of node {:?}", node))?);
     comp.footprint = node.get_maybe_only_child_val(&Token::sym("footprint"))
         .with_context(|| format!("error looking for footprint child of node {:?}", node))?
         .map(|x| x.to_string());
 
     comp.description = node.get_maybe_only_child_val(&Token::sym("description"))
         .with_context(|| format!("error looking for description child of node {:?}", node))?
-        .map(|x| x.to_string());
+        .map(|x| unescape_kicad(x));
 
     comp.sheet = node.get_maybe_only_child(&Token::sym("sheetpath"))
         .with_context(|| format!("error looking for sheethpath child of node {:?}", node))?
@@ -378,7 +447,7 @@ fn parse_component(node: &NetListNode, base_tree: &NetListNode) -> anyhow::Resul
         .into_iter()
         .map(|node| -> anyhow::Result<(String, Option<String>)> {
             let key = node.get_only_child_val(&Token::sym("name"))?;
-            let value = node.get_maybe_only_child_val(&Token::sym("value"))?.map(|x| x.to_string());
+            let value = node.get_maybe_only_child_val(&Token::sym("value"))?.map(|x| unescape_kicad(x));
             Ok((key.to_string(), value))
         })
         .collect::<anyhow::Result<HashMap<String, Option<String>>>>()?;
@@ -396,8 +465,7 @@ fn parse_net(node: &NetListNode, comps: &mut Vec::<netlist::Component>) -> anyho
         .to_string()
         .parse::<usize>()?;
 
-    let name = node.get_only_child_val(&Token::sym("name"))?
-        .to_string();
+    let name = unescape_kicad(node.get_only_child_val(&Token::sym("name"))?);
 
     let net = netlist::Net {
         code: code,

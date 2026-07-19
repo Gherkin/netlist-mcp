@@ -148,6 +148,8 @@ impl Design {
             })
             .collect();
 
+        let role = self.net_role(net_ref);
+
         let envelope = NetDetail {
             net: net_ref.name.clone(),
             code: net_ref.code,
@@ -156,6 +158,7 @@ impl Design {
             rail_evidence: evidence,
             pin_types: net_ref.pin_types.clone(),
             subsystems,
+            role,
             offset,
             limit,
             returned: members.len(),
@@ -615,6 +618,154 @@ impl Design {
         }
 
         (score, evidence)
+    }
+
+    /// Per-net counts of owning-component classes, split into IC ("U"),
+    /// connector ("J"/"P"), passive ("R"/"L"/"C"/"FB"), and everything else.
+    /// Shared by `net_role` and `audit` so both agree on what "IC pin",
+    /// "connector pin", and "passive-only" mean.
+    fn net_class_counts(&self, net: &Net) -> NetClassCounts {
+        let mut counts = NetClassCounts::default();
+        for pid in &net.pins {
+            let comp = self.component(&self.pin(pid).comp);
+            let class = Self::refdes_class(&comp.refdes);
+            if class == IC_CLASS {
+                counts.ic += 1;
+            } else if CONNECTOR_CLASSES.contains(&class.as_str()) {
+                counts.connector += 1;
+            } else if PASSIVE_CLASSES.contains(&class.as_str()) {
+                counts.passive += 1;
+            } else {
+                counts.other += 1;
+            }
+        }
+        counts
+    }
+
+    /// Factual classification of a net's role in the connectivity graph,
+    /// derived purely from `net.pin_types` presence and owning-component
+    /// classes (see `net_class_counts`). This makes NO judgment about
+    /// whether a pattern is a defect — e.g. `has_power_in && !has_source` is
+    /// common and correct for a net whose source lives off-net (a regulator
+    /// output net, a jumper-fed rail, etc.). Reused by `get_net` (embedded as
+    /// `role`) and `audit` (the bucketing predicates).
+    pub fn net_role(&self, net: &Net) -> NetRole {
+        let has_source = net.pin_types.get("power_out").copied().unwrap_or(0) > 0;
+        let has_driver = DRIVER_PIN_TYPES
+            .iter()
+            .any(|t| net.pin_types.get(*t).copied().unwrap_or(0) > 0);
+        let has_power_in = net.pin_types.get("power_in").copied().unwrap_or(0) > 0;
+        let has_input = net.pin_types.get("input").copied().unwrap_or(0) > 0;
+
+        let counts = self.net_class_counts(net);
+        let fanout = net.pins.len();
+        let passive_only = fanout > 0 && counts.passive == fanout;
+
+        NetRole {
+            has_source,
+            has_driver,
+            has_power_in,
+            has_input,
+            ic_pin_count: counts.ic,
+            passive_only,
+        }
+    }
+
+    /// Scan every net and bucket it into FACTUAL, non-exclusive categories
+    /// describing observed graph patterns worth a human's attention — this
+    /// never asserts a defect or infers intent, only reports what the graph
+    /// looks like:
+    /// - `unpowered_power_in`: has a `power_in` pin, no `power_out` source
+    ///   anywhere on the net.
+    /// - `undriven_input`: has an `input` pin, no driver-typed pin on the net.
+    /// - `single_ic_pin`: touches exactly one IC pin, and every other pin on
+    ///   the net belongs to a passive component.
+    /// - `stub`: a single-pin (or unconnected) net, or a multi-pin net with
+    ///   no IC and no connector pin (passive/other parts only).
+    ///
+    /// Each bucket is sorted by fanout descending (name ascending on ties),
+    /// reports the true `count`, and returns up to `limit` rows — this keeps
+    /// hundreds of stub/TP nets from drowning the response.
+    pub fn audit(&self, limit: u32) -> anyhow::Result<String> {
+        let mut unpowered_power_in: Vec<AuditNetRow> = Vec::new();
+        let mut undriven_input: Vec<AuditNetRow> = Vec::new();
+        let mut single_ic_pin: Vec<AuditNetRow> = Vec::new();
+        let mut stub: Vec<AuditNetRow> = Vec::new();
+
+        for net in &self.nets {
+            let fanout = net.pins.len();
+            let role = self.net_role(net);
+            let counts = self.net_class_counts(net);
+
+            if role.has_power_in && !role.has_source {
+                let power_in_count = net.pin_types.get("power_in").copied().unwrap_or(0);
+                unpowered_power_in.push(AuditNetRow {
+                    net: net.name.clone(),
+                    code: net.code,
+                    fanout,
+                    note: format!("{power_in_count} power_in pin(s), no power_out source"),
+                });
+            }
+
+            if role.has_input && !role.has_driver {
+                let input_count = net.pin_types.get("input").copied().unwrap_or(0);
+                undriven_input.push(AuditNetRow {
+                    net: net.name.clone(),
+                    code: net.code,
+                    fanout,
+                    note: format!("{input_count} input pin(s), no driver"),
+                });
+            }
+
+            // Exactly one IC pin, and every non-IC pin on the net is passive
+            // (no connector, no other class).
+            if counts.ic == 1
+                && counts.connector == 0
+                && counts.other == 0
+                && counts.passive == fanout.saturating_sub(1)
+            {
+                single_ic_pin.push(AuditNetRow {
+                    net: net.name.clone(),
+                    code: net.code,
+                    fanout,
+                    note: "1 IC pin + only passives".to_string(),
+                });
+            }
+
+            if fanout <= 1 {
+                stub.push(AuditNetRow {
+                    net: net.name.clone(),
+                    code: net.code,
+                    fanout,
+                    note: "single-pin net".to_string(),
+                });
+            } else if counts.ic == 0 && counts.connector == 0 {
+                stub.push(AuditNetRow {
+                    net: net.name.clone(),
+                    code: net.code,
+                    fanout,
+                    note: "only passives, no IC or connector".to_string(),
+                });
+            }
+        }
+
+        let envelope = AuditEnvelope {
+            unpowered_power_in: Self::bucket_audit(unpowered_power_in, limit),
+            undriven_input: Self::bucket_audit(undriven_input, limit),
+            single_ic_pin: Self::bucket_audit(single_ic_pin, limit),
+            stub: Self::bucket_audit(stub, limit),
+        };
+        return Ok(serde_json::to_string_pretty(&envelope).context("error serializing audit")?);
+    }
+
+    /// Sort an `audit` bucket (fanout desc, name asc), record its true count,
+    /// then cap the returned rows at `limit`.
+    fn bucket_audit(mut rows: Vec<AuditNetRow>, limit: u32) -> AuditBucket {
+        rows.sort_by(|a, b| b.fanout.cmp(&a.fanout).then_with(|| a.net.cmp(&b.net)));
+        let count = rows.len();
+        rows.truncate(limit as usize);
+        let returned = rows.len();
+        AuditBucket { count, returned, nets: rows }
     }
 
     /// Zero-knowledge orientation summary: counts, refdes-class histogram,
@@ -1232,7 +1383,8 @@ struct NetMemberRow {
 }
 
 /// The `get_net` output envelope: identity/fanout, rail-score with evidence,
-/// pin-type histogram, connected subsystems, and paginated members.
+/// pin-type histogram, connected subsystems, a factual role classification
+/// (see `Design::net_role`), and paginated members.
 #[derive(Debug, Serialize)]
 struct NetDetail {
     net: String,
@@ -1242,10 +1394,71 @@ struct NetDetail {
     rail_evidence: Vec<String>,
     pin_types: HashMap<String, i32>,
     subsystems: Vec<String>,
+    role: NetRole,
     offset: u32,
     limit: u32,
     returned: usize,
     members: Vec<NetMemberRow>,
+}
+
+/// Factual classification of a net's role in the graph, derived purely from
+/// pin-type presence and owning-component classes — no judgment about
+/// whether the pattern is correct or intended. See `Design::net_role`.
+#[derive(Debug, Serialize, Clone)]
+pub struct NetRole {
+    /// Any `power_out` pin present on the net.
+    pub has_source: bool,
+    /// Any driver-typed pin present (`output`, `bidirectional`, `tri_state`,
+    /// `open_collector`, `open_emitter`, `power_out`).
+    pub has_driver: bool,
+    /// Any `power_in` pin present on the net.
+    pub has_power_in: bool,
+    /// Any `input` pin present on the net.
+    pub has_input: bool,
+    /// Count of pins whose owning component's refdes class is "U" (IC).
+    pub ic_pin_count: usize,
+    /// True if every pin's owning component is a passive class (R/L/C/FB) —
+    /// i.e. no IC, connector, or other class touches this net.
+    pub passive_only: bool,
+}
+
+/// Internal per-net tally of owning-component classes, computed by
+/// `net_class_counts` and shared by `net_role` and `audit`.
+#[derive(Debug, Default)]
+struct NetClassCounts {
+    ic: usize,
+    connector: usize,
+    passive: usize,
+    other: usize,
+}
+
+/// One net in an `audit` bucket: identity/fanout plus a neutral, factual
+/// note describing why it landed in that bucket (never a verdict).
+#[derive(Debug, Serialize)]
+struct AuditNetRow {
+    net: String,
+    code: usize,
+    fanout: usize,
+    note: String,
+}
+
+/// One `audit` category: the true count across the whole design, how many
+/// rows were actually returned (capped by `limit`), and those rows.
+#[derive(Debug, Serialize)]
+struct AuditBucket {
+    count: usize,
+    returned: usize,
+    nets: Vec<AuditNetRow>,
+}
+
+/// The `audit` output envelope: four non-exclusive FACTUAL categories over
+/// the whole net graph. See `Design::audit`.
+#[derive(Debug, Serialize)]
+struct AuditEnvelope {
+    unpowered_power_in: AuditBucket,
+    undriven_input: AuditBucket,
+    single_ic_pin: AuditBucket,
+    stub: AuditBucket,
 }
 
 /// The owning component of a `get_pin` detail response (compact identity only).
@@ -1533,6 +1746,17 @@ const RAIL_WEIGHT_POWER_FRAC: f32 = 0.45;
 const RAIL_WEIGHT_NAME_MATCH: f32 = 0.30;
 const RAIL_WEIGHT_CAP_FRAC: f32 = 0.25;
 const RAIL_FANOUT_BOOST: f32 = 0.15;
+
+// Pin-type and refdes-class sets shared by `Design::net_role` and
+// `Design::audit`. A "driver" is any pin type capable of actively asserting
+// a level onto the net; `power_out` counts as both a driver and the sole
+// "source" type.
+const DRIVER_PIN_TYPES: &[&str] = &[
+    "output", "bidirectional", "tri_state", "open_collector", "open_emitter", "power_out",
+];
+const PASSIVE_CLASSES: &[&str] = &["R", "L", "C", "FB"];
+const CONNECTOR_CLASSES: &[&str] = &["J", "P"];
+const IC_CLASS: &str = "U";
 
 /// Case-insensitive heuristic for "does this net name look like a power/ground
 /// rail?" Checks the segment after the last '/' against a set of common rail

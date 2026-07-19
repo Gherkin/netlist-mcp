@@ -148,6 +148,14 @@ struct PathBetweenParams {
     to: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AuditParams {
+    /// Max nets to return per category (default 100). Each category also
+    /// reports its true `count` across the whole design.
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
 #[derive(Clone)]
 struct NetlistServer {
     design: std::sync::Arc<Design>,
@@ -309,6 +317,25 @@ impl NetlistServer {
             Err(e) => format!("error: {e:#}"),
         }
     }
+
+    #[tool(description = "Scan the whole net graph and report FACTUAL, \
+        non-exclusive connectivity patterns worth a human's review — this is \
+        an observation tool, not a defect detector: it never asserts a bug or \
+        infers intent, only states what the graph looks like. Categories: \
+        unpowered_power_in (has a power_in pin, no power_out source anywhere \
+        on the net), undriven_input (has an input pin, no driver-typed pin on \
+        the net), single_ic_pin (touches exactly one IC pin and only passives \
+        otherwise), and stub (a single-pin net, or a multi-pin net with no IC \
+        and no connector pin). A net can appear in several categories. Each \
+        category reports its true count plus up to `limit` nets (default \
+        100), so hundreds of stub/TP nets don't drown the response.")]
+    fn audit(&self, Parameters(p): Parameters<AuditParams>) -> String {
+        let limit = p.limit.unwrap_or(100);
+        match self.design.audit(limit) {
+            Ok(out) => out,
+            Err(e) => format!("error: {e:#}"),
+        }
+    }
 }
 
 const SERVER_INSTRUCTIONS: &str = "\
@@ -352,6 +379,12 @@ TRACE (connectivity — the point of this server):
   capped group). Cheap orientation before a walk.
 - path_between: whether two pins are connected through series parts (not across \
   rails), and the parts on the path.
+
+REVIEW (factual patterns, not verdicts):
+- audit: scans every net for FACTUAL graph patterns worth a look — unpowered \
+  power_in nets, undriven input nets, single-IC-pin nets, and stub nets. It \
+  reports observed states, never asserts a bug; you judge relevance. get_net's \
+  `role` field carries the same classification for a single net.
 
 Notes: a component's `value` is usually its manufacturer part number for ICs (a \
 spec like \"10k\" for passives); `keywords` mirrors it. To find a part by \

@@ -287,6 +287,13 @@ impl Design {
             .context("error serializing neighbors")?);
     }
 
+    /// Parse a `subsystem` argument against the sheets this design actually
+    /// has — see `SubsystemFilter`. `None` means "no filter".
+    fn subsystem_filter(&self, arg: Option<&str>) -> Option<SubsystemFilter> {
+        let sheets = self.components.iter().map(|c| c.sheet.as_deref());
+        Some(SubsystemFilter::parse(arg)?.widen_if_unmatched(sheets))
+    }
+
     pub fn filter_components(
         &self,
         query: Option<&str>,
@@ -301,7 +308,7 @@ impl Design {
             .map(|q| q.split_whitespace().map(|t| t.to_lowercase()).collect::<Vec<_>>())
             .filter(|terms: &Vec<String>| !terms.is_empty());
         let refdes_class_lc = refdes_class.map(|c| c.to_lowercase());
-        let subsystem_filter = SubsystemFilter::parse(subsystem);
+        let subsystem_filter = self.subsystem_filter(subsystem);
 
         let mut matches: Vec<&Component> = self.components
             .iter()
@@ -473,7 +480,7 @@ impl Design {
         let name_lc = name
             .map(|n| n.to_lowercase())
             .filter(|n| !n.trim().is_empty());
-        let subsystem_filter = SubsystemFilter::parse(subsystem);
+        let subsystem_filter = self.subsystem_filter(subsystem);
 
         let mut matches: Vec<&Net> = self.nets
             .iter()
@@ -556,7 +563,7 @@ impl Design {
             .into_iter()
             .map(|(sheet, component_count)| match sheet {
                 Some(path) => {
-                    let name = path.trim_matches('/').to_string();
+                    let name = subsystem_display_name(&path);
                     SubsystemRow { path: Some(path), name, component_count }
                 }
                 None => SubsystemRow {
@@ -904,7 +911,7 @@ impl Design {
             .into_iter()
             .map(|(sheet, component_count)| {
                 let name = match &sheet {
-                    Some(path) => path.trim_matches('/').to_string(),
+                    Some(path) => subsystem_display_name(path),
                     None => "(unassigned)".to_string(),
                 };
                 SubsystemSummaryRow { name, component_count }
@@ -1556,6 +1563,20 @@ struct ComponentPinRow {
     net: Option<String>,
 }
 
+/// Display name for a sheet path: the path with its rooting slashes trimmed,
+/// so "/Power/" reads as "Power".
+///
+/// The root sheet trims away to nothing, so it keeps its "/". An empty name is
+/// not merely unreadable — it is the one string `SubsystemFilter::parse` reads
+/// as "no filter", so an agent copying it out of `list_subsystems` or
+/// `design_overview` into a `subsystem` argument would get the whole design
+/// back: issue #17 again, by way of the discovery path. Both names round-trip
+/// as selectors: "Power" as a substring, "/" as the root sheet.
+fn subsystem_display_name(path: &str) -> String {
+    let name = path.trim_matches('/');
+    if name.is_empty() { "/".to_string() } else { name.to_string() }
+}
+
 /// How a `subsystem` argument is matched against a component's sheet path.
 ///
 /// KiCad writes sheet paths rooted and trailing-slashed ("/", "/Power/",
@@ -1568,6 +1589,8 @@ struct ComponentPinRow {
 ///   already what omitting the filter does, so the exact reading is the only
 ///   useful one.
 /// - `"/Power"`, `"/Power/"` — a rooted path: that sheet and any sheet under it.
+///   A rooted path no sheet in the design answers to widens back to a
+///   substring — see `widen_if_unmatched`.
 /// - `"Power"`, `"sensor"` — a bare name: case-insensitive substring, so
 ///   "sensor" still spans /Sensor1/../Sensor3/.
 #[derive(Debug, PartialEq)]
@@ -1589,8 +1612,8 @@ impl SubsystemFilter {
         let lc = raw.to_lowercase();
 
         if !lc.starts_with('/') {
-            let bare = lc.trim_matches('/').to_string();
-            return (!bare.is_empty()).then_some(SubsystemFilter::Substring(bare));
+            // Non-empty and not slash-led, so trimming cannot empty it.
+            return Some(SubsystemFilter::Substring(lc.trim_matches('/').to_string()));
         }
         if lc.chars().all(|c| c == '/') {
             return Some(SubsystemFilter::Root);
@@ -1601,6 +1624,26 @@ impl SubsystemFilter {
             path.push('/');
         }
         Some(SubsystemFilter::Path(path))
+    }
+
+    /// Widen a rooted path that no sheet in the design answers to into a
+    /// substring match on the same name.
+    ///
+    /// `list_subsystems` hands out rooted paths ("/ADC1/", "/ADC2/"), so the
+    /// obvious way to ask for both is their shared prefix "/ADC" — which as a
+    /// path names a sheet that does not exist. Without this it returns an
+    /// empty page, indistinguishable from "this design has no ADC parts".
+    ///
+    /// Only `Path` widens. A `Root` filter matching nothing means the design
+    /// has no parts on its root sheet, which is a true empty answer; widening
+    /// it would return the whole design instead.
+    fn widen_if_unmatched<'a>(self, mut sheets: impl Iterator<Item = Option<&'a str>>) -> Self {
+        if let SubsystemFilter::Path(path) = &self {
+            if !sheets.any(|sheet| self.matches(sheet)) {
+                return SubsystemFilter::Substring(path.trim_matches('/').to_string());
+            }
+        }
+        self
     }
 
     /// Test one component's sheet (`None` for a component KiCad left
@@ -2636,12 +2679,67 @@ mod subsystem_filter_tests {
     }
 
     #[test]
+    fn unmatched_rooted_path_widens_to_a_substring() {
+        let sheets = [Some("/ADC1/"), Some("/ADC2/"), Some("/Power/")];
+        let f = SubsystemFilter::parse(Some("/ADC"))
+            .expect("a filter")
+            .widen_if_unmatched(sheets.into_iter());
+        assert_eq!(f, SubsystemFilter::Substring("adc".to_string()));
+        assert!(f.matches(Some("/ADC1/")));
+        assert!(f.matches(Some("/ADC2/")));
+        assert!(!f.matches(Some("/Power/")));
+    }
+
+    #[test]
+    fn rooted_path_that_matches_a_sheet_stays_a_path() {
+        let sheets = [Some("/Power/"), Some("/PowerMon/")];
+        let f = SubsystemFilter::parse(Some("/Power"))
+            .expect("a filter")
+            .widen_if_unmatched(sheets.into_iter());
+        assert_eq!(f, SubsystemFilter::Path("/power/".to_string()));
+        // Still a path, so the sibling sheet is still excluded — widening it
+        // to a substring would have swept /PowerMon/ in.
+        assert!(!f.matches(Some("/PowerMon/")));
+    }
+
+    #[test]
+    fn root_never_widens() {
+        // A design with no root-sheet parts: the empty answer is the true one.
+        let sheets = [Some("/Power/"), Some("/ADC1/")];
+        let f = SubsystemFilter::parse(Some("/"))
+            .expect("a filter")
+            .widen_if_unmatched(sheets.into_iter());
+        assert_eq!(f, SubsystemFilter::Root);
+    }
+
+    #[test]
     fn unassigned_sheet_matches_nothing() {
         for arg in ["/", "/Power/", "power"] {
             let f = SubsystemFilter::parse(Some(arg)).expect("a filter");
             assert!(!f.matches(None), "{arg} should not match an unassigned part");
             assert!(!f.matches(Some("")), "{arg} should not match an empty sheet");
         }
+    }
+}
+
+#[cfg(test)]
+mod subsystem_display_name_tests {
+    use super::subsystem_display_name;
+
+    #[test]
+    fn trims_the_rooting_slashes() {
+        assert_eq!(subsystem_display_name("/Power/"), "Power");
+        assert_eq!(subsystem_display_name("/Power/Aux/"), "Power/Aux");
+    }
+
+    #[test]
+    fn root_keeps_its_slash_so_it_round_trips_as_a_selector() {
+        use super::SubsystemFilter;
+        let name = subsystem_display_name("/");
+        assert_eq!(name, "/");
+        // The name an agent reads back out must select the root sheet, not
+        // the whole design.
+        assert_eq!(SubsystemFilter::parse(Some(&name)), Some(SubsystemFilter::Root));
     }
 }
 

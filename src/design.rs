@@ -301,7 +301,7 @@ impl Design {
             .map(|q| q.split_whitespace().map(|t| t.to_lowercase()).collect::<Vec<_>>())
             .filter(|terms: &Vec<String>| !terms.is_empty());
         let refdes_class_lc = refdes_class.map(|c| c.to_lowercase());
-        let subsystem_lc = subsystem.map(|s| s.trim_matches('/').to_lowercase());
+        let subsystem_filter = SubsystemFilter::parse(subsystem);
 
         let mut matches: Vec<&Component> = self.components
             .iter()
@@ -318,14 +318,10 @@ impl Design {
                     }
                 }
 
-                // subsystem: case-insensitive substring against sheet, '/' trimmed.
-                if let Some(sub) = &subsystem_lc {
-                    let sheet_norm = comp.sheet
-                        .as_deref()
-                        .unwrap_or("")
-                        .trim_matches('/')
-                        .to_lowercase();
-                    if !sheet_norm.contains(sub.as_str()) {
+                // subsystem: rooted paths match as paths, bare names as
+                // substrings — see `SubsystemFilter`.
+                if let Some(filter) = &subsystem_filter {
+                    if !filter.matches(comp.sheet.as_deref()) {
                         return false;
                     }
                 }
@@ -477,7 +473,7 @@ impl Design {
         let name_lc = name
             .map(|n| n.to_lowercase())
             .filter(|n| !n.trim().is_empty());
-        let subsystem_lc = subsystem.map(|s| s.trim_matches('/').to_lowercase());
+        let subsystem_filter = SubsystemFilter::parse(subsystem);
 
         let mut matches: Vec<&Net> = self.nets
             .iter()
@@ -489,12 +485,11 @@ impl Design {
                     }
                 }
 
-                // subsystem: any connected component's sheet contains the filter,
-                // '/' trimmed on both sides (same normalization as filter_components).
-                if let Some(sub) = &subsystem_lc {
-                    let hit = self.net_component_sheets(net).any(|sheet| {
-                        sheet.trim_matches('/').to_lowercase().contains(sub.as_str())
-                    });
+                // subsystem: any connected component sits on a matching sheet
+                // (same matcher as filter_components).
+                if let Some(filter) = &subsystem_filter {
+                    let hit = self.net_component_sheets(net)
+                        .any(|sheet| filter.matches(Some(sheet)));
                     if !hit {
                         return false;
                     }
@@ -1561,6 +1556,79 @@ struct ComponentPinRow {
     net: Option<String>,
 }
 
+/// How a `subsystem` argument is matched against a component's sheet path.
+///
+/// KiCad writes sheet paths rooted and trailing-slashed ("/", "/Power/",
+/// "/Power/Aux/"), so a plain substring match makes the root sheet "/"
+/// unaddressable: it is a substring of every other path, and selecting it
+/// silently returns the whole design (issue #17). The argument's shape picks
+/// the matcher:
+///
+/// - `"/"` — the root sheet and nothing below it. Root-plus-descendants is
+///   already what omitting the filter does, so the exact reading is the only
+///   useful one.
+/// - `"/Power"`, `"/Power/"` — a rooted path: that sheet and any sheet under it.
+/// - `"Power"`, `"sensor"` — a bare name: case-insensitive substring, so
+///   "sensor" still spans /Sensor1/../Sensor3/.
+#[derive(Debug, PartialEq)]
+enum SubsystemFilter {
+    /// The root sheet, and only it.
+    Root,
+    /// A rooted path, lowercased and trailing-slashed ("/power/"): the sheet
+    /// itself or anything below it.
+    Path(String),
+    /// A bare name, lowercased and slash-trimmed: substring of the sheet path.
+    Substring(String),
+}
+
+impl SubsystemFilter {
+    /// `None` means "no filter" — the argument was absent, blank, or (for a
+    /// bare name) nothing but whitespace. Never "match nothing".
+    fn parse(arg: Option<&str>) -> Option<Self> {
+        let raw = arg.map(str::trim).filter(|a| !a.is_empty())?;
+        let lc = raw.to_lowercase();
+
+        if !lc.starts_with('/') {
+            let bare = lc.trim_matches('/').to_string();
+            return (!bare.is_empty()).then_some(SubsystemFilter::Substring(bare));
+        }
+        if lc.chars().all(|c| c == '/') {
+            return Some(SubsystemFilter::Root);
+        }
+
+        let mut path = lc;
+        if !path.ends_with('/') {
+            path.push('/');
+        }
+        Some(SubsystemFilter::Path(path))
+    }
+
+    /// Test one component's sheet (`None` for a component KiCad left
+    /// unassigned, which no filter matches).
+    fn matches(&self, sheet: Option<&str>) -> bool {
+        let sheet_lc = sheet.unwrap_or("").trim().to_lowercase();
+        if sheet_lc.is_empty() {
+            return false;
+        }
+        match self {
+            SubsystemFilter::Root => sheet_lc == "/",
+            SubsystemFilter::Path(path) => {
+                // Normalize the sheet the same way the argument was, so
+                // "/power" and "/power/" describe the same sheet.
+                let sheet_path = if sheet_lc.ends_with('/') {
+                    sheet_lc
+                } else {
+                    format!("{sheet_lc}/")
+                };
+                sheet_path.starts_with(path.as_str())
+            }
+            SubsystemFilter::Substring(term) => {
+                sheet_lc.trim_matches('/').contains(term.as_str())
+            }
+        }
+    }
+}
+
 /// The `get_component` output envelope: full identity/properties plus a
 /// paginated, structured pin list.
 #[derive(Debug, Serialize)]
@@ -2516,6 +2584,65 @@ pub struct Net {
     pub name: String,
     pub pins: Vec<PinId>,
     pub pin_types: HashMap<String, i32>
+}
+
+#[cfg(test)]
+mod subsystem_filter_tests {
+    use super::SubsystemFilter;
+
+    #[test]
+    fn root_selects_only_the_root_sheet() {
+        let f = SubsystemFilter::parse(Some("/")).expect("a filter");
+        assert_eq!(f, SubsystemFilter::Root);
+        assert!(f.matches(Some("/")));
+        assert!(!f.matches(Some("/Power/")));
+        assert!(!f.matches(Some("/Power/Aux/")));
+    }
+
+    #[test]
+    fn rooted_path_takes_the_sheet_and_its_descendants() {
+        let f = SubsystemFilter::parse(Some("/Power/")).expect("a filter");
+        assert!(f.matches(Some("/Power/")));
+        assert!(f.matches(Some("/power/aux/")));
+        assert!(!f.matches(Some("/")));
+        assert!(!f.matches(Some("/PowerMon/")));
+        assert!(!f.matches(Some("/Aux/Power/")));
+    }
+
+    #[test]
+    fn rooted_path_without_trailing_slash_is_the_same_sheet() {
+        assert_eq!(
+            SubsystemFilter::parse(Some("/Power")),
+            SubsystemFilter::parse(Some("/Power/")),
+        );
+    }
+
+    #[test]
+    fn bare_name_stays_a_substring_match() {
+        let f = SubsystemFilter::parse(Some("sensor")).expect("a filter");
+        assert!(f.matches(Some("/Sensor1/")));
+        assert!(f.matches(Some("/Sensor3/")));
+        assert!(f.matches(Some("/Analog/Sensor2/")));
+        assert!(!f.matches(Some("/Power/")));
+        // A bare name never reaches the root sheet — "/" trims to nothing.
+        assert!(!f.matches(Some("/")));
+    }
+
+    #[test]
+    fn blank_argument_is_no_filter() {
+        assert_eq!(SubsystemFilter::parse(None), None);
+        assert_eq!(SubsystemFilter::parse(Some("")), None);
+        assert_eq!(SubsystemFilter::parse(Some("   ")), None);
+    }
+
+    #[test]
+    fn unassigned_sheet_matches_nothing() {
+        for arg in ["/", "/Power/", "power"] {
+            let f = SubsystemFilter::parse(Some(arg)).expect("a filter");
+            assert!(!f.matches(None), "{arg} should not match an unassigned part");
+            assert!(!f.matches(Some("")), "{arg} should not match an empty sheet");
+        }
+    }
 }
 
 #[cfg(test)]

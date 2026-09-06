@@ -203,6 +203,7 @@ impl Design {
                 value: comp.value.clone(),
                 description: comp.description.clone(),
                 sheet: comp.sheet.clone(),
+                dnp: comp.dnp,
             },
             net,
         };
@@ -279,6 +280,7 @@ impl Design {
         let envelope = NeighborsEnvelope {
             refdes: comp.refdes.clone(),
             value: comp.value.clone(),
+            dnp: comp.dnp,
             net_groups,
         };
         return Ok(serde_json::to_string_pretty(&envelope)
@@ -890,6 +892,7 @@ impl Design {
                 refdes: comp.refdes.clone(),
                 value: comp.value.clone(),
                 pin_count: comp.pins.len(),
+                dnp: comp.dnp,
             })
             .collect();
 
@@ -1709,6 +1712,8 @@ struct PinComponentInfo {
     value: String,
     description: Option<String>,
     sheet: Option<String>,
+    /// Do Not Populate — the owning part is not fitted on the built board.
+    dnp: bool,
 }
 
 /// The net of a `get_pin` detail response, or absent if the pin is unconnected.
@@ -1781,6 +1786,8 @@ struct NetGroup {
 struct NeighborsEnvelope {
     refdes: String,
     value: String,
+    /// Do Not Populate — the queried part itself is not fitted on the built board.
+    dnp: bool,
     net_groups: Vec<NetGroup>,
 }
 
@@ -1858,6 +1865,8 @@ struct ConnectorRow {
     refdes: String,
     value: String,
     pin_count: usize,
+    /// Do Not Populate — this connector is not fitted on the built board.
+    dnp: bool,
 }
 
 /// One subsystem bucket in `design_overview` (compact form of `SubsystemRow`,

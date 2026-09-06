@@ -401,8 +401,10 @@ REVIEW (factual patterns, not verdicts):
   reports observed states, never asserts a bug; you judge relevance. get_net's \
   `role` field carries the same classification for a single net.
 
-DNP: every component carries a `dnp` boolean, and so does every part reported \
-in a walk/path_between `via` chain, a `neighbors` row, and a `get_net` member. \
+DNP: every component identity carries a `dnp` boolean — get_component, \
+get_pin's owning component, filter/find rows, get_net members, neighbors (the \
+queried part and its rows), design_overview's connectors, and every part in a \
+walk/path_between `via` chain. \
 A DNP part is drawn on the schematic and present in the netlist, but is NOT \
 fitted on the built board — a connection that only exists through a DNP series \
 part does not exist in hardware. Check it before concluding two things are \

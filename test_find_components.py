@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Test client for the kicad-netlist-parser MCP server's find_components tool.
 
-Starts the server with `medium_netlist.net`, does the MCP handshake over
+Starts the server on the netlist under test (see `_resolve_netlist`), does the MCP handshake over
 stdio, calls `find_components` with the cases from the design doc, and dumps
 each result to stdout.
 
@@ -11,12 +11,16 @@ newline-delimited JSON-RPC 2.0.
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-NETLIST = HERE / "medium_netlist.net"
+
+# Netlist under test: $NETLIST_MCP_NET if set, else the in-repo fixture.
+NETLIST = Path(os.environ["NETLIST_MCP_NET"]).expanduser() \
+    if os.environ.get("NETLIST_MCP_NET") else HERE / "tests" / "fixture.net"
 BIN = HERE / "target" / "debug" / "kicad-netlist-parser"
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -145,45 +149,52 @@ def main():
         )
         server.notify("notifications/initialized")
 
-        # 2. cases from find_components_instructions.md "Verify"
+        # 2. cases from find_components_instructions.md "Verify", retargeted
+        # at tests/fixture.net.
         print("\n--- exact ---")
-        env = call_find(server, {"query": "TLA2518IRTER"})
+        env = call_find(server, {"query": "LAN8720A"})
         t = top(env)
-        all_ok &= check("U8 top at ~1.0, reason exact",
-                        t and t["refdes"] == "U8" and t["confidence"] >= 0.99
-                        and t["match_reason"].startswith("exact"))
+        all_ok &= check("U2 top at ~1.0, reason exact",
+                        bool(t and t["refdes"] == "U2" and t["confidence"] >= 0.99
+                             and t["match_reason"].startswith("exact")))
 
         print("\n--- reverse-join (partial MPN) ---")
-        env = call_find(server, {"query": "TLA2518"})
+        env = call_find(server, {"query": "LAN8720"})
         t = top(env)
-        all_ok &= check("U8 top, high base-match",
-                        t and t["refdes"] == "U8" and t["confidence"] >= 0.80
-                        and "base-match" in t["match_reason"])
+        all_ok &= check("U2 top, high base-match",
+                        bool(t and t["refdes"] == "U2" and t["confidence"] >= 0.80
+                             and "base-match" in t["match_reason"]))
 
         print("\n--- reverse-join (over-complete MPN) ---")
-        env = call_find(server, {"query": "TLA2518IRTERQ1"})
+        env = call_find(server, {"query": "LAN8720AI"})
         t = top(env)
-        all_ok &= check("U8 still matches (base-match other direction)",
-                        t and t["refdes"] == "U8" and "base-match" in t["match_reason"])
+        all_ok &= check("U2 still matches (base-match other direction)",
+                        bool(t and t["refdes"] == "U2"
+                             and "base-match" in t["match_reason"]))
 
         print("\n--- value ('10k') ---")
         env = call_find(server, {"query": "10k"})
         all_ok &= check("returns 10k resistors",
-                        env["returned"] > 0
-                        and all("10k" in c["value"].lower() for c in env["candidates"]))
+                        bool(env["returned"] > 0
+                             and all("10k" in c["value"].lower()
+                                     for c in env["candidates"])))
         all_ok &= check("sorted by confidence desc", sorted_desc(env))
 
-        print("\n--- functional ('adc') — page-name match, IC ranks first ---")
-        # U8's only "adc" text is its /ADC1/ sheet, tying it at 0.55 with every
-        # decoupling cap on the ADC sheets. The pin-count tie-break lifts the
-        # 16-pin ADC above the 2-pin caps, so the primary part tops the list —
-        # what a generic agent asking for "adc" actually wants.
-        env = call_find(server, {"query": "adc"})
-        t = top(env)
-        all_ok &= check("an ADC IC (U8-U11) top-ranks on 'adc', not a cap",
-                        t and t["refdes"].startswith("U") and t["pin_count"] > 2)
-        all_ok &= check("U8 present",
-                        "U8" in [c["refdes"] for c in env["candidates"]])
+        print("\n--- functional ('sensor') — page-name match, IC ranks first ---")
+        # U3's only "sensor" text is its /Sensor1/ sheet, tying it at 0.25 with
+        # every cap on the sensor sheets. The pin-count tie-break lifts the
+        # opamp above the 2-pin caps, so the primary part outranks them — what
+        # a generic agent asking for "sensor" actually wants. (J2 tops the list
+        # outright on its value, "Sensor_Header".)
+        env = call_find(server, {"query": "sensor"})
+        ics = [c for c in env["candidates"] if c["refdes"].startswith("U")]
+        caps = [c for c in env["candidates"] if c["refdes"].startswith("C")]
+        all_ok &= check("an IC outranks the 2-pin caps it ties with",
+                        bool(ics and caps
+                             and env["candidates"].index(ics[0])
+                             < env["candidates"].index(caps[0])))
+        all_ok &= check("U3 present",
+                        "U3" in [c["refdes"] for c in env["candidates"]])
 
         print("\n--- description word ('unpolarized') — field-weighted, above sheet-only ---")
         env = call_find(server, {"query": "unpolarized"})

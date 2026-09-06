@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Test client for the kicad-netlist-parser MCP server.
 
-Starts the server with `medium_netlist.net`, does the MCP handshake over
+Starts the server on the netlist under test (see `_resolve_netlist`), does the MCP handshake over
 stdio, calls the `list_subsystems` tool with empty args, and dumps the
 result to stdout.
 
@@ -11,12 +11,16 @@ newline-delimited JSON-RPC 2.0.
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-NETLIST = HERE / "medium_netlist.net"
+
+# Netlist under test: $NETLIST_MCP_NET if set, else the in-repo fixture.
+NETLIST = Path(os.environ["NETLIST_MCP_NET"]).expanduser() \
+    if os.environ.get("NETLIST_MCP_NET") else HERE / "tests" / "fixture.net"
 BIN = HERE / "target" / "debug" / "kicad-netlist-parser"
 
 PROTOCOL_VERSION = "2024-11-05"

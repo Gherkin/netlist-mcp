@@ -52,9 +52,6 @@
 				(name "exclude_from_bom")
 			)
 			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "mounting hole")
 			)
@@ -87,9 +84,6 @@
 				(name "exclude_from_bom")
 			)
 			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "test point")
 			)
@@ -117,12 +111,6 @@
 				(lib "Switch")
 				(part "SW_Push")
 				(description "Push button")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -155,12 +143,6 @@
 				(lib "Regulator")
 				(part "AP2112K")
 				(description "300mA LDO regulator")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -207,12 +189,6 @@
 				(description "Unpolarized capacitor")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "cap capacitor")
 			)
@@ -243,12 +219,6 @@
 				(lib "Device")
 				(part "C")
 				(description "Unpolarized capacitor")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -283,12 +253,6 @@
 				(description "Unpolarized capacitor")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "cap capacitor")
 			)
@@ -319,12 +283,6 @@
 				(lib "Device")
 				(part "R")
 				(description "Resistor")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -359,12 +317,6 @@
 				(description "Resistor")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "R res resistor")
 			)
@@ -395,9 +347,6 @@
 				(lib "Device")
 				(part "R")
 				(description "Resistor")
-			)
-			(property
-				(name "exclude_from_bom")
 			)
 			(property
 				(name "dnp")
@@ -435,12 +384,6 @@
 				(description "Inductor")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "inductor choke coil")
 			)
@@ -471,12 +414,6 @@
 				(lib "Device")
 				(part "FerriteBead")
 				(description "Ferrite bead")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -511,12 +448,6 @@
 				(description "Schottky diode")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "diode schottky rectifier")
 			)
@@ -547,12 +478,6 @@
 				(lib "Device")
 				(part "Q_NMOS_GSD")
 				(description "N-channel MOSFET")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -590,12 +515,6 @@
 				(description "2-pin header")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "connector header")
 			)
@@ -631,9 +550,6 @@
 				(name "exclude_from_bom")
 			)
 			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "test point")
 			)
@@ -661,12 +577,6 @@
 				(lib "Amplifier")
 				(part "TLV9004")
 				(description "Quad op amp")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -710,12 +620,6 @@
 				(description "Resistor")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "R res resistor")
 			)
@@ -746,12 +650,6 @@
 				(lib "Device")
 				(part "R")
 				(description "Resistor")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -789,9 +687,6 @@
 				(name "exclude_from_bom")
 			)
 			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "test point")
 			)
@@ -819,12 +714,6 @@
 				(lib "Device")
 				(part "C")
 				(description "Unpolarized capacitor")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -859,12 +748,6 @@
 				(description "Resistor")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "R res resistor")
 			)
@@ -895,12 +778,6 @@
 				(lib "Device")
 				(part "R")
 				(description "Resistor")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -938,9 +815,6 @@
 				(name "exclude_from_bom")
 			)
 			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "test point")
 			)
@@ -968,12 +842,6 @@
 				(lib "Device")
 				(part "C")
 				(description "Unpolarized capacitor")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -1008,12 +876,6 @@
 				(description "Resistor")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "R res resistor")
 			)
@@ -1044,12 +906,6 @@
 				(lib "Device")
 				(part "R")
 				(description "Resistor")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -1087,9 +943,6 @@
 				(name "exclude_from_bom")
 			)
 			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "test point")
 			)
@@ -1117,12 +970,6 @@
 				(lib "Connector")
 				(part "Conn_01x02")
 				(description "2-pin header")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -1160,12 +1007,6 @@
 				(description "Unpolarized capacitor")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "cap capacitor")
 			)
@@ -1198,12 +1039,6 @@
 				(description "Resistor")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "R res resistor")
 			)
@@ -1234,12 +1069,6 @@
 				(lib "Interface")
 				(part "LAN8720A")
 				(description "Ethernet PHY")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -1298,12 +1127,6 @@
 				(description "RJ45 jack")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "ethernet jack magjack")
 			)
@@ -1334,12 +1157,6 @@
 				(lib "Transformer")
 				(part "H1102NL")
 				(description "Ethernet magnetics")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -1386,12 +1203,6 @@
 				(description "Crystal")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "crystal resonator")
 			)
@@ -1430,12 +1241,6 @@
 				(description "Unpolarized capacitor")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "cap capacitor")
 			)
@@ -1468,12 +1273,6 @@
 				(description "Unpolarized capacitor")
 			)
 			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
-			)
-			(property
 				(name "ki_keywords")
 				(value "cap capacitor")
 			)
@@ -1504,12 +1303,6 @@
 				(lib "Device")
 				(part "R")
 				(description "Resistor")
-			)
-			(property
-				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")
@@ -1583,9 +1376,6 @@
 			)
 			(property
 				(name "exclude_from_bom")
-			)
-			(property
-				(name "dnp")
 			)
 			(property
 				(name "ki_keywords")

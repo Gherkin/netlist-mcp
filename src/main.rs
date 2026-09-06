@@ -71,6 +71,10 @@ struct FilterComponentsParams {
     /// Restrict to a subsystem / sheet, e.g. "power".
     #[serde(default)]
     subsystem: Option<String>,
+    /// Restrict by Do Not Populate: true = only DNP parts, false = only
+    /// populated parts. Omit for both.
+    #[serde(default)]
+    dnp: Option<bool>,
     /// Max rows to return (default 50).
     #[serde(default)]
     limit: Option<u32>,
@@ -187,8 +191,11 @@ impl NetlistServer {
     }
 
     #[tool(description = "Full detail on one component: identity, keywords, \
-        footprint, subsystem, the full property map, and paginated pins (each \
-        with name, electrical type, and net).")]
+        footprint, subsystem, the dnp / exclude_from_bom flags, the full \
+        property map, and paginated pins (each with name, electrical type, and \
+        net). `dnp: true` means the schematic marks the part Do Not Populate — \
+        it is in the netlist and on every net it touches, but not on the built \
+        board.")]
     fn get_component(&self, Parameters(p): Parameters<GetComponentParams>) -> String {
         let limit = p.limit.unwrap_or(200);
         let offset = p.offset.unwrap_or(0);
@@ -198,7 +205,8 @@ impl NetlistServer {
         }
     }
 
-    #[tool(description = "Summarize the whole design: component counts, a \
+    #[tool(description = "Summarize the whole design: component counts \
+        (including how many parts are DNP / excluded from the BOM), a \
         refdes-class histogram, detected power rails (with confidence), \
         connectors, subsystems, and the highest-fanout nets. The zero-knowledge \
         first call for orienting in an unfamiliar design.")]
@@ -224,7 +232,9 @@ impl NetlistServer {
         keywords/footprint. Returns a flat, paginated list — every match, no \
         ranking. Use for enumeration/counting ('how many 0402 caps in the power \
         sheet') or as a fallback when find_components returns noise. For turning \
-        a rough idea into a handle, prefer find_components.")]
+        a rough idea into a handle, prefer find_components. `dnp` filters by \
+        Do Not Populate: true lists only the unfitted parts, false only the \
+        fitted ones.")]
     fn filter_components(&self, Parameters(p): Parameters<FilterComponentsParams>) -> String {
         let limit = p.limit.unwrap_or(50);
         let offset = p.offset.unwrap_or(0);
@@ -232,6 +242,7 @@ impl NetlistServer {
             p.query.as_deref(),
             p.refdes_class.as_deref(),
             p.subsystem.as_deref(),
+            p.dnp,
             limit,
             offset,
         ) {
@@ -281,7 +292,9 @@ impl NetlistServer {
         real opaque endpoints (ICs, connectors). Power/ground rails terminate \
         the walk and are reported, never enumerated. Returns endpoints with the \
         parts traversed to reach each. Topological, not electrical. The primary \
-        'what is actually connected to this?' tool.")]
+        'what is actually connected to this?' tool. Every traversed part and \
+        endpoint carries a `dnp` flag — a hop through a DNP part exists on the \
+        schematic but not on the built board.")]
     fn walk(&self, Parameters(p): Parameters<WalkParams>) -> String {
         let max_depth = p.max_depth.unwrap_or(4);
         let max_endpoints = p.max_endpoints.unwrap_or(50);
@@ -309,8 +322,9 @@ impl NetlistServer {
     }
 
     #[tool(description = "Report whether two pins are connected and, if so, the \
-        parts on the path between them. Expensive; prefer walk for open-ended \
-        tracing.")]
+        parts on the path between them (each with a `dnp` flag — a path through \
+        a DNP part is not connected on the built board). Expensive; prefer walk \
+        for open-ended tracing.")]
     fn path_between(&self, Parameters(p): Parameters<PathBetweenParams>) -> String {
         match self.design.path_between(&p.from, &p.to) {
             Ok(out) => out,
@@ -358,9 +372,10 @@ LOCATE (turn a rough idea into concrete handles):
   MPN, a value like \"10k\", or \"the MCU\") and get ranked candidates with a \
   confidence. Fuzzy and tolerant of partial/over-complete part numbers. Reach \
   for this first.
-- filter_components: deterministic filter (refdes class, subsystem, substring \
-  query). Use for exhaustive/counting questions (\"how many 0402 caps in the \
-  power sheet\") or when find_components is noisy.
+- filter_components: deterministic filter (refdes class, subsystem, dnp, \
+  substring query). Use for exhaustive/counting questions (\"how many 0402 caps \
+  in the power sheet\", \"which parts are DNP\") or when find_components is \
+  noisy.
 - filter_nets: find nets by name substring / subsystem. This is where \
   connectivity words resolve — \"spi\" finds SPI nets, which find_components \
   cannot (SPI lives in net names, not component fields).
@@ -385,6 +400,14 @@ REVIEW (factual patterns, not verdicts):
   power_in nets, undriven input nets, single-IC-pin nets, and stub nets. It \
   reports observed states, never asserts a bug; you judge relevance. get_net's \
   `role` field carries the same classification for a single net.
+
+DNP: every component carries a `dnp` boolean, and so does every part reported \
+in a walk/path_between `via` chain, a `neighbors` row, and a `get_net` member. \
+A DNP part is drawn on the schematic and present in the netlist, but is NOT \
+fitted on the built board — a connection that only exists through a DNP series \
+part does not exist in hardware. Check it before concluding two things are \
+wired together, and before treating a part as populated. `exclude_from_bom` is \
+a separate flag: a part can be DNP and still in the BOM, or vice versa.
 
 Notes: a component's `value` is usually its manufacturer part number for ICs (a \
 spec like \"10k\" for passives); `keywords` mirrors it. To find a part by \

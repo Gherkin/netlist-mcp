@@ -13,8 +13,11 @@ Notes on the format, learned from a real export and from `src/parser/`:
   * Pin *names* and *types* come from the libpart. The `pintype` on a net's
     `node` is ignored by the parser, so type coverage lives in `libparts`.
   * A `comp`'s own pins are bare `(pin (num "N"))` under `units/unit/pins`.
-  * KiCad emits `(property (name "dnp"))` with **no** `(value ...)` for DNP and
-    non-DNP parts alike — that is issue #15, reproduced here faithfully.
+  * KiCad emits `(property (name "dnp"))` with the name only and **no**
+    `(value ...)`, and emits it *only for the parts that carry the flag*. The
+    presence of the key is the flag (issue #15). `exclude_from_bom` works the
+    same way and is an independent flag — R3 below is DNP but still in the BOM,
+    H2/TP* are in the BOM's exclusion list but populated.
 """
 
 from pathlib import Path
@@ -85,14 +88,19 @@ KEYWORDS = {
 }
 
 # --- components ----------------------------------------------------------
-# refdes -> (libpart key, value, sheet, dnp?)
+# refdes -> (libpart key, value, sheet, dnp?, exclude_from_bom?)
 COMPONENTS = {}
 # net name -> [(refdes, pin), ...]
 NETS = {}
 
 
-def comp(refdes, part, value, sheet, dnp=False):
-    COMPONENTS[refdes] = (part, value, sheet, dnp)
+def comp(refdes, part, value, sheet, dnp=False, efb=None):
+    # Mechanical parts and test points are the usual BOM exclusions. Default
+    # them that way, but keep `efb` explicit so the two flags can be set
+    # independently of each other (issue #15).
+    if efb is None:
+        efb = part in ("MTG", "TP")
+    COMPONENTS[refdes] = (part, value, sheet, dnp, efb)
 
 
 def wire(net, *nodes):
@@ -101,7 +109,7 @@ def wire(net, *nodes):
 
 # Root sheet "/" — real, addressable, and small (issue #17: it must be
 # selectable without matching every other sheet, whose paths contain "/").
-comp("H1", "MTG", "MountingHole", "/", dnp=True)
+comp("H1", "MTG", "MountingHole", "/", dnp=True)          # DNP *and* excluded
 comp("H2", "MTG", "MountingHole", "/")
 comp("TP1", "TP", "TestPoint", "/")
 comp("SW1", "SW", "SW_Push", "/")
@@ -113,7 +121,7 @@ comp("C2", "C", "100n", "/Power/")
 comp("C3", "C", "33 pF", "/Power/")          # space before unit (issue #18)
 comp("R1", "R", "24K", "/Power/")            # uppercase K (issue #18)
 comp("R2", "R", "4k7", "/Power/")
-comp("R3", "R", "100k", "/Power/", dnp=True)
+comp("R3", "R", "100k", "/Power/", dnp=True, efb=False)   # DNP but in the BOM
 comp("L1", "L", "2.2u", "/Power/")
 comp("FB1", "FB", "600R", "/Power/")
 comp("D1", "DIODE", "SS34", "/Power/")
@@ -167,7 +175,7 @@ comp("X1", "XTAL", "25MHz", "/Ethernet/")
 comp("C30", "C", "18p", "/Ethernet/")
 comp("C31", "C", "18p", "/Ethernet/")
 comp("R40", "R", "1k", "/Ethernet/")
-comp("R41", "R", "49R9", "/Ethernet/", dnp=True)
+comp("R41", "R", "49R9", "/Ethernet/", dnp=True, efb=True)
 comp("TP20", "TP", "TestPoint", "/Ethernet/")
 
 wire("/Ethernet/LED1/REGOFF", ("U2", "3"), ("R40", "1"))   # slash in the label
@@ -225,7 +233,7 @@ def emit_libparts():
 
 def emit_components():
     out = [f"{IND}(components"]
-    for refdes, (part_key, value, sheet, dnp) in COMPONENTS.items():
+    for refdes, (part_key, value, sheet, dnp, efb) in COMPONENTS.items():
         lib, part, desc, pins = LIBPARTS[part_key]
         used = sorted({pin for (ref, pin) in
                        ((r, p) for nodes in NETS.values() for (r, p) in nodes)
@@ -242,15 +250,22 @@ def emit_components():
             f'{IND * 4}(part "{esc(part)}")',
             f'{IND * 4}(description "{esc(desc)}")',
             f"{IND * 3})",
-            # KiCad emits these two with the name only and no value, whether or
-            # not the part is DNP. `dnp` below records the ground truth that the
-            # export throws away (issue #15).
-            f"{IND * 3}(property",
-            f'{IND * 4}(name "exclude_from_bom")',
-            f"{IND * 3})",
-            f"{IND * 3}(property",
-            f'{IND * 4}(name "dnp")',
-            f"{IND * 3})",
+            # Presence-only flags: the name is emitted with no value, and only
+            # for the parts that actually carry the flag (issue #15).
+        ]
+        if efb:
+            out += [
+                f"{IND * 3}(property",
+                f'{IND * 4}(name "exclude_from_bom")',
+                f"{IND * 3})",
+            ]
+        if dnp:
+            out += [
+                f"{IND * 3}(property",
+                f'{IND * 4}(name "dnp")',
+                f"{IND * 3})",
+            ]
+        out += [
             f"{IND * 3}(property",
             f'{IND * 4}(name "ki_keywords")',
             f'{IND * 4}(value "{esc(KEYWORDS[part_key])}")',

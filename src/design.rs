@@ -87,6 +87,8 @@ impl Design {
             keywords: comp.properties.get("ki_keywords").cloned().flatten(),
             footprint: comp.footprint.clone(),
             sheet: comp.sheet.clone(),
+            dnp: comp.dnp,
+            exclude_from_bom: comp.exclude_from_bom,
             properties: comp.properties.clone(),
             pin_count,
             offset,
@@ -143,6 +145,7 @@ impl Design {
                     pin: self.pin_name(pid),
                     refdes: comp.refdes.clone(),
                     value: comp.value.clone(),
+                    dnp: comp.dnp,
                     pin_name: pin.name.clone(),
                     pin_type: pin.pin_type.clone(),
                 }
@@ -257,6 +260,7 @@ impl Design {
                     refdes: nc.refdes.clone(),
                     value: nc.value.clone(),
                     pin: self.pin_name(npid),
+                    dnp: nc.dnp,
                 });
             }
 
@@ -286,6 +290,7 @@ impl Design {
         query: Option<&str>,
         refdes_class: Option<&str>,
         subsystem: Option<&str>,
+        dnp: Option<bool>,
         limit: u32,
         offset: u32,
     ) -> anyhow::Result<String> {
@@ -323,6 +328,13 @@ impl Design {
                     }
                 }
 
+                // dnp: tri-state — None means "don't care", not "populated only".
+                if let Some(want_dnp) = dnp {
+                    if comp.dnp != want_dnp {
+                        return false;
+                    }
+                }
+
                 // query: every term must appear in the searchable bundle.
                 if let Some(terms) = &query_terms {
                     let bundle = comp.search_bundle();
@@ -351,6 +363,7 @@ impl Design {
                 footprint: comp.footprint.clone(),
                 sheet: comp.sheet.clone(),
                 keywords: comp.properties.get("ki_keywords").cloned().flatten(),
+                dnp: comp.dnp,
                 pin_count: comp.pins.len(),
             })
             .collect();
@@ -420,6 +433,7 @@ impl Design {
                     footprint: comp.footprint.clone(),
                     sheet: comp.sheet.clone(),
                     keywords: comp.properties.get("ki_keywords").cloned().flatten(),
+                    dnp: comp.dnp,
                     pin_count: comp.pins.len(),
                 },
                 confidence: score,
@@ -810,6 +824,8 @@ impl Design {
             components: self.components.len(),
             nets: self.nets.len(),
             pins: self.pins.len(),
+            dnp_components: self.components.iter().filter(|c| c.dnp).count(),
+            bom_excluded_components: self.components.iter().filter(|c| c.exclude_from_bom).count(),
         };
 
         // refdes_classes: histogram over leading-alpha class, count desc then class asc.
@@ -959,6 +975,7 @@ impl Design {
                     refdes: comp.refdes.clone(),
                     value: comp.value.clone(),
                     class: Self::refdes_class(&comp.refdes),
+                    dnp: comp.dnp,
                 }
             })
             .collect()
@@ -1125,6 +1142,7 @@ impl Design {
                                     refdes: comp.refdes.clone(),
                                     value: comp.value.clone(),
                                     class,
+                                    dnp: comp.dnp,
                                 });
                             }
                         }
@@ -1246,6 +1264,7 @@ impl Design {
                             value: comp.value.clone(),
                             description: comp.description.clone(),
                             sheet: comp.sheet.clone(),
+                            dnp: comp.dnp,
                         },
                         kind: Self::endpoint_kind(&class),
                         via: self.via_parts(&via),
@@ -1363,6 +1382,7 @@ impl Design {
                 refdes: v.refdes.clone(),
                 value: v.value.clone(),
                 class: v.class.clone(),
+                dnp: v.dnp,
             })
             .collect()
     }
@@ -1440,6 +1460,14 @@ impl Design {
         let mut j: usize = 0;
         for (i, netlist_comp) in netlist.components.into_iter().enumerate() {
             let value_norm = normalize_value(&netlist_comp.value, &Self::refdes_class(&netlist_comp.refdes));
+            // Lift the two presence-only flags into typed booleans and drop the
+            // keys, so `properties` never carries an entry whose null value
+            // would read as "not DNP" when it means the opposite.
+            let mut properties = netlist_comp.properties;
+            let dnp = presence_flag(&properties, "dnp");
+            let exclude_from_bom = presence_flag(&properties, "exclude_from_bom");
+            properties.remove("dnp");
+            properties.remove("exclude_from_bom");
             let mut comp = Component {
                 id: CompId(i),
                 refdes: netlist_comp.refdes,
@@ -1448,7 +1476,9 @@ impl Design {
                 footprint: netlist_comp.footprint,
                 description: netlist_comp.description,
                 sheet: netlist_comp.sheet,
-                properties: netlist_comp.properties,
+                dnp,
+                exclude_from_bom,
+                properties,
                 pins: Vec::new()
             };
             comp_map.insert(comp.refdes.clone(), CompId(i));
@@ -1539,6 +1569,11 @@ struct ComponentDetail {
     keywords: Option<String>,
     footprint: Option<String>,
     sheet: Option<String>,
+    /// Do Not Populate: the part is on the schematic but deliberately not
+    /// fitted. Always emitted, never null — see `presence_flag`.
+    dnp: bool,
+    /// Excluded from the BOM. Independent of `dnp`.
+    exclude_from_bom: bool,
     properties: HashMap<String, Option<String>>,
     pin_count: usize,
     offset: u32,
@@ -1554,6 +1589,9 @@ struct NetMemberRow {
     pin: String,
     refdes: String,
     value: String,
+    /// True if the owning component is Do Not Populate — the pin is on the
+    /// net in the schematic, but not on the built board.
+    dnp: bool,
     pin_name: Option<String>,
     #[serde(rename = "type")]
     pin_type: Option<String>,
@@ -1702,6 +1740,8 @@ struct FilterRow {
     footprint: Option<String>,
     sheet: Option<String>,
     keywords: Option<String>,
+    /// Do Not Populate — see `ComponentDetail::dnp`.
+    dnp: bool,
     pin_count: usize,
 }
 
@@ -1721,6 +1761,8 @@ struct NeighborRow {
     refdes: String,
     value: String,
     pin: String,
+    /// Do Not Populate — this neighbor is not fitted on the built board.
+    dnp: bool,
 }
 
 /// One net shared between the queried component and others: the queried
@@ -1786,6 +1828,12 @@ struct OverviewCounts {
     components: usize,
     nets: usize,
     pins: usize,
+    /// Components the schematic marks Do Not Populate. They are still present
+    /// in every net and every walk — check the `dnp` flag on a part before
+    /// concluding a connection exists on the built board.
+    dnp_components: usize,
+    /// Components excluded from the BOM (a separate KiCad flag from `dnp`).
+    bom_excluded_components: usize,
 }
 
 /// One refdes-class bucket in `design_overview` (e.g. "C" -> 220 parts).
@@ -1875,6 +1923,9 @@ struct ViaPart {
     refdes: String,
     value: String,
     class: String,
+    /// Do Not Populate. A DNP series part means this hop does **not** exist on
+    /// the built board — the path is schematic topology only.
+    dnp: bool,
 }
 
 /// The owning component of a reached endpoint pin (compact identity only).
@@ -1884,6 +1935,8 @@ struct EndpointComponent {
     value: String,
     description: Option<String>,
     sheet: Option<String>,
+    /// Do Not Populate — the endpoint part is not fitted on the built board.
+    dnp: bool,
 }
 
 /// One opaque endpoint reached by `walk`: the specific pin, its function, the
@@ -2191,6 +2244,25 @@ fn term_match_score(terms: &[&str], comp: &Component) -> Option<(f32, String)> {
     None
 }
 
+/// Read a KiCad presence-only symbol flag (`dnp`, `exclude_from_bom`) out of a
+/// component's property map.
+///
+/// The netlist exporter emits these as a *name with no value* — `(property
+/// (name "dnp"))` — and emits them **only for the parts that carry the flag**.
+/// So the key's presence is the flag; the `None` value is not "unknown", it is
+/// how KiCad spells `true`. A value is still honoured if some other exporter
+/// writes one, with the usual falsy spellings rejected.
+fn presence_flag(properties: &HashMap<String, Option<String>>, key: &str) -> bool {
+    match properties.get(key) {
+        None => false,
+        Some(None) => true,
+        Some(Some(v)) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "no" | "false" | "0"
+        ),
+    }
+}
+
 #[derive(Debug)]
 pub struct Component {
     id: CompId,
@@ -2200,6 +2272,14 @@ pub struct Component {
     footprint: Option<String>,
     description: Option<String>,
     sheet: Option<String>,
+    /// True if the schematic marks this part Do Not Populate. Derived from the
+    /// netlist's presence-only `dnp` property (see `presence_flag`) and lifted
+    /// out of `properties` so it can never be read as a null/unknown.
+    dnp: bool,
+    /// True if the schematic excludes this part from the BOM. A *separate*
+    /// KiCad flag from `dnp`: a part can be DNP and still in the BOM, or in
+    /// the BOM and excluded from it.
+    exclude_from_bom: bool,
     properties: HashMap<String, Option<String>>,
     pins: Vec<PinId>
 }
@@ -2431,7 +2511,8 @@ pub struct Net {
 
 #[cfg(test)]
 mod value_norm_tests {
-    use super::normalize_value;
+    use super::{normalize_value, presence_flag};
+    use std::collections::HashMap;
 
     #[test]
     fn parses_pf_written_as_trailing_token() {
@@ -2502,5 +2583,40 @@ mod value_norm_tests {
     #[test]
     fn non_passive_class_returns_none() {
         assert!(normalize_value("STM32F407VGT6", "U").is_none());
+    }
+
+    #[test]
+    fn presence_flag_absent_key_is_false() {
+        let props: HashMap<String, Option<String>> = HashMap::new();
+        assert!(!presence_flag(&props, "dnp"));
+    }
+
+    #[test]
+    fn presence_flag_valueless_key_is_true() {
+        // How KiCad actually spells it: the name is emitted, with no value,
+        // and only for the parts that carry the flag (issue #15).
+        let mut props: HashMap<String, Option<String>> = HashMap::new();
+        props.insert("dnp".to_string(), None);
+        assert!(presence_flag(&props, "dnp"));
+    }
+
+    #[test]
+    fn presence_flag_honours_an_explicit_value() {
+        let mut props: HashMap<String, Option<String>> = HashMap::new();
+        props.insert("dnp".to_string(), Some("yes".to_string()));
+        assert!(presence_flag(&props, "dnp"));
+
+        for falsy in ["no", "false", "0", "", "  "] {
+            props.insert("dnp".to_string(), Some(falsy.to_string()));
+            assert!(!presence_flag(&props, "dnp"), "{falsy:?} should be falsy");
+        }
+    }
+
+    #[test]
+    fn presence_flags_are_independent() {
+        let mut props: HashMap<String, Option<String>> = HashMap::new();
+        props.insert("dnp".to_string(), None);
+        assert!(presence_flag(&props, "dnp"));
+        assert!(!presence_flag(&props, "exclude_from_bom"));
     }
 }

@@ -677,19 +677,25 @@ impl Design {
     }
 
     /// Per-net counts of owning-component classes, split into IC ("U"),
-    /// connector ("J"/"P"), passive ("R"/"L"/"C"/"FB"), and everything else.
-    /// Shared by `net_role` and `audit` so both agree on what "IC pin",
-    /// "connector pin", and "passive-only" mean.
+    /// connector ("J"/"P"/"CN"/"RJ"/"USB"), passive ("R"/"L"/"C"/"FB"), and
+    /// everything else, plus an `endpoint` tally (see `is_endpoint_class`)
+    /// that cuts across the first three. Shared by `net_role` and `audit` so
+    /// both agree on what "IC pin", "connector pin", "endpoint pin", and
+    /// "passive-only" mean.
     fn net_class_counts(&self, net: &Net) -> NetClassCounts {
         let mut counts = NetClassCounts::default();
         for pid in &net.pins {
             let comp = self.component(&self.pin(pid).comp);
             let class = Self::refdes_class(&comp.refdes);
+            let pin_count = comp.pins.len();
+            if is_endpoint_class(&class, pin_count) {
+                counts.endpoint += 1;
+            }
             if class == IC_CLASS {
                 counts.ic += 1;
             } else if CONNECTOR_CLASSES.contains(&class.as_str()) {
                 counts.connector += 1;
-            } else if PASSIVE_CLASSES.contains(&class.as_str()) {
+            } else if is_passive_passthrough(&class, pin_count) {
                 counts.passive += 1;
             } else {
                 counts.other += 1;
@@ -723,6 +729,7 @@ impl Design {
             has_power_in,
             has_input,
             ic_pin_count: counts.ic,
+            endpoint_pin_count: counts.endpoint,
             passive_only,
         }
     }
@@ -759,8 +766,10 @@ impl Design {
     /// - `undriven_input`: has an `input` pin, no driver-typed pin on the net.
     /// - `single_ic_pin`: touches exactly one IC pin, and every other pin on
     ///   the net belongs to a passive component.
-    /// - `stub`: a single-pin (or unconnected) net, or a multi-pin net with
-    ///   no IC and no connector pin (passive/other parts only).
+    /// - `stub`: a single-pin (or unconnected) net, or a multi-pin net that
+    ///   reaches no endpoint part at all — only two-terminal passives and
+    ///   probe/mechanical parts (see `is_endpoint_class`). The note names
+    ///   whichever of the two the net actually carries.
     ///
     /// Each bucket is sorted by fanout descending (name ascending on ties),
     /// reports the true `count`, and returns up to `limit` rows — this keeps
@@ -818,12 +827,21 @@ impl Design {
                     fanout,
                     note: "single-pin net".to_string(),
                 });
-            } else if counts.ic == 0 && counts.connector == 0 {
+            } else if counts.endpoint == 0 {
+                // Every pin is a two-terminal passive or a probe/mechanical
+                // part; say which are actually present rather than naming both
+                // for a net that carries only one (a chassis net of mounting
+                // holes has no passives on it at all).
+                let note = match (counts.passive, fanout - counts.passive) {
+                    (0, _) => "only probe/mechanical parts, no endpoint part",
+                    (_, 0) => "only passives, no endpoint part",
+                    _ => "only passives and probe/mechanical parts, no endpoint part",
+                };
                 stub.push(AuditNetRow {
                     net: net.name.clone(),
                     code: net.code,
                     fanout,
-                    note: "only passives, no IC or connector".to_string(),
+                    note: note.to_string(),
                 });
             }
         }
@@ -902,16 +920,11 @@ impl Design {
         });
         rails.truncate(25);
 
-        // connectors: refdes class J or P, natural refdes order, capped 50.
+        // connectors: any CONNECTOR_CLASSES refdes, natural order, capped 50.
         let mut connectors: Vec<&Component> = self.components
             .iter()
             .filter(|comp| {
-                let class = comp.refdes
-                    .chars()
-                    .take_while(|c| !c.is_ascii_digit())
-                    .collect::<String>()
-                    .to_uppercase();
-                class == "J" || class == "P"
+                CONNECTOR_CLASSES.contains(&Self::refdes_class(&comp.refdes).as_str())
             })
             .collect();
         connectors.sort_by(|a, b| Self::pin_sort_key(&a.refdes).cmp(&Self::pin_sort_key(&b.refdes)));
@@ -989,10 +1002,16 @@ impl Design {
     fn endpoint_kind(class: &str) -> String {
         match class {
             "U" => "ic",
-            "J" | "P" => "connector",
+            "J" | "P" | "CN" | "RJ" | "USB" => "connector",
             "D" => "diode",
             "Q" => "transistor",
+            "T" => "transformer",
+            "X" | "Y" => "crystal",
+            "SW" => "switch",
             "TP" => "test_point",
+            // Only reachable for a passive that is NOT a 2-pin passthrough:
+            // a common-mode choke, an EMI filter, a resistor network.
+            "R" | "L" | "C" | "FB" => "passive",
             _ => "other",
         }
         .to_string()
@@ -1098,9 +1117,9 @@ impl Design {
     /// Also surfaces `dead_ends`: branches that fizzle out through a passthrough
     /// (never the start net itself) instead of reaching a real endpoint — a
     /// passthrough whose far pin is NC/single-pin ("dangling"), or a reached net
-    /// with no active (U/J/P/Q) component on it ("passive_only"). These are
-    /// additive/diagnostic and never change which endpoints/rails/large_nets are
-    /// reported.
+    /// with no endpoint part on it at all ("passive_only" — see
+    /// `is_endpoint_class`). These are additive/diagnostic and never change
+    /// which endpoints/rails/large_nets are reported.
     fn walk_bfs(
         &self,
         start_net: &NetId,
@@ -1157,41 +1176,50 @@ impl Design {
                 }
 
                 // passive_only dead end: this net was reached through at least
-                // one passthrough (via is never empty here) and carries no
-                // active (U/J/P/Q) endpoint — only passives and/or test points.
+                // one passthrough (via is never empty here) and reaches no
+                // endpoint part (`is_endpoint_class`) — only two-terminal
+                // passives and probe/mechanical parts. Both go into `parts`:
+                // a caller reading "no endpoint" needs to see the test point
+                // that is nevertheless sitting on the net, because `endpoints`
+                // reports it too.
                 let mut has_active = false;
-                let mut passive_seen: std::collections::HashSet<usize> =
+                let mut has_probe = false;
+                let mut inert_seen: std::collections::HashSet<usize> =
                     std::collections::HashSet::new();
-                let mut passive_parts: Vec<ViaPart> = Vec::new();
+                let mut inert_parts: Vec<ViaPart> = Vec::new();
                 for pin_id in &net.pins {
                     let pin = self.pin(pin_id);
                     let comp = self.component(&pin.comp);
                     let class = Self::refdes_class(&comp.refdes);
-                    match class.as_str() {
-                        "U" | "J" | "P" | "Q" => has_active = true,
-                        "R" | "L" | "C" | "FB" => {
-                            if passive_seen.insert(pin.comp.0) {
-                                passive_parts.push(ViaPart {
-                                    refdes: comp.refdes.clone(),
-                                    value: comp.value.clone(),
-                                    class,
-                                    dnp: comp.dnp,
-                                });
-                            }
+                    if is_endpoint_class(&class, comp.pins.len()) {
+                        has_active = true;
+                    } else {
+                        has_probe |= PROBE_CLASSES.contains(&class.as_str());
+                        if inert_seen.insert(pin.comp.0) {
+                            inert_parts.push(ViaPart {
+                                refdes: comp.refdes.clone(),
+                                value: comp.value.clone(),
+                                class,
+                                dnp: comp.dnp,
+                            });
                         }
-                        _ => {}
                     }
                 }
                 if !has_active
                     && dead_end_seen.insert(net.name.clone())
                     && dead_ends.len() < max_endpoints as usize
                 {
+                    let reason = if has_probe {
+                        "only passives and probe/mechanical parts, no active endpoint"
+                    } else {
+                        "only passives, no active endpoint"
+                    };
                     dead_ends.push(DeadEnd {
                         net: Some(net.name.clone()),
                         fanout: net.pins.len(),
                         via: self.via_parts(&via),
-                        parts: passive_parts,
-                        reason: "only passives, no active endpoint".to_string(),
+                        parts: inert_parts,
+                        reason: reason.to_string(),
                     });
                 }
             }
@@ -1211,8 +1239,7 @@ impl Design {
 
                 let comp = self.component(comp_id);
                 let class = Self::refdes_class(&comp.refdes);
-                let is_passthrough =
-                    comp.pins.len() == 2 && matches!(class.as_str(), "R" | "L" | "FB" | "C");
+                let is_passthrough = is_passive_passthrough(&class, comp.pins.len());
 
                 if is_passthrough {
                     // The OTHER pin on this 2-pin component (not the one we
@@ -1795,9 +1822,20 @@ pub struct NetRole {
     /// Any `input` pin present on the net.
     pub has_input: bool,
     /// Count of pins whose owning component's refdes class is "U" (IC).
+    /// Strictly ICs — a net landing on a jack, magnetics or a crystal has a
+    /// real endpoint but still reports 0 here; see `endpoint_pin_count`.
     pub ic_pin_count: usize,
-    /// True if every pin's owning component is a passive class (R/L/C/FB) —
-    /// i.e. no IC, connector, or other class touches this net.
+    /// Count of pins on parts this net can actually TERMINATE on — ICs,
+    /// connectors, and everything that is neither a two-terminal passive nor a
+    /// probe/mechanical part (magnetics, crystals, transistors, diodes,
+    /// switches, multi-terminal passives like common-mode chokes, ...). See
+    /// `is_endpoint_class`. 0 means the net only reaches two-terminal passives
+    /// and probe/mechanical parts.
+    pub endpoint_pin_count: usize,
+    /// True if every pin's owning component is a two-terminal passive
+    /// (R/L/C/FB with exactly 2 pins) — i.e. nothing this net could terminate
+    /// on touches it. A multi-terminal passive (a common-mode choke, a
+    /// resistor network) is an endpoint, not a passive, and clears this.
     pub passive_only: bool,
 }
 
@@ -1834,6 +1872,10 @@ struct NetClassCounts {
     connector: usize,
     passive: usize,
     other: usize,
+    /// Pins on parts a net can actually terminate on (`is_endpoint_class`).
+    /// Cuts across `ic`/`connector`/`other` — it is NOT a fifth disjoint
+    /// bucket.
+    endpoint: usize,
 }
 
 /// One net in an `audit` bucket: identity/fanout plus a neutral, factual
@@ -2027,7 +2069,7 @@ struct RailRow {
     evidence: Vec<String>,
 }
 
-/// One connector (refdes class J/P) in `design_overview`.
+/// One connector (refdes class J/P/CN/RJ/USB) in `design_overview`.
 #[derive(Debug, Serialize)]
 struct ConnectorRow {
     refdes: String,
@@ -2125,7 +2167,8 @@ struct WalkEndpoint {
     pin_type: Option<String>,
     component: EndpointComponent,
     /// Broad function grouping derived from the endpoint's refdes class:
-    /// "ic", "connector", "diode", "transistor", "test_point", or "other".
+    /// "ic", "connector", "diode", "transistor", "transformer", "crystal",
+    /// "switch", "test_point", or "other".
     kind: String,
     via: Vec<ViaPart>,
     distance: u32,
@@ -2134,13 +2177,17 @@ struct WalkEndpoint {
 /// A branch that fizzled out instead of reaching a real endpoint: reached
 /// only through at least one passthrough (`via` non-empty, never the start
 /// net). Either a passthrough whose far pin is NC or lands on a single-pin
-/// net ("dangling"), or a reached net with no active (U/J/P/Q) component on
-/// it ("passive_only").
+/// net ("dangling"), or a reached net with no endpoint part on it at all
+/// ("passive_only" — see `is_endpoint_class`).
 #[derive(Debug, Serialize)]
 struct DeadEnd {
     net: Option<String>,
     fanout: usize,
     via: Vec<ViaPart>,
+    /// The non-endpoint parts found on the net: two-terminal passives plus any
+    /// probe/mechanical parts. Probe parts are listed even though they also
+    /// appear under `endpoints`, so `reason` never contradicts an unexplained
+    /// gap here.
     parts: Vec<ViaPart>,
     reason: String,
 }
@@ -2252,8 +2299,60 @@ const DRIVER_PIN_TYPES: &[&str] = &[
     "output", "bidirectional", "tri_state", "open_collector", "open_emitter", "power_out",
 ];
 const PASSIVE_CLASSES: &[&str] = &["R", "L", "C", "FB"];
-const CONNECTOR_CLASSES: &[&str] = &["J", "P"];
+const CONNECTOR_CLASSES: &[&str] = &["J", "P", "CN", "RJ", "USB"];
 const IC_CLASS: &str = "U";
+// Parts that touch a net without terminating it: probe points and mechanical
+// hardware. Together with PASSIVE_CLASSES these are the ONLY classes
+// `is_endpoint_class` treats as non-endpoints.
+//
+// Add to this list only for a prefix that is UNAMBIGUOUSLY inert, and check it
+// against the stock KiCad libraries first: a wrong entry here is silent and
+// unbounded, since every part in the class then vanishes from stub detection
+// and from walk endpoints. "MK" looked mechanical and is not — KiCad gives it
+// to microphones (Device: Microphone*, all of Sensor_Audio: ICS-43434,
+// SPH0645LM4H, IM69D130, ...), which are exactly the kind of endpoint #13 was
+// about. "H" (mounting holes/screws/outlines), "FID" (fiducials) and "TP"
+// (test points) are inert throughout those libraries, with one exception worth
+// knowing: Connector's `CoaxialSwitch_Testpoint` also takes "TP" and is a
+// 3-pin RF switch sitting IN the signal path. "MH" has no owner in the stock
+// libraries at all — it is included by convention (mounting hole), not by
+// verification.
+const PROBE_CLASSES: &[&str] = &["TP", "H", "MH", "FID"];
+
+/// Is this component the two-terminal passive a walk passes THROUGH rather
+/// than stopping at? Class alone is not enough: `L` is a passthrough as a
+/// 2-pin inductor and a real endpoint as a 4-pin common-mode choke, and the
+/// same holds for 3-terminal EMI filters and resistor networks carrying an
+/// `R` prefix.
+///
+/// This is THE definition of a passthrough — `walk` branches on it, and
+/// `is_endpoint_class` is its complement — so the two can never disagree
+/// about a part.
+fn is_passive_passthrough(class: &str, pin_count: usize) -> bool {
+    PASSIVE_CLASSES.contains(&class) && pin_count == 2
+}
+
+/// Can a net actually TERMINATE on this component?
+///
+/// Deliberately a deny-list, not an allow-list: an allow-list of "real" parts
+/// is never finished (RJ45 jacks, magnetics, crystals, relays, opto-isolators,
+/// modules, antennas, ... all keep arriving), and every class it has not heard
+/// of gets silently reported as a dead end. The parts that are genuinely NOT
+/// endpoints are a short, closed set — two-terminal passives, which a walk
+/// passes THROUGH rather than stopping at, and probe/mechanical parts, which
+/// merely touch a net. Everything else is assumed to be a real part.
+///
+/// `pin_count` is the whole reason this takes more than a class: a passive
+/// prefix earns its exemption only at exactly two terminals. Anything else
+/// wearing an `R`/`L`/`C`/`FB` prefix — a choke, a filter, a network, or a
+/// 1-pin passive that should not exist — is reported as the endpoint it is,
+/// which is also what `walk` already did with it.
+///
+/// `class` must come from `Design::refdes_class` (uppercased leading
+/// non-digit prefix); `pin_count` from `Component::pins`.
+pub fn is_endpoint_class(class: &str, pin_count: usize) -> bool {
+    !is_passive_passthrough(class, pin_count) && !PROBE_CLASSES.contains(&class)
+}
 
 /// Case-insensitive heuristic for "does this net name look like a power/ground
 /// rail?" Checks the segment after the last '/' against a set of common rail
@@ -3042,5 +3141,119 @@ mod value_norm_tests {
         props.insert("dnp".to_string(), None);
         assert!(presence_flag(&props, "dnp"));
         assert!(!presence_flag(&props, "exclude_from_bom"));
+    }
+}
+
+#[cfg(test)]
+mod endpoint_class_tests {
+    use super::{is_endpoint_class, is_passive_passthrough};
+
+    /// Pin count for the cases where the class alone settles it.
+    const ANY: usize = 2;
+
+    #[test]
+    fn two_pin_passives_and_probes_are_not_endpoints() {
+        for class in ["R", "L", "C", "FB"] {
+            assert!(
+                !is_endpoint_class(class, 2),
+                "2-pin {class} should not be an endpoint"
+            );
+        }
+        for class in ["TP", "H", "MH", "FID"] {
+            assert!(
+                !is_endpoint_class(class, ANY),
+                "{class} should not be an endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_terminal_passives_are_endpoints() {
+        // A 4-pin common-mode choke, a 3-terminal EMI filter and a resistor
+        // network all wear a passive prefix and are not passthroughs: `walk`
+        // reports them under `endpoints`, so the predicate must agree or the
+        // same response calls their net a dead end. See issue #13.
+        for (class, pins) in [("L", 4), ("C", 3), ("R", 8), ("FB", 4)] {
+            assert!(
+                is_endpoint_class(class, pins),
+                "{pins}-pin {class} should be an endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn a_one_pin_passive_is_an_endpoint() {
+        // Anomalous rather than inert — better surfaced than swallowed.
+        assert!(is_endpoint_class("R", 1));
+    }
+
+    #[test]
+    fn probes_are_inert_at_any_pin_count() {
+        // Deliberate: the pin-count gate applies to passive prefixes only. It
+        // costs us Connector's 3-pin `CoaxialSwitch_Testpoint`, which is a
+        // real RF endpoint wearing a "TP" prefix — see PROBE_CLASSES.
+        for pins in [1, 2, 3] {
+            assert!(!is_endpoint_class("TP", pins));
+        }
+    }
+
+    #[test]
+    fn passthrough_and_endpoint_are_exact_complements_for_passives() {
+        // The bug this pairing exists to prevent: `walk` branching on one rule
+        // and the dead-end reason on another, so a response lists a part under
+        // `endpoints` and calls its net "no active endpoint" in the same
+        // breath.
+        for class in ["R", "L", "C", "FB"] {
+            for pins in [1, 2, 3, 4, 8] {
+                assert_eq!(
+                    is_passive_passthrough(class, pins),
+                    !is_endpoint_class(class, pins),
+                    "{pins}-pin {class}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mk_is_a_microphone_not_a_mechanical_part() {
+        // KiCad hands "MK" to microphones (Device: Microphone*, all of
+        // Sensor_Audio). A PDM mic biased by an R/C is precisely the #13
+        // shape: deny-listing it puts its net back in `stub` and turns a walk
+        // onto it into a dead end.
+        assert!(is_endpoint_class("MK", ANY));
+    }
+
+    #[test]
+    fn ics_and_connectors_are_endpoints() {
+        for class in ["U", "J", "P", "CN", "RJ", "USB"] {
+            assert!(
+                is_endpoint_class(class, ANY),
+                "{class} should be an endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn the_classes_issue_13_reported_are_endpoints() {
+        // RJ45 jack, Ethernet magnetics, crystal — nets landing on these were
+        // reported as stubs with ic_pin_count 0.
+        for class in ["RJ", "T", "X"] {
+            assert!(
+                is_endpoint_class(class, ANY),
+                "{class} should be an endpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_class_is_assumed_to_be_a_real_part() {
+        // The whole point of the deny-list: a class the tool has never heard
+        // of is far more likely a real part than a probe point.
+        for class in ["K", "BZ", "ANT", "MOD", "ISO"] {
+            assert!(
+                is_endpoint_class(class, ANY),
+                "{class} should be an endpoint"
+            );
+        }
     }
 }

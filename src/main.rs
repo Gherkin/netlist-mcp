@@ -348,10 +348,14 @@ impl NetlistServer {
         unpowered_power_in (has a power_in pin, no power_out source anywhere \
         on the net), undriven_input (has an input pin, no driver-typed pin on \
         the net), single_ic_pin (touches exactly one IC pin and only passives \
-        otherwise), and stub (a single-pin net, or a multi-pin net with no IC \
-        and no connector pin). A net can appear in several categories. Each \
-        category reports its true count plus up to `limit` nets (default \
-        100), so hundreds of stub/TP nets don't drown the response.")]
+        otherwise), and stub (a single-pin net, or a multi-pin net that \
+        reaches no endpoint part at all — only two-terminal passives and \
+        probe/mechanical parts; jacks, magnetics, crystals, transistors, and \
+        passives with more than two terminals such as common-mode chokes, DO \
+        count as endpoints). A net can appear in several \
+        categories. Each category reports its true count plus up to `limit` \
+        nets (default 100), so hundreds of stub/TP nets don't drown the \
+        response.")]
     fn audit(&self, Parameters(p): Parameters<AuditParams>) -> String {
         let limit = p.limit.unwrap_or(100);
         match self.design.audit(limit) {

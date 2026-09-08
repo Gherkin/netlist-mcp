@@ -303,11 +303,16 @@ impl Design {
         let sheets = self.components.iter().map(|c| c.sheet.as_deref());
         let filter = parsed.widen_if_unmatched(sheets);
         // PathPrefix is unreachable from parse, so its presence *is* the
-        // record that widening happened.
+        // record that widening happened. The note describes the widening
+        // rather than claiming a match: the prefix may well match nothing
+        // (a design whose only USB sheet is /PeriphUSB/ answers "/USB" with
+        // an empty page), and that is the case where the caller most needs
+        // the unanchored reading pointed out to them.
         let note = match &filter {
             SubsystemFilter::PathPrefix(prefix) => Some(format!(
-                "no sheet in this design answers to '{}'; matched sheets whose \
-                 path starts with '{prefix}' instead",
+                "no sheet in this design answers to '{}'; widened to sheets whose \
+                 path starts with '{prefix}' — for an unanchored match, drop the \
+                 leading slash",
                 arg.unwrap_or_default().trim(),
             )),
             _ => None,
@@ -2883,6 +2888,27 @@ mod subsystem_filter_seam_tests {
             // matches nothing is a true empty answer, same as Root.
             assert!(note.is_none(), "{arg} produced {note:?}");
         }
+    }
+
+    /// The note is only useful if it survives serialization — it is the one
+    /// thing on the page that says the argument was reinterpreted.
+    #[test]
+    fn a_widened_filter_reports_itself_in_the_envelope() {
+        let design = design_with_sheets(&["/ADC1/", "/ADC2/", "/Power/"]);
+        let json = design
+            .filter_components(None, None, Some("/ADC"), None, 10, 0)
+            .expect("filter_components");
+        assert!(json.contains("subsystem_note"), "{json}");
+        assert!(json.contains("drop the leading slash"), "{json}");
+        // The widened prefix matched, but the note does not say so either
+        // way — an empty page carries the same wording.
+        assert!(!json.contains("matched sheets"), "{json}");
+
+        // Taken at face value, the envelope keeps its compact shape.
+        let json = design
+            .filter_components(None, None, Some("/Power"), None, 10, 0)
+            .expect("filter_components");
+        assert!(!json.contains("subsystem_note"), "{json}");
     }
 }
 

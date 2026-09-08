@@ -830,7 +830,8 @@ impl Design {
                     net: net.name.clone(),
                     code: net.code,
                     fanout,
-                    note: "only passives and test points, no endpoint part".to_string(),
+                    note: "only passives and probe/mechanical parts, no endpoint part"
+                        .to_string(),
                 });
             }
         }
@@ -1162,39 +1163,50 @@ impl Design {
                 }
 
                 // passive_only dead end: this net was reached through at least
-                // one passthrough (via is never empty here) and carries no
-                // active (U/J/P/Q) endpoint — only passives and/or test points.
+                // one passthrough (via is never empty here) and reaches no
+                // endpoint part (`is_endpoint_class`) — only two-terminal
+                // passives and probe/mechanical parts. Both go into `parts`:
+                // a caller reading "no endpoint" needs to see the test point
+                // that is nevertheless sitting on the net, because `endpoints`
+                // reports it too.
                 let mut has_active = false;
-                let mut passive_seen: std::collections::HashSet<usize> =
+                let mut has_probe = false;
+                let mut inert_seen: std::collections::HashSet<usize> =
                     std::collections::HashSet::new();
-                let mut passive_parts: Vec<ViaPart> = Vec::new();
+                let mut inert_parts: Vec<ViaPart> = Vec::new();
                 for pin_id in &net.pins {
                     let pin = self.pin(pin_id);
                     let comp = self.component(&pin.comp);
                     let class = Self::refdes_class(&comp.refdes);
                     if is_endpoint_class(&class) {
                         has_active = true;
-                    } else if PASSIVE_CLASSES.contains(&class.as_str())
-                        && passive_seen.insert(pin.comp.0)
-                    {
-                        passive_parts.push(ViaPart {
-                            refdes: comp.refdes.clone(),
-                            value: comp.value.clone(),
-                            class,
-                            dnp: comp.dnp,
-                        });
+                    } else {
+                        has_probe |= PROBE_CLASSES.contains(&class.as_str());
+                        if inert_seen.insert(pin.comp.0) {
+                            inert_parts.push(ViaPart {
+                                refdes: comp.refdes.clone(),
+                                value: comp.value.clone(),
+                                class,
+                                dnp: comp.dnp,
+                            });
+                        }
                     }
                 }
                 if !has_active
                     && dead_end_seen.insert(net.name.clone())
                     && dead_ends.len() < max_endpoints as usize
                 {
+                    let reason = if has_probe {
+                        "only passives and probe/mechanical parts, no active endpoint"
+                    } else {
+                        "only passives, no active endpoint"
+                    };
                     dead_ends.push(DeadEnd {
                         net: Some(net.name.clone()),
                         fanout: net.pins.len(),
                         via: self.via_parts(&via),
-                        parts: passive_parts,
-                        reason: "only passives, no active endpoint".to_string(),
+                        parts: inert_parts,
+                        reason: reason.to_string(),
                     });
                 }
             }
@@ -2157,6 +2169,10 @@ struct DeadEnd {
     net: Option<String>,
     fanout: usize,
     via: Vec<ViaPart>,
+    /// The non-endpoint parts found on the net: two-terminal passives plus any
+    /// probe/mechanical parts. Probe parts are listed even though they also
+    /// appear under `endpoints`, so `reason` never contradicts an unexplained
+    /// gap here.
     parts: Vec<ViaPart>,
     reason: String,
 }
@@ -2273,7 +2289,16 @@ const IC_CLASS: &str = "U";
 // Parts that touch a net without terminating it: probe points and mechanical
 // hardware. Together with PASSIVE_CLASSES these are the ONLY classes
 // `is_endpoint_class` treats as non-endpoints.
-const PROBE_CLASSES: &[&str] = &["TP", "H", "MH", "MK", "FID"];
+//
+// Add to this list only for a prefix that is UNAMBIGUOUSLY inert, and check it
+// against the stock KiCad libraries first: a wrong entry here is silent and
+// unbounded, since every part in the class then vanishes from stub detection
+// and from walk endpoints. "MK" looked mechanical and is not — KiCad gives it
+// to microphones (Device: Microphone*, all of Sensor_Audio: ICS-43434,
+// SPH0645LM4H, IM69D130, ...), which are exactly the kind of endpoint #13 was
+// about. "H"/"MH" (mounting holes/screws), "FID" (fiducials) and "TP" (test
+// points) carry no signal anywhere in those libraries.
+const PROBE_CLASSES: &[&str] = &["TP", "H", "MH", "FID"];
 
 /// Does a refdes class name a part a net can actually TERMINATE on?
 ///
@@ -3087,9 +3112,18 @@ mod endpoint_class_tests {
 
     #[test]
     fn passives_and_probes_are_not_endpoints() {
-        for class in ["R", "L", "C", "FB", "TP", "H", "MH", "MK", "FID"] {
+        for class in ["R", "L", "C", "FB", "TP", "H", "MH", "FID"] {
             assert!(!is_endpoint_class(class), "{class} should not be an endpoint");
         }
+    }
+
+    #[test]
+    fn mk_is_a_microphone_not_a_mechanical_part() {
+        // KiCad hands "MK" to microphones (Device: Microphone*, all of
+        // Sensor_Audio). A PDM mic biased by an R/C is precisely the #13
+        // shape: deny-listing it puts its net back in `stub` and turns a walk
+        // onto it into a dead end.
+        assert!(is_endpoint_class("MK"));
     }
 
     #[test]

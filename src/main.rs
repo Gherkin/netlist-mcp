@@ -350,8 +350,9 @@ impl NetlistServer {
         the net), single_ic_pin (touches exactly one IC pin and only passives \
         otherwise), and stub (a single-pin net, or a multi-pin net that \
         reaches no endpoint part at all — only two-terminal passives and \
-        probe/mechanical parts; jacks, magnetics, crystals, transistors and \
-        the like DO count as endpoints). A net can appear in several \
+        probe/mechanical parts; jacks, magnetics, crystals, transistors, and \
+        passives with more than two terminals such as common-mode chokes, DO \
+        count as endpoints). A net can appear in several \
         categories. Each category reports its true count plus up to `limit` \
         nets (default 100), so hundreds of stub/TP nets don't drown the \
         response.")]

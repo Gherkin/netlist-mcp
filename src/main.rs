@@ -68,7 +68,13 @@ struct FilterComponentsParams {
     /// Restrict to a refdes class, e.g. "U", "R", "C", "J".
     #[serde(default)]
     refdes_class: Option<String>,
-    /// Restrict to a subsystem / sheet, e.g. "power".
+    /// Restrict to a subsystem / sheet. A bare name is a case-insensitive
+    /// substring, so "sensor" spans /Sensor1/../Sensor3/. A rooted path takes
+    /// that sheet and anything below it ("/Power/"); if no sheet answers to it
+    /// it widens to a rooted prefix, so "/ADC" still spans /ADC1/ and /ADC2/
+    /// while staying clear of unrelated sheets — the response says so in
+    /// `subsystem_note` when this happens. "/" is the root sheet alone — omit
+    /// this field for the whole design.
     #[serde(default)]
     subsystem: Option<String>,
     /// Restrict by Do Not Populate: true = only DNP parts, false = only
@@ -88,7 +94,10 @@ struct FilterNetsParams {
     /// Substring / pattern to match against net names.
     #[serde(default)]
     name: Option<String>,
-    /// Restrict to a subsystem / sheet.
+    /// Restrict to nets with a pin on a matching sheet. Same matching as
+    /// filter_components: bare name = substring, "/Power/" = that sheet and
+    /// below (widening to a rooted prefix, reported in `subsystem_note`, if no
+    /// sheet answers to it), "/" = the root sheet alone.
     #[serde(default)]
     subsystem: Option<String>,
     /// Sort by descending pin fanout (default true).

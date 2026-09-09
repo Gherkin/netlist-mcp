@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
 use std::fmt::format;
 use std::fmt::Display;
@@ -18,7 +19,12 @@ pub struct Design {
     // Map of Refdes:PinNo -> PinId
     pin_map: HashMap<String, PinId>,
     // Map of NetName -> NetId
-    net_map: HashMap<String, NetId>
+    net_map: HashMap<String, NetId>,
+    // Every sheet path this design actually has, normalized by
+    // `normalize_sheet_path` and closed over ancestors. Read only by
+    // `net_hierarchy`, to tell a hierarchy separator in a net name from a
+    // slash that is part of a label (issue #16).
+    sheet_paths: HashSet<String>
 }
 
 impl Design {
@@ -153,7 +159,7 @@ impl Design {
             .collect();
 
         let role = self.net_role(net_ref);
-        let hierarchy = Self::net_hierarchy(&net_ref.name);
+        let hierarchy = self.net_hierarchy(&net_ref.name);
 
         let envelope = NetDetail {
             net: net_ref.name.clone(),
@@ -300,7 +306,12 @@ impl Design {
         let Some(parsed) = SubsystemFilter::parse(arg) else {
             return (None, None);
         };
-        let sheets = self.components.iter().map(|c| c.sheet.as_deref());
+        // Declared sheets as well as the components': a sheet that holds no
+        // parts is still a sheet, and asking for it should come back empty
+        // rather than widened — the widening note would claim the design has
+        // no such sheet, which by then a net's `sheet_path` has already named.
+        let sheets = self.components.iter().map(|c| c.sheet.as_deref())
+            .chain(self.sheet_paths.iter().map(|s| Some(s.as_str())));
         let filter = parsed.widen_if_unmatched(sheets);
         // PathPrefix is unreachable from parse, so its presence *is* the
         // record that widening happened. The note describes the widening
@@ -549,7 +560,7 @@ impl Design {
             .skip(offset as usize)
             .take(limit as usize)
             .map(|net| {
-                let hierarchy = Self::net_hierarchy(&net.name);
+                let hierarchy = self.net_hierarchy(&net.name);
                 NetRow {
                     name: net.name.clone(),
                     code: net.code,
@@ -734,27 +745,58 @@ impl Design {
         }
     }
 
-    /// Pure, structural decomposition of a net name by its '/'-separated
-    /// hierarchy. Splits on '/' and drops empty segments (so a leading '/'
-    /// and any repeated slashes are both handled cleanly). Does not infer
-    /// intended connectivity, scope, or cross-sheet bridging — only reports
-    /// the name's literal segment structure. Reused by `get_net` (embedded
-    /// as `hierarchy`) and `filter_nets` (compact `sheet_path`/`depth`
-    /// fields on each row).
-    pub fn net_hierarchy(name: &str) -> NetHierarchy {
+    /// Decomposition of a net name into the sheet path KiCad prefixed it with
+    /// and the label a human typed. Does not infer intended connectivity,
+    /// scope, or cross-sheet bridging. Reused by `get_net` (embedded as
+    /// `hierarchy`) and `filter_nets` (compact `sheet_path`/`depth` fields on
+    /// each row).
+    ///
+    /// The split is against `self.sheet_paths`, not against '/' — see
+    /// `net_hierarchy_in` for why the naive split is wrong.
+    pub fn net_hierarchy(&self, name: &str) -> NetHierarchy {
+        Self::net_hierarchy_in(name, &self.sheet_paths)
+    }
+
+    /// The sheet-set half of `net_hierarchy`, split out to be testable
+    /// without a whole design behind it.
+    ///
+    /// A net name is `<sheet path><label>`, and both halves may contain '/':
+    /// a label named after a dual-function pin ("LED1/REGOFF", after the
+    /// LAN8720A's LED1/nREGOFF) is normal. Splitting on the *last* slash
+    /// therefore invents a sheet — "/Ethernet/LED1/REGOFF" reads as a net on
+    /// "/Ethernet/LED1", a sheet no design has (issue #16), and the depth
+    /// that comes with it is wrong too.
+    ///
+    /// So the prefix is matched against the sheets the design actually has,
+    /// longest first (a design with both "/Ethernet/" and "/Ethernet/PHY/"
+    /// splits "/Ethernet/PHY/RST" at the deeper one). A name whose prefix
+    /// names no sheet is reported flat — whole name as `local_name`, no
+    /// `sheet_path`, depth 0. That is the honest reading for a global label
+    /// and for a local label containing a slash alike, and it never points at
+    /// a sheet that does not exist.
+    fn net_hierarchy_in(name: &str, sheets: &HashSet<String>) -> NetHierarchy {
         let rooted = name.starts_with('/');
         let segments: Vec<&str> = name.split('/').filter(|s| !s.is_empty()).collect();
 
-        let local_name = segments.last().copied().unwrap_or(name).to_string();
-        let depth = segments.len().saturating_sub(1);
-        let sheet_path = if segments.len() > 1 {
-            Some(format!("/{}", segments[..segments.len() - 1].join("/")))
+        // Longest segment prefix that names a real sheet; 0 when none does,
+        // which includes every flat name (there is no prefix to test).
+        let sheet_segments = (1..segments.len())
+            .rev()
+            .find(|k| sheets.contains(&normalize_sheet_path(&segments[..*k].join("/"))))
+            .unwrap_or(0);
+
+        let local_name = if sheet_segments == 0 {
+            // Not `segments.join("/")`: that would silently normalize away a
+            // leading or doubled slash the caller may want to see echoed.
+            name.trim_start_matches('/').to_string()
         } else {
-            None
+            segments[sheet_segments..].join("/")
         };
+        let sheet_path = (sheet_segments > 0)
+            .then(|| format!("/{}", segments[..sheet_segments].join("/")));
         let scope_hint = if rooted { "hierarchical" } else { "flat" };
 
-        NetHierarchy { rooted, local_name, sheet_path, depth, scope_hint }
+        NetHierarchy { rooted, local_name, sheet_path, depth: sheet_segments, scope_hint }
     }
 
     /// Scan every net and bucket it into FACTUAL, non-exclusive categories
@@ -1499,6 +1541,12 @@ impl Design {
     }
 
     pub fn from_netlist(netlist: netlist::Netlist) -> anyhow::Result<Design> {
+        let sheet_paths = sheet_path_set(
+            netlist.sheets.iter().map(String::as_str).chain(
+                netlist.components.iter().filter_map(|c| c.sheet.as_deref()),
+            ),
+        );
+
         let mut nets: Vec<Net> = Vec::new();
         let mut net_map: HashMap<String, NetId> = HashMap::new();
         for (i, netlist_net) in netlist.nets.into_iter().enumerate() {
@@ -1600,7 +1648,8 @@ impl Design {
             pins: pins,
             pin_map: pin_map,
             nets: nets,
-            net_map: net_map
+            net_map: net_map,
+            sheet_paths
         });
     }
 }
@@ -1616,6 +1665,41 @@ struct ComponentPinRow {
     #[serde(rename = "type")]
     pin_type: Option<String>,
     net: Option<String>,
+}
+
+/// One sheet path in the form `sheet_path_set` stores and `net_hierarchy_in`
+/// looks up: lowercased (KiCad carries the sheet name's case in both the
+/// design header and the net name, but nothing guarantees the two agree),
+/// rooted, and trailing-slashed. The two sides arrive in different shapes —
+/// "/Power/" from the export, "Power" from a joined run of net-name segments
+/// — and normalizing makes them one key.
+fn normalize_sheet_path(path: &str) -> String {
+    format!("/{}/", path.trim().trim_matches('/').to_lowercase())
+}
+
+/// The set of sheet paths a design has, for `net_hierarchy_in` to split net
+/// names against.
+///
+/// Fed from the export's `(design ...)` header *and* the components'
+/// sheetpaths: the header is authoritative but older exports omit it, while
+/// the components cover only sheets that hold parts. Either source alone
+/// leaves a real sheet out, and a missing sheet costs a net its hierarchy.
+///
+/// Ancestors are added for the same reason: a sheet whose children hold every
+/// part ("/Power/Aux/") is still a sheet, and nets can be labelled on it.
+fn sheet_path_set<'a>(sheets: impl Iterator<Item = &'a str>) -> HashSet<String> {
+    let mut paths: HashSet<String> = HashSet::new();
+    for sheet in sheets {
+        let segments: Vec<&str> = sheet.split('/').filter(|s| !s.is_empty()).collect();
+        for k in 1..=segments.len() {
+            paths.insert(normalize_sheet_path(&segments[..k].join("/")));
+        }
+    }
+    // The root sheet is every design's, and its path normalizes to "/" — a
+    // name no net-name segment can produce, so it is inert as a split point
+    // and present only so the set is not a lie about the design.
+    paths.insert("/".to_string());
+    paths
 }
 
 /// Display name for a sheet path: the path with its rooting slashes trimmed,
@@ -2940,6 +3024,7 @@ mod subsystem_filter_seam_tests {
                 pins: Vec::new(),
             })
             .collect();
+        let sheet_paths = super::sheet_path_set(sheets.iter().copied());
         Design {
             components,
             pins: Vec::new(),
@@ -2947,6 +3032,7 @@ mod subsystem_filter_seam_tests {
             component_map: HashMap::new(),
             pin_map: HashMap::new(),
             net_map: HashMap::new(),
+            sheet_paths,
         }
     }
 
@@ -3255,5 +3341,118 @@ mod endpoint_class_tests {
                 "{class} should be an endpoint"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod net_hierarchy_tests {
+    use super::{sheet_path_set, Design};
+    use std::collections::HashSet;
+
+    fn sheets(paths: &[&str]) -> HashSet<String> {
+        sheet_path_set(paths.iter().copied())
+    }
+
+    #[test]
+    fn splits_a_net_name_at_the_sheet_it_names() {
+        let h = Design::net_hierarchy_in("/Power/EN", &sheets(&["/Power/"]));
+        assert!(h.rooted);
+        assert_eq!(h.local_name, "EN");
+        assert_eq!(h.sheet_path.as_deref(), Some("/Power"));
+        assert_eq!(h.depth, 1);
+        assert_eq!(h.scope_hint, "hierarchical");
+    }
+
+    /// Issue #16: a label named after a dual-function pin. The slash is part
+    /// of the label, and the sheet it would otherwise imply does not exist.
+    #[test]
+    fn keeps_a_slash_that_belongs_to_the_label() {
+        let h = Design::net_hierarchy_in("/Ethernet/LED1/REGOFF", &sheets(&["/Ethernet/"]));
+        assert_eq!(h.local_name, "LED1/REGOFF");
+        assert_eq!(h.sheet_path.as_deref(), Some("/Ethernet"));
+        assert_eq!(h.depth, 1);
+    }
+
+    #[test]
+    fn prefers_the_deepest_sheet_that_matches() {
+        let h = Design::net_hierarchy_in(
+            "/Ethernet/Magnetics/CT",
+            &sheets(&["/Ethernet/", "/Ethernet/Magnetics/"]),
+        );
+        assert_eq!(h.local_name, "CT");
+        assert_eq!(h.sheet_path.as_deref(), Some("/Ethernet/Magnetics"));
+        assert_eq!(h.depth, 2);
+    }
+
+    /// A sheet holding nothing but sub-sheets still names nets, so
+    /// `sheet_path_set` keeps the ancestors of every path it is given.
+    #[test]
+    fn a_sheet_known_only_as_an_ancestor_still_splits() {
+        let h = Design::net_hierarchy_in("/Ethernet/RST", &sheets(&["/Ethernet/Magnetics/"]));
+        assert_eq!(h.local_name, "RST");
+        assert_eq!(h.sheet_path.as_deref(), Some("/Ethernet"));
+        assert_eq!(h.depth, 1);
+    }
+
+    /// The whole point of validating: never name a sheet the design has not
+    /// got. A prefix that matches nothing leaves the name whole.
+    #[test]
+    fn an_unknown_prefix_reads_as_a_flat_name() {
+        let h = Design::net_hierarchy_in("/LED1/REGOFF", &sheets(&["/Ethernet/"]));
+        assert_eq!(h.local_name, "LED1/REGOFF");
+        assert_eq!(h.sheet_path, None);
+        assert_eq!(h.depth, 0);
+        // Still rooted as written — `scope_hint` reports the name's shape,
+        // which is not what changed here.
+        assert!(h.rooted);
+        assert_eq!(h.scope_hint, "hierarchical");
+    }
+
+    #[test]
+    fn a_flat_name_has_no_hierarchy() {
+        let h = Design::net_hierarchy_in("GND", &sheets(&["/Power/"]));
+        assert!(!h.rooted);
+        assert_eq!(h.local_name, "GND");
+        assert_eq!(h.sheet_path, None);
+        assert_eq!(h.depth, 0);
+        assert_eq!(h.scope_hint, "flat");
+    }
+
+    /// KiCad's own auto-generated names carry a slash-bearing pin name
+    /// unescaped by the time they reach here ("Net-(U2A-NINT/REFCLKO)").
+    #[test]
+    fn an_autogenerated_name_is_not_split() {
+        let h = Design::net_hierarchy_in("Net-(U2A-NINT/REFCLKO)", &sheets(&["/Ethernet/"]));
+        assert_eq!(h.local_name, "Net-(U2A-NINT/REFCLKO)");
+        assert_eq!(h.sheet_path, None);
+        assert_eq!(h.depth, 0);
+    }
+
+    /// The sheet path in a net name and the one in the design header come
+    /// from the same schematic, but nothing in the format guarantees their
+    /// case matches, and a case difference must not cost a net its hierarchy.
+    #[test]
+    fn matching_ignores_case() {
+        let h = Design::net_hierarchy_in("/POWER/EN", &sheets(&["/Power/"]));
+        assert_eq!(h.sheet_path.as_deref(), Some("/POWER"));
+        assert_eq!(h.local_name, "EN");
+    }
+
+    /// The root sheet is in the set as "/", which no segment prefix can
+    /// produce — a net on the root sheet is flat, and stays flat.
+    #[test]
+    fn the_root_sheet_is_not_a_split_point() {
+        let h = Design::net_hierarchy_in("/SENSIN1", &sheets(&["/"]));
+        assert_eq!(h.local_name, "SENSIN1");
+        assert_eq!(h.sheet_path, None);
+        assert_eq!(h.depth, 0);
+    }
+
+    /// A sheet whose name is a prefix of another's must not claim its nets.
+    #[test]
+    fn a_sheet_name_is_matched_whole_not_as_a_prefix() {
+        let h = Design::net_hierarchy_in("/PowerAux/EN", &sheets(&["/Power/"]));
+        assert_eq!(h.local_name, "PowerAux/EN");
+        assert_eq!(h.sheet_path, None);
     }
 }

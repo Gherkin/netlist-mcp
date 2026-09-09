@@ -457,6 +457,29 @@ fn parse_component(node: &NetListNode, base_tree: &NetListNode) -> anyhow::Resul
     return Ok(comp);
 }
 
+/// The sheet names listed in the export's `(design ...)` header. This is the
+/// only authoritative sheet list in a netlist: component `sheetpath`s name
+/// only the sheets that happen to hold parts, and the header also carries
+/// sheets that hold nothing but sub-sheets.
+///
+/// A missing `design` node, or a header with no `sheet` entries, is not an
+/// error — it is what an older export (or a hand-built fixture) looks like,
+/// and yields an empty list.
+fn parse_sheets(nodetree: &NetListNode) -> anyhow::Result<Vec<String>> {
+    let Some(design) = nodetree.get_maybe_only_child(&Token::sym("design"))
+        .context("error looking for design child of the export node")?
+    else {
+        return Ok(Vec::new());
+    };
+
+    design.get_direct_child(&Token::sym("sheet"))
+        .context("error looking for sheet children of the design node")?
+        .into_iter()
+        .map(|sheet| Ok(unescape_kicad(sheet.get_only_child_val(&Token::sym("name"))
+            .with_context(|| format!("error looking for name child of sheet node {:?}", sheet))?)))
+        .collect()
+}
+
 fn parse_net(node: &NetListNode, comps: &mut Vec::<netlist::Component>) -> anyhow::Result<netlist::Net> {
     let sym = node.key()?;
     ensure!(*sym == Token::sym("net"), "NetListNode passed was not Symbol::Comp but {sym:?}");
@@ -565,8 +588,58 @@ pub fn parse_netlist(data: &String) -> anyhow::Result<netlist::Netlist> {
 
     let netlist = netlist::Netlist {
         components: comps,
-        nets: nets
+        nets: nets,
+        sheets: parse_sheets(&nodetree)?
     };
 
     return Ok(netlist);
+}
+
+#[cfg(test)]
+mod parse_sheets_tests {
+    use super::{parse_sheets, structurize, NetListNode, Scanner, Token};
+
+    fn tree(src: &str) -> NetListNode {
+        let syms: Vec<Token> = Scanner::new(src)
+            .collect::<anyhow::Result<Vec<Token>>>()
+            .expect("scan");
+        let mut slice: &[Token] = &syms;
+        structurize(&mut slice).expect("structurize")
+    }
+
+    #[test]
+    fn reads_the_sheet_names_in_file_order() {
+        let node = tree(r#"(export (design
+            (source "b.kicad_sch")
+            (sheet (number "1") (name "/") (tstamps "/"))
+            (sheet (number "2") (name "/Ethernet PHY/") (tstamps "/abc/"))
+        ) (components))"#);
+        assert_eq!(parse_sheets(&node).unwrap(), vec!["/", "/Ethernet PHY/"]);
+    }
+
+    /// An export that lists no sheets is not malformed — a flat schematic has
+    /// none to list, and older exports omit the block. Callers fall back to
+    /// the components' sheetpaths.
+    #[test]
+    fn a_header_without_sheets_yields_none() {
+        let node = tree(r#"(export (design (source "b.kicad_sch")) (components))"#);
+        assert!(parse_sheets(&node).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_missing_design_header_yields_none() {
+        let node = tree(r#"(export (components))"#);
+        assert!(parse_sheets(&node).unwrap().is_empty());
+    }
+
+    /// Sheet names go through the same unescaping as every other string, so a
+    /// sheet whose name contains a slash arrives comparable to the net names
+    /// that carry it as a prefix.
+    #[test]
+    fn unescapes_the_sheet_name() {
+        let node = tree(r#"(export (design
+            (sheet (number "1") (name "/AB{slash}C/") (tstamps "/x/"))
+        ))"#);
+        assert_eq!(parse_sheets(&node).unwrap(), vec!["/AB/C/"]);
+    }
 }

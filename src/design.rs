@@ -506,6 +506,14 @@ impl Design {
     /// Net-side counterpart of `filter_components`: deterministic, exhaustive,
     /// no scoring. Filter by name substring and/or subsystem (AND-combined,
     /// case-insensitive), sort, paginate, and serialize a compact envelope.
+    ///
+    /// One exception to "no scoring": under a `subsystem` filter every row is
+    /// rail-scored and the rails sort last (issue #4). A net belongs to a
+    /// subsystem only through the parts it touches, so GND and the supply rails
+    /// match *every* sheet, and fanout-descending order then floats them above
+    /// the sheet-local signals the query was after. They are demoted rather
+    /// than dropped: whether GND reaches this sheet is a fair question, and a
+    /// silently truncated answer is worse than a reordered one.
     pub fn filter_nets(
         &self,
         name: Option<&str>,
@@ -520,7 +528,7 @@ impl Design {
             .filter(|n| !n.trim().is_empty());
         let (subsystem_filter, subsystem_note) = self.subsystem_filter(subsystem);
 
-        let mut matches: Vec<&Net> = self.nets
+        let matches: Vec<&Net> = self.nets
             .iter()
             .filter(|net| {
                 // name: case-insensitive substring against the net name.
@@ -544,22 +552,45 @@ impl Design {
             })
             .collect();
 
-        // Default (sort_by_fanout): fanout descending, tie-break net name ascending.
-        // Otherwise: alphabetical by net name.
-        if sort_by_fanout {
-            matches.sort_by(|a, b| {
-                b.pins.len().cmp(&a.pins.len()).then_with(|| a.name.cmp(&b.name))
-            });
-        } else {
-            matches.sort_by(|a, b| a.name.cmp(&b.name));
-        }
+        // Rail-scoring is a subsystem-filter concern only: an unfiltered page
+        // (or a name search for "gnd") is asking about the design as a whole,
+        // where a high-fanout rail on top is the right answer.
+        let scored = subsystem_filter.is_some();
+        let mut matches: Vec<(&Net, f32)> = matches
+            .into_iter()
+            .map(|net| (net, if scored { self.rail_score(net).0 } else { 0.0 }))
+            .collect();
+
+        // Rails last (no-op without a subsystem filter, where every score is 0),
+        // then within each group: default (sort_by_fanout) fanout descending,
+        // tie-break net name ascending; otherwise alphabetical by net name.
+        matches.sort_by(|(a, a_score), (b, b_score)| {
+            let a_rail = *a_score >= RAIL_THRESHOLD;
+            let b_rail = *b_score >= RAIL_THRESHOLD;
+            a_rail.cmp(&b_rail).then_with(|| {
+                if sort_by_fanout {
+                    b.pins.len().cmp(&a.pins.len()).then_with(|| a.name.cmp(&b.name))
+                } else {
+                    a.name.cmp(&b.name)
+                }
+            })
+        });
+
+        // Say so on the envelope: the demotion is invisible from the rows alone,
+        // and a caller who wants the rails now knows where they went.
+        let demoted = matches.iter().filter(|(_, s)| *s >= RAIL_THRESHOLD).count();
+        let rail_note = (demoted > 0).then(|| format!(
+            "{demoted} power/ground rail(s) sorted last: a rail reaches parts on \
+             nearly every sheet, so it matches this subsystem without belonging \
+             to it. See each row's rail_score.",
+        ));
 
         let total = matches.len();
         let rows: Vec<NetRow> = matches
             .into_iter()
             .skip(offset as usize)
             .take(limit as usize)
-            .map(|net| {
+            .map(|(net, rail)| {
                 let hierarchy = self.net_hierarchy(&net.name);
                 NetRow {
                     name: net.name.clone(),
@@ -568,6 +599,7 @@ impl Design {
                     pin_types: net.pin_types.clone(),
                     sheet_path: hierarchy.sheet_path,
                     depth: hierarchy.depth,
+                    rail_score: scored.then(|| (rail * 100.0).round() / 100.0),
                 }
             })
             .collect();
@@ -578,6 +610,7 @@ impl Design {
             limit,
             returned: rows.len(),
             subsystem_note,
+            rail_note,
             rows,
         };
         return Ok(serde_json::to_string_pretty(&envelope)
@@ -938,12 +971,13 @@ impl Design {
             b.count.cmp(&a.count).then_with(|| a.class.cmp(&b.class))
         });
 
-        // rails: every net scoring >= 0.5, sorted score desc then fanout desc, capped 25.
+        // rails: every net at or over `RAIL_THRESHOLD`, sorted score desc then
+        // fanout desc, capped 25.
         let mut rails: Vec<RailRow> = self.nets
             .iter()
             .filter_map(|net| {
                 let (score, evidence) = self.rail_score(net);
-                if score >= 0.5 {
+                if score >= RAIL_THRESHOLD {
                     Some(RailRow {
                         net: net.name.clone(),
                         fanout: net.pins.len(),
@@ -1153,7 +1187,7 @@ impl Design {
 
     /// BFS traversal core shared by `walk` (and, later, `path_between`). Alternates
     /// net -> pins -> owning component -> (through a passthrough?) -> other net.
-    /// Rails (score >= 0.5 when `stop_at_power`) and large nets (fanout > 40) are
+    /// Rails (`RAIL_THRESHOLD` when `stop_at_power`) and large nets (fanout > 40) are
     /// terminal. Cycles are cut by `visited_nets` / `visited_comps`.
     ///
     /// Also surfaces `dead_ends`: branches that fizzle out through a passthrough
@@ -1199,7 +1233,7 @@ impl Design {
             if net_idx != start_net_idx {
                 if stop_at_power {
                     let (score, _evidence) = self.rail_score(net);
-                    if score >= 0.5 {
+                    if score >= RAIL_THRESHOLD {
                         rails_reached.push(RailReached {
                             net: net.name.clone(),
                             score: (score * 100.0).round() / 100.0,
@@ -2093,6 +2127,11 @@ struct NetRow {
     pin_types: HashMap<String, i32>,
     sheet_path: Option<String>,
     depth: usize,
+    /// Present only under a `subsystem` filter, which is the only page that
+    /// ranks by it (see `Design::filter_nets`). Same score as `get_net`'s,
+    /// without the evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rail_score: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2105,6 +2144,10 @@ struct NetEnvelope {
     /// `Design::subsystem_filter`.
     #[serde(skip_serializing_if = "Option::is_none")]
     subsystem_note: Option<String>,
+    /// Present only when a `subsystem` filter demoted at least one rail to the
+    /// end of the ordering — see `Design::filter_nets`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rail_note: Option<String>,
     rows: Vec<NetRow>,
 }
 
@@ -2374,6 +2417,10 @@ const RAIL_WEIGHT_POWER_FRAC: f32 = 0.45;
 const RAIL_WEIGHT_NAME_MATCH: f32 = 0.30;
 const RAIL_WEIGHT_CAP_FRAC: f32 = 0.25;
 const RAIL_FANOUT_BOOST: f32 = 0.15;
+// The score at or above which a net is treated as a rail rather than a signal:
+// `design_overview` lists it as a detected rail, `walk` stops at it instead of
+// enumerating it, and `filter_nets` sorts it last under a subsystem filter.
+const RAIL_THRESHOLD: f32 = 0.5;
 
 // Pin-type and refdes-class sets shared by `Design::net_role` and
 // `Design::audit`. A "driver" is any pin type capable of actively asserting
@@ -3660,5 +3707,185 @@ mod net_hierarchy_tests {
         let h = Design::net_hierarchy_in("/PowerAux/EN", &sheets(&["/Power/"]));
         assert_eq!(h.local_name, "PowerAux/EN");
         assert_eq!(h.sheet_path, None);
+    }
+}
+
+#[cfg(test)]
+mod filter_nets_rail_tests {
+    use super::*;
+
+    /// A design of one net per entry: `(net name, [(refdes, sheet, pin type)])`.
+    /// Enough to exercise `filter_nets` end to end — every part is single-pin,
+    /// which `rail_score` does not care about (it reads pin types, refdes class
+    /// and fanout).
+    fn design_of(nets: &[(&str, &[(&str, &str, &str)])]) -> Design {
+        let mut design = Design {
+            components: Vec::new(),
+            pins: Vec::new(),
+            nets: Vec::new(),
+            component_map: HashMap::new(),
+            pin_map: HashMap::new(),
+            net_map: HashMap::new(),
+            sheet_paths: HashSet::new(),
+        };
+
+        for (code, (name, members)) in nets.iter().enumerate() {
+            let net_id = NetId(design.nets.len());
+            let mut pin_ids: Vec<PinId> = Vec::new();
+            let mut pin_types: HashMap<String, i32> = HashMap::new();
+
+            for (refdes, sheet, pin_type) in members.iter() {
+                let comp_id = match design.component_map.get(*refdes) {
+                    Some(id) => CompId(id.0),
+                    None => {
+                        let id = CompId(design.components.len());
+                        design.components.push(Component {
+                            id: CompId(id.0),
+                            refdes: refdes.to_string(),
+                            value: String::new(),
+                            value_norm: None,
+                            footprint: None,
+                            description: None,
+                            sheet: Some(sheet.to_string()),
+                            dnp: false,
+                            exclude_from_bom: false,
+                            properties: HashMap::new(),
+                            pins: Vec::new(),
+                        });
+                        design.component_map.insert(refdes.to_string(), CompId(id.0));
+                        id
+                    }
+                };
+
+                let pin_id = PinId(design.pins.len());
+                let number = (design.component(&comp_id).pins.len() + 1).to_string();
+                design.pins.push(Pin {
+                    id: PinId(pin_id.0),
+                    comp: CompId(comp_id.0),
+                    number: number.clone(),
+                    name: None,
+                    pin_type: Some(pin_type.to_string()),
+                    net: Some(NetId(net_id.0)),
+                });
+                design.pin_map.insert(format!("{refdes}:{number}"), PinId(pin_id.0));
+                design.components[comp_id.0].pins.push(PinId(pin_id.0));
+                pin_ids.push(pin_id);
+                *pin_types.entry(pin_type.to_string()).or_insert(0) += 1;
+            }
+
+            design.nets.push(Net {
+                id: net_id,
+                code: code + 1,
+                name: name.to_string(),
+                pins: pin_ids,
+                pin_types,
+            });
+            design.net_map.insert(name.to_string(), NetId(design.nets.len() - 1));
+        }
+
+        let sheets: Vec<&str> = design.components
+            .iter()
+            .filter_map(|c| c.sheet.as_deref())
+            .collect();
+        design.sheet_paths = sheet_path_set(sheets.into_iter());
+        design
+    }
+
+    /// The design from issue #4 in miniature: GND is the highest-fanout net on
+    /// every sheet, and the sensor sheet's own signals are small.
+    fn sensor_design() -> Design {
+        design_of(&[
+            ("GND", &[
+                ("U1", "/Sensor1/", "power_in"), ("C1", "/Sensor1/", "passive"),
+                ("C2", "/Sensor1/", "passive"), ("U2", "/MCU/", "power_in"),
+                ("C3", "/MCU/", "passive"), ("C4", "/MCU/", "passive"),
+                ("C5", "/MCU/", "passive"),
+            ]),
+            ("+3V3", &[
+                ("U1", "/Sensor1/", "power_in"), ("U2", "/MCU/", "power_in"),
+                ("C6", "/MCU/", "passive"),
+            ]),
+            ("/SENSOUT", &[("U1", "/Sensor1/", "output"), ("U2", "/MCU/", "input")]),
+            ("/SENSIN", &[("U1", "/Sensor1/", "input"), ("R1", "/Sensor1/", "passive")]),
+        ])
+    }
+
+    fn rows(json: &str) -> Vec<serde_json::Value> {
+        let parsed: serde_json::Value = serde_json::from_str(json).expect("valid JSON");
+        parsed["rows"].as_array().expect("rows").clone()
+    }
+
+    fn names(json: &str) -> Vec<String> {
+        rows(json).iter().map(|r| r["name"].as_str().unwrap().to_string()).collect()
+    }
+
+    /// The issue itself: fanout-descending order used to put GND and +3V3 above
+    /// every signal on the sheet. They are still on the page — last.
+    #[test]
+    fn rails_sort_last_under_a_subsystem_filter() {
+        let design = sensor_design();
+        let json = design.filter_nets(None, Some("Sensor1"), true, 50, 0).expect("filter_nets");
+        assert_eq!(names(&json), ["/SENSIN", "/SENSOUT", "GND", "+3V3"]);
+        // Demoted, never dropped — "does GND reach this sheet" stays answerable.
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["total"], 4);
+        assert!(parsed["rail_note"].as_str().unwrap().starts_with("2 power/ground rail(s)"));
+    }
+
+    /// Alphabetical order is a presentation choice, not a different question:
+    /// the rails go last there too, sorted among themselves by name.
+    #[test]
+    fn the_demotion_survives_the_alphabetical_sort() {
+        let design = sensor_design();
+        let json = design.filter_nets(None, Some("Sensor1"), false, 50, 0).expect("filter_nets");
+        assert_eq!(names(&json), ["/SENSIN", "/SENSOUT", "+3V3", "GND"]);
+    }
+
+    /// Without a subsystem filter the question is about the whole design, where
+    /// a high-fanout rail on top is the right answer — and the row stays compact.
+    #[test]
+    fn an_unfiltered_page_is_untouched() {
+        let design = sensor_design();
+        let json = design.filter_nets(None, None, true, 50, 0).expect("filter_nets");
+        assert_eq!(names(&json), ["GND", "+3V3", "/SENSIN", "/SENSOUT"]);
+        assert!(!json.contains("rail_score"), "{json}");
+        assert!(!json.contains("rail_note"), "{json}");
+    }
+
+    /// A name search for a rail is not a subsystem query either.
+    #[test]
+    fn a_name_filter_alone_does_not_demote() {
+        let design = sensor_design();
+        let json = design.filter_nets(Some("gnd"), None, true, 50, 0).expect("filter_nets");
+        assert_eq!(names(&json), ["GND"]);
+        assert!(!json.contains("rail_note"), "{json}");
+    }
+
+    /// Paging is applied after the demotion, so page one is all signal: the
+    /// rails are pushed onto the last page rather than eating the first.
+    #[test]
+    fn the_demotion_happens_before_pagination() {
+        let design = sensor_design();
+        let json = design.filter_nets(None, Some("Sensor1"), true, 2, 0).expect("filter_nets");
+        assert_eq!(names(&json), ["/SENSIN", "/SENSOUT"]);
+        // The note counts every demoted rail, including the ones off this page.
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["rail_note"].as_str().unwrap().starts_with("2 power/ground rail(s)"));
+
+        let json = design.filter_nets(None, Some("Sensor1"), true, 2, 2).expect("filter_nets");
+        assert_eq!(names(&json), ["GND", "+3V3"]);
+    }
+
+    /// Every row under a subsystem filter carries the score it was ranked by,
+    /// so a caller can see why a net landed where it did — and a sheet with no
+    /// rail on it gets no note.
+    #[test]
+    fn scored_rows_report_their_score_and_a_rail_free_sheet_gets_no_note() {
+        let design = design_of(&[
+            ("/SENSOUT", &[("U1", "/Sensor1/", "output"), ("U2", "/MCU/", "input")]),
+        ]);
+        let json = design.filter_nets(None, Some("Sensor1"), true, 50, 0).expect("filter_nets");
+        assert_eq!(rows(&json)[0]["rail_score"], 0.0);
+        assert!(!json.contains("rail_note"), "{json}");
     }
 }

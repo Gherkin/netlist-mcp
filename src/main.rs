@@ -264,7 +264,10 @@ impl NetlistServer {
         subsystem, sorted by fanout (default) or name. Returns compact rows (net \
         name, code, fanout, pin-type distribution). This is where connectivity \
         words resolve — e.g. 'spi' finds the SPI nets, which find_components \
-        cannot (SPI lives in net names, not component fields).")]
+        cannot (SPI lives in net names, not component fields). Under a subsystem \
+        filter, power/ground rails sort last and each row carries its rail_score: \
+        a rail touches parts on nearly every sheet, so it matches a subsystem \
+        without belonging to it. It is still on the page, at the end.")]
     fn filter_nets(&self, Parameters(p): Parameters<FilterNetsParams>) -> String {
         let sort_by_fanout = p.sort_by_fanout.unwrap_or(true);
         let limit = p.limit.unwrap_or(50);
@@ -391,7 +394,9 @@ LOCATE (turn a rough idea into concrete handles):
   noisy.
 - filter_nets: find nets by name substring / subsystem. This is where \
   connectivity words resolve — \"spi\" finds SPI nets, which find_components \
-  cannot (SPI lives in net names, not component fields).
+  cannot (SPI lives in net names, not component fields). A subsystem filter \
+  sorts the power/ground rails last (they reach every sheet), so the top of \
+  the page is the sheet's own signals.
 
 INSPECT (full detail on a known handle):
 - get_component (by REFDES), get_net (by name or code), get_pin (by REFDES:PIN). \

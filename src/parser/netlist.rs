@@ -4,7 +4,13 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub struct Netlist {
     pub components: Vec<Component>,
-    pub nets: Vec<Net>
+    pub nets: Vec<Net>,
+    /// Every sheet the export's `(design ...)` header lists, in file order and
+    /// exactly as written ("/", "/Power/", "/Power/Aux/"). Older exports (and
+    /// hand-built fixtures) may omit the entries entirely, so this can be
+    /// empty even for a hierarchical design — callers fall back to the
+    /// sheetpaths carried by the components themselves.
+    pub sheets: Vec<String>
 }
 
 #[derive(Debug)]

@@ -2659,18 +2659,62 @@ pub struct ValueNorm {
     pub canonical: String,
 }
 
-/// SI prefix letter -> multiplier. Case-sensitive: lowercase 'm' is milli,
-/// uppercase 'M' is mega; 'u' and 'µ' both mean micro.
-fn si_prefix(c: char) -> Option<f64> {
-    match c {
-        'p' => Some(1e-12),
-        'n' => Some(1e-9),
-        'u' | 'µ' => Some(1e-6),
-        'm' => Some(1e-3),
-        'k' => Some(1e3),
-        'M' => Some(1e6),
-        'G' => Some(1e9),
-        _ => None,
+/// SI prefix letter -> multiplier, for a value of the given class.
+///
+/// Case-tolerant exactly where the domain leaves no ambiguity: 'K', 'P', 'N'
+/// and 'U' name no other quantity a passive is written in, so "24K" is 24k and
+/// "33P" is 33p (issue #18). 'G' keeps its case, since a lowercase giga is
+/// never written and folding it buys nothing.
+///
+/// 'M' is the one prefix whose reading depends on the class, because that is
+/// where the ambiguity does or does not exist:
+///
+/// - **R**: strict. Milli and mega are both real for a resistor and case is
+///   all that separates a 1mΩ shunt from a 1MΩ bleeder, so folding would turn
+///   one into the other.
+/// - **L**: milli. There is no megahenry, so uppercase "10MH" can only mean
+///   10mH — the same no-other-quantity argument that folds 'K' and 'P'.
+/// - **C**: refused, by the range rule below. Neither reading is safe: the
+///   megafarad does not exist, but legacy US notation spells the *micro*farad
+///   "MF"/"MFD", so uppercase 'M' on a capacitor is genuinely ambiguous and a
+///   null is the honest answer.
+///
+/// A prefix is refused outright when it names a magnitude the class is not
+/// made in, because then the letter is something else — most often a tolerance
+/// code, where "104K" is 100nF ±10% and *not* 104kF. Refusing it leaves the
+/// honest null these fields had before uppercase folding rather than a number
+/// that is confidently off by orders of magnitude. See [`prefix_is_real`].
+///
+/// Both micro signs are accepted: U+00B5 MICRO SIGN and U+03BC GREEK SMALL
+/// LETTER MU, which exports use interchangeably.
+fn si_prefix(c: char, unit_letter: char) -> Option<f64> {
+    let mult = match c {
+        'p' | 'P' => 1e-12,
+        'n' | 'N' => 1e-9,
+        'u' | 'U' | 'µ' | 'μ' => 1e-6,
+        'm' => 1e-3,
+        'k' | 'K' => 1e3,
+        // Uppercase 'M' is milli for an inductor, mega elsewhere; see above.
+        'M' if unit_letter == 'H' => 1e-3,
+        'M' => 1e6,
+        'G' => 1e9,
+        _ => return None,
+    };
+    prefix_is_real(mult, unit_letter).then_some(mult)
+}
+
+/// Whether parts of this class are made in the decade `mult` names.
+///
+/// Resistors run from the microohm shunt at the bottom of current sensing up
+/// to the gigaohm bias resistor; a nanoohm or picoohm resistor is not a part,
+/// so "100 n" on an R is a misread, not a 100nΩ shunt. Capacitance and
+/// inductance stop at the part itself — a 10F supercap is real, a kilofarad or
+/// kilohenry is not — while their bottom end, the picofarad and the picohenry,
+/// is the smallest prefix there is.
+fn prefix_is_real(mult: f64, unit_letter: char) -> bool {
+    match unit_letter {
+        'R' => mult >= 1e-6,
+        _ => mult < 1e3,
     }
 }
 
@@ -2696,6 +2740,12 @@ fn strip_long_unit_word(tok: &str, unit_letter: char) -> &str {
     }
 }
 
+/// How many digits may follow a decimal marker. Markings carry at most four
+/// significant figures ("1K00", "4R99"), so a longer digit run is not a value
+/// at all — it is a part number whose own letter landed where a prefix goes,
+/// and "2N7002" must stay unparsed rather than become 2.7002nΩ.
+const MAX_DECIMAL_MARKER_DIGITS: usize = 3;
+
 /// Parse one value token ("348k", "4R7", "0.1uF", "10R", "100n") into a
 /// base-unit magnitude. Handles a trailing SI-prefix/unit suffix ("100n",
 /// "0.1uF") and the decimal-marker style where the prefix or unit letter
@@ -2708,7 +2758,8 @@ fn parse_value_token(tok: &str, unit_letter: char) -> Option<f64> {
         return None;
     }
     let chars: Vec<char> = tok.chars().collect();
-    let marker_pos = chars.iter().position(|&c| si_prefix(c).is_some() || is_unit_char(c, unit_letter));
+    let marker_pos =
+        chars.iter().position(|&c| si_prefix(c, unit_letter).is_some() || is_unit_char(c, unit_letter));
 
     let Some(pos) = marker_pos else {
         return tok.parse::<f64>().ok();
@@ -2718,12 +2769,14 @@ fn parse_value_token(tok: &str, unit_letter: char) -> Option<f64> {
     if int_part.is_empty() {
         return None;
     }
-    let marker_mult = si_prefix(chars[pos]).unwrap_or(1.0);
+    let marker_mult = si_prefix(chars[pos], unit_letter).unwrap_or(1.0);
     let tail: String = chars[pos + 1..].iter().collect();
 
     if tail.is_empty() {
         int_part.parse::<f64>().ok().map(|n| n * marker_mult)
-    } else if tail.chars().all(|c| c.is_ascii_digit()) {
+    } else if tail.chars().all(|c| c.is_ascii_digit())
+        && tail.chars().count() <= MAX_DECIMAL_MARKER_DIGITS
+    {
         // Decimal-marker style: the marker itself acts as the decimal point.
         format!("{int_part}.{tail}").parse::<f64>().ok().map(|n| n * marker_mult)
     } else {
@@ -2741,12 +2794,21 @@ fn parse_value_token(tok: &str, unit_letter: char) -> Option<f64> {
 /// A bare unit token with no leading digits, e.g. "pF" in "33 pF" — used only
 /// as a fallback when the value's first token is a plain number and a later
 /// token spells out the prefix/unit.
-fn parse_unit_only_token(tok: &str, unit_letter: char) -> Option<f64> {
+///
+/// A lone prefix letter counts: "100 k" is 100k, not 100 (issue #18). That
+/// case used to fall through to the caller's multiplier of 1, which is worse
+/// than the null the issue reports — a wrong magnitude rather than a missing
+/// one. It counts only in the token right after the number, which is where a
+/// split-off prefix is written — `adjacent` says so. Further out, a single
+/// letter is a tolerance or dielectric code that happens to spell a prefix:
+/// the K in "4.7 ohm K" is ±10%, not kilo.
+fn parse_unit_only_token(tok: &str, unit_letter: char, adjacent: bool) -> Option<f64> {
     let tok = strip_long_unit_word(tok, unit_letter);
     let chars: Vec<char> = tok.chars().collect();
     match chars.len() {
         1 if is_unit_char(chars[0], unit_letter) => Some(1.0),
-        2 if is_unit_char(chars[1], unit_letter) => si_prefix(chars[0]),
+        1 if adjacent => si_prefix(chars[0], unit_letter),
+        2 if is_unit_char(chars[1], unit_letter) => si_prefix(chars[0], unit_letter),
         _ => None,
     }
 }
@@ -2796,13 +2858,17 @@ pub fn normalize_value(value: &str, refdes_class: &str) -> Option<ValueNorm> {
     if stripped.is_empty() {
         return None;
     }
-    let has_marker = stripped.chars().any(|c| si_prefix(c).is_some() || is_unit_char(c, unit_letter));
+    let has_marker =
+        stripped.chars().any(|c| si_prefix(c, unit_letter).is_some() || is_unit_char(c, unit_letter));
 
     let magnitude = if has_marker {
         parse_value_token(first, unit_letter)?
     } else {
         let bare: f64 = stripped.parse().ok()?;
-        let mult = tokens.find_map(|t| parse_unit_only_token(t, unit_letter)).unwrap_or(1.0);
+        let mult = tokens
+            .enumerate()
+            .find_map(|(i, t)| parse_unit_only_token(t, unit_letter, i == 0))
+            .unwrap_or(1.0);
         bare * mult
     };
 
@@ -3177,6 +3243,146 @@ mod value_norm_tests {
     fn prefix_and_unit_letter_concatenated() {
         let v = normalize_value("0.1uF", "C").expect("should parse");
         assert!((v.magnitude - 1e-7).abs() < 1e-15);
+    }
+
+    #[test]
+    fn uppercase_prefix_folds_where_it_is_unambiguous() {
+        // Issue #18: "24K" is the same 24k every other resistor spells
+        // lowercase, and a null here reads downstream as missing data rather
+        // than as a formatting variant.
+        let v = normalize_value("24K", "R").expect("should parse");
+        assert_eq!(v.canonical, "24kΩ");
+        assert!((v.magnitude - 24000.0).abs() < 1e-9);
+
+        for (raw, class, canonical) in [
+            ("33P", "C", "33pF"),
+            ("10N", "C", "10nF"),
+            ("4U7", "C", "4.7µF"),
+            ("1K5", "R", "1.5kΩ"),
+            ("2U2", "L", "2.2µH"),
+        ] {
+            let v = normalize_value(raw, class).unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, canonical, "{raw}");
+        }
+    }
+
+    #[test]
+    fn milli_and_mega_keep_their_case_on_a_resistor() {
+        // The one place folding must not touch: both cases are real for a
+        // resistor, and case is all that separates a shunt from a bleeder.
+        let milli = normalize_value("1m", "R").expect("should parse");
+        assert_eq!(milli.canonical, "1mΩ");
+        let mega = normalize_value("1M", "R").expect("should parse");
+        assert_eq!(mega.canonical, "1MΩ");
+    }
+
+    #[test]
+    fn uppercase_m_is_milli_on_an_inductor() {
+        // No inductor is a megahenry, so an uppercase 'M' there can only be
+        // the millihenry — the same no-other-quantity argument that folds
+        // 'K' and 'P'. Case-converted BOMs are where this spelling comes from.
+        for (raw, canonical) in [("10MH", "10mH"), ("1MH", "1mH"), ("1M5", "1.5mH")] {
+            let v = normalize_value(raw, "L").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, canonical, "{raw}");
+        }
+        // Lowercase is unaffected, and neither reading of 'M' is safe on a
+        // capacitor — the megafarad is not a part, and legacy "MF"/"MFD"
+        // spells the microfarad — so C keeps its null.
+        let v = normalize_value("10mH", "L").expect("should parse");
+        assert_eq!(v.canonical, "10mH");
+        assert!(normalize_value("1MF", "C").is_none());
+        assert!(normalize_value("475M", "C").is_none());
+    }
+
+    #[test]
+    fn a_lone_prefix_token_supplies_the_multiplier() {
+        // Before #18 these fell through to a multiplier of 1 — "100 k" came
+        // back as 100Ω, a wrong number rather than a missing one.
+        let v = normalize_value("100 k", "R").expect("should parse");
+        assert_eq!(v.canonical, "100kΩ");
+
+        let v = normalize_value("22 u 25 V", "C").expect("should parse");
+        assert_eq!(v.canonical, "22µF");
+
+        let v = normalize_value("24 Kohm", "R").expect("should parse");
+        assert_eq!(v.canonical, "24kΩ");
+    }
+
+    #[test]
+    fn a_bare_unit_word_is_still_no_multiplier() {
+        // "ohms" strips to nothing, which must stay a multiplier of 1 rather
+        // than becoming a prefix lookup on some leftover character.
+        let v = normalize_value("24 ohms", "R").expect("should parse");
+        assert_eq!(v.canonical, "24Ω");
+    }
+
+    #[test]
+    fn both_micro_signs_parse() {
+        // U+00B5 MICRO SIGN and U+03BC GREEK SMALL LETTER MU, which exports
+        // use interchangeably.
+        for raw in ["4.7\u{b5}F", "4.7\u{3bc}F"] {
+            let v = normalize_value(raw, "C").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "4.7µF");
+        }
+    }
+
+    #[test]
+    fn a_part_number_in_the_value_field_stays_unparsed() {
+        // Folding uppercase prefixes puts 'P'/'N'/'K'/'U' in reach of MPNs
+        // that some designs put in a passive's value. The trailing junk after
+        // the marker is what keeps them out: 4816P must not read as 4816p.
+        assert!(normalize_value("4816P-1-103LF", "R").is_none());
+        assert!(normalize_value("GRM155R71C104KA88D", "C").is_none());
+
+        // Semiconductor part numbers are all digits around the folded letter,
+        // so only the length of the digit run separates "2N7002" from "4k7".
+        for raw in ["2N7002", "1N4148", "2N3904", "1N5819"] {
+            assert!(normalize_value(raw, "R").is_none(), "{raw}");
+        }
+        // Four significant figures is still a value, not a part number.
+        let v = normalize_value("1K00", "R").expect("should parse");
+        assert_eq!(v.canonical, "1kΩ");
+    }
+
+    #[test]
+    fn a_prefix_the_class_is_not_made_in_is_refused() {
+        // "104K" is 100nF ±10% — the letter is the tolerance, not a prefix,
+        // and no capacitor or inductor is measured in kilos.
+        for raw in ["104K", "103K", "224K", "104M"] {
+            assert!(normalize_value(raw, "C").is_none(), "{raw}");
+        }
+        assert!(normalize_value("101K", "L").is_none());
+        // The same shape on a resistor is a real value and still parses.
+        let v = normalize_value("104K", "R").expect("should parse");
+        assert_eq!(v.canonical, "104kΩ");
+
+        // The other end of the same rule: no resistor is a nanoohm or a
+        // picoohm, so those letters are a misread of something else.
+        for raw in ["100n", "4n7", "33P", "1n5"] {
+            assert!(normalize_value(raw, "R").is_none(), "{raw}");
+        }
+        // The floor sits at the microohm shunt, which is a real part.
+        for (raw, canonical) in [("100u", "100µΩ"), ("500m", "500mΩ"), ("1G", "1GΩ")] {
+            let v = normalize_value(raw, "R").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, canonical, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_stray_letter_is_not_a_multiplier() {
+        // The lone-prefix rule reaches only the token after the number.
+        // Further out, a single letter is a tolerance or dielectric code:
+        // "4.7 ohm K" is a ±10% 4.7Ω part, not 4.7kΩ.
+        let v = normalize_value("4.7 ohm K", "R").expect("should parse");
+        assert_eq!(v.canonical, "4.7Ω");
+
+        let v = normalize_value("22 uF X7R K", "C").expect("should parse");
+        assert_eq!(v.canonical, "22µF");
+
+        // A split-off letter the class cannot be measured in is no multiplier
+        // either, adjacent or not: "100 n" is not a 100nΩ resistor.
+        let v = normalize_value("100 n", "R").expect("should parse");
+        assert_eq!(v.canonical, "100Ω");
     }
 
     #[test]

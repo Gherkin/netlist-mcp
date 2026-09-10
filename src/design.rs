@@ -555,10 +555,18 @@ impl Design {
         // Rail-scoring is a subsystem-filter concern only: an unfiltered page
         // (or a name search for "gnd") is asking about the design as a whole,
         // where a high-fanout rail on top is the right answer.
+        // Rounded here, once, and then both ranked and reported at that
+        // precision: a row that reads `0.5` has to be one of the rails the note
+        // is about. Comparing the raw score while reporting a rounded one lets a
+        // net just under the threshold print as exactly `0.5` and still sort
+        // first, which is unanswerable from the row alone.
         let scored = subsystem_filter.is_some();
         let mut matches: Vec<(&Net, f32)> = matches
             .into_iter()
-            .map(|net| (net, if scored { self.rail_score(net).0 } else { 0.0 }))
+            .map(|net| {
+                let score = if scored { self.rail_score(net).0 } else { 0.0 };
+                (net, (score * 100.0).round() / 100.0)
+            })
             .collect();
 
         // Rails last (no-op without a subsystem filter, where every score is 0),
@@ -576,16 +584,31 @@ impl Design {
             })
         });
 
-        // Say so on the envelope: the demotion is invisible from the rows alone,
-        // and a caller who wants the rails now knows where they went.
-        let demoted = matches.iter().filter(|(_, s)| *s >= RAIL_THRESHOLD).count();
-        let rail_note = (demoted > 0).then(|| format!(
-            "{demoted} power/ground rail(s) sorted last: a rail reaches parts on \
-             nearly every sheet, so it matches this subsystem without belonging \
-             to it. See each row's rail_score.",
-        ));
-
+        // Say so on the envelope: the demotion is invisible from the rows alone.
+        // Name the demoted nets and where the block starts, because a `limit`
+        // shorter than the match count pushes them onto a later page — pointing
+        // at "each row's rail_score" would then point at rows that are not here.
         let total = matches.len();
+        let demoted = matches.iter().filter(|(_, s)| *s >= RAIL_THRESHOLD).count();
+        let rail_start = total - demoted;
+        let rail_note = (demoted > 0).then(|| {
+            let shown = RAIL_NOTE_NAMES.min(demoted);
+            let mut named: String = matches[rail_start..rail_start + shown]
+                .iter()
+                .map(|(net, _)| net.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if demoted > shown {
+                named.push_str(&format!(", +{} more", demoted - shown));
+            }
+            format!(
+                "{demoted} power/ground rail(s) sorted last: {named}. A rail \
+                 reaches parts on nearly every sheet, so it matches this \
+                 subsystem without belonging to it. They are the final \
+                 {demoted} of {total} matches, from offset {rail_start} — \
+                 request that offset if this page stops short of them.",
+            )
+        });
         let rows: Vec<NetRow> = matches
             .into_iter()
             .skip(offset as usize)
@@ -599,7 +622,7 @@ impl Design {
                     pin_types: net.pin_types.clone(),
                     sheet_path: hierarchy.sheet_path,
                     depth: hierarchy.depth,
-                    rail_score: scored.then(|| (rail * 100.0).round() / 100.0),
+                    rail_score: scored.then_some(rail),
                 }
             })
             .collect();
@@ -2421,6 +2444,9 @@ const RAIL_FANOUT_BOOST: f32 = 0.15;
 // `design_overview` lists it as a detected rail, `walk` stops at it instead of
 // enumerating it, and `filter_nets` sorts it last under a subsystem filter.
 const RAIL_THRESHOLD: f32 = 0.5;
+// How many demoted rails `filter_nets` names in its `rail_note` before falling
+// back to a count; the note is an orientation aid, not a second result set.
+const RAIL_NOTE_NAMES: usize = 5;
 
 // Pin-type and refdes-class sets shared by `Design::net_role` and
 // `Design::audit`. A "driver" is any pin type capable of actively asserting
@@ -3874,6 +3900,61 @@ mod filter_nets_rail_tests {
 
         let json = design.filter_nets(None, Some("Sensor1"), true, 2, 2).expect("filter_nets");
         assert_eq!(names(&json), ["GND", "+3V3"]);
+    }
+
+    /// The score a row reports is the score it was ranked by. A raw 0.4975
+    /// (0.45·0.3 power pins + 0.30 name + 0.25·0.25 caps — netdaq's `PGND`)
+    /// prints as `0.5`, so it has to be demoted like one: reporting a rounded
+    /// score while ranking on the raw one left a row reading exactly the
+    /// threshold sitting on top of a page whose note said rails sort last.
+    #[test]
+    fn a_score_that_rounds_up_to_the_threshold_is_demoted_with_it() {
+        let mut pgnd: Vec<(&str, &str, &str)> = Vec::new();
+        for refdes in ["U1", "U2", "U3", "U4", "U5", "U6"] {
+            pgnd.push((refdes, "/PoE/", "power_in"));      // 6/20 power pins
+        }
+        for refdes in ["C1", "C2", "C3", "C4", "C5"] {
+            pgnd.push((refdes, "/PoE/", "passive"));       // 5/20 capacitors
+        }
+        for refdes in ["R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8", "R9"] {
+            pgnd.push((refdes, "/PoE/", "passive"));
+        }
+        // Fanout is exactly 20, just under the >20 the fanout boost needs, so
+        // the score stays on the low side of the threshold.
+        let design = design_of(&[
+            ("PGND", &pgnd),
+            ("/POE_SW", &[("U1", "/PoE/", "output"), ("U7", "/PoE/", "input")]),
+        ]);
+
+        let json = design.filter_nets(None, Some("PoE"), true, 50, 0).expect("filter_nets");
+        // Highest fanout by a wide margin, and still last.
+        assert_eq!(names(&json), ["/POE_SW", "PGND"]);
+        assert_eq!(rows(&json)[1]["rail_score"], 0.5);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["rail_note"].as_str().unwrap().contains("PGND"), "{json}");
+    }
+
+    /// The note has to survive a page that stops short of the rails: naming
+    /// them and the offset they start at is the only thing a caller looking at
+    /// five rail-free rows can act on.
+    #[test]
+    fn the_note_names_the_demoted_nets_and_where_they_start() {
+        let design = sensor_design();
+
+        let json = design.filter_nets(None, Some("Sensor1"), true, 50, 0).expect("filter_nets");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let note = parsed["rail_note"].as_str().unwrap();
+        // Named in the order they were demoted to, not the order they matched.
+        assert!(note.contains("2 power/ground rail(s) sorted last: GND, +3V3."), "{note}");
+        assert!(note.contains("final 2 of 4 matches, from offset 2"), "{note}");
+
+        // Same note on a page that shows none of them — the offset is the
+        // caller's way back to the rows the note is about.
+        let json = design.filter_nets(None, Some("Sensor1"), true, 2, 0).expect("filter_nets");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let note = parsed["rail_note"].as_str().unwrap();
+        assert!(note.contains("GND, +3V3"), "{note}");
+        assert!(note.contains("from offset 2"), "{note}");
     }
 
     /// Every row under a subsystem filter carries the score it was ranked by,

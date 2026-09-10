@@ -267,7 +267,9 @@ impl NetlistServer {
         cannot (SPI lives in net names, not component fields). Under a subsystem \
         filter, power/ground rails sort last and each row carries its rail_score: \
         a rail touches parts on nearly every sheet, so it matches a subsystem \
-        without belonging to it. It is still on the page, at the end.")]
+        without belonging to it. It is demoted, never dropped — but a limit \
+        shorter than the match count leaves it on a later page, so read \
+        rail_note, which names the demoted nets and the offset they start at.")]
     fn filter_nets(&self, Parameters(p): Parameters<FilterNetsParams>) -> String {
         let sort_by_fanout = p.sort_by_fanout.unwrap_or(true);
         let limit = p.limit.unwrap_or(50);

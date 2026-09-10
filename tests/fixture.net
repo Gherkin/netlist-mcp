@@ -1147,6 +1147,9 @@
 						(pin
 							(num "10")
 						)
+						(pin
+							(num "11")
+						)
 					)
 				)
 			)
@@ -1761,6 +1764,11 @@
 					(name "RXN")
 					(type "input")
 				)
+				(pin
+					(num "11")
+					(name "VDDIO")
+					(type "power_in")
+				)
 			)
 		)
 		(libpart
@@ -1954,14 +1962,14 @@
 				(pintype "passive")
 			)
 			(node
-				(ref "TP2")
+				(ref "FB2")
 				(pin "1")
 				(pintype "passive")
 			)
 			(node
-				(ref "FB2")
-				(pin "1")
-				(pintype "passive")
+				(ref "U2")
+				(pin "11")
+				(pintype "power_in")
 			)
 			(node
 				(ref "U3")

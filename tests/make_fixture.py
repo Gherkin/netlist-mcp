@@ -53,7 +53,12 @@ LIBPARTS = {
                     ("3", "LED1/nREGOFF", "bidirectional"), ("4", "RXD0/MODE0", "bidirectional"),
                     ("5", "XTAL1", "input"), ("6", "XTAL2", "output"),
                     ("7", "TXP", "bidirectional"), ("8", "TXN", "bidirectional"),
-                    ("9", "RXP", "input"), ("10", "RXN", "input")]),
+                    ("9", "RXP", "input"), ("10", "RXN", "input"),
+                    # Two supplies, as the real part has: VDDIO straight off
+                    # the rail, VDDCR behind a bead. A bead feeding the only
+                    # supply pin of a chip would take the rail's last direct
+                    # consumer with it — see the +3V3 wire below.
+                    ("11", "VDDIO", "power_in")]),
     # Endpoint classes the tool does not recognize today (issue #13).
     "RJ45":    ("Connector", "RJ45-Magjack", "RJ45 jack", [
                     ("1", "TX+", "unspecified"), ("2", "TX-", "unspecified"),
@@ -132,8 +137,12 @@ comp("TP2", "TP", "TestPoint", "/Power/")
 
 wire("VIN", ("J1", "1"), ("D1", "2"), ("C1", "1"), ("FB1", "1"))
 wire("VIN_F", ("FB1", "2"), ("U1", "1"), ("C2", "1"))
-wire("+3V3", ("U1", "5"), ("C3", "1"), ("L1", "1"), ("TP2", "1"),
-     ("FB2", "1"), ("U3", "4"))
+# TP2 is a GND test point (see the GND wire); it is deliberately not on the
+# rail. Keep at least two direct power pins here: +3V3 is the fixture's only
+# positive rail, and rail_score gates walk's stop-at-power, filter_nets' rail
+# sort and design_overview's rail list, so it needs room above RAIL_THRESHOLD.
+wire("+3V3", ("U1", "5"), ("C3", "1"), ("L1", "1"),
+     ("FB2", "1"), ("U2", "11"), ("U3", "4"))
 wire("PG", ("U1", "4"), ("R1", "1"))          # open_collector driver + pull-up
 wire("FLAG", ("U1", "6"), ("R2", "1"))        # open_emitter driver (issue #14)
 wire("EN", ("U1", "3"), ("R3", "1"), ("Q1", "3"))

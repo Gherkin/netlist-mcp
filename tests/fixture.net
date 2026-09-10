@@ -1334,7 +1334,7 @@
 		)
 		(comp
 			(ref "R40")
-			(value "1k")
+			(value "1 k")
 			(footprint "Fixture:R")
 			(description "Resistor")
 			(libsource

@@ -2663,10 +2663,21 @@ pub struct ValueNorm {
 ///
 /// Case-tolerant exactly where the domain leaves no ambiguity: 'K', 'P', 'N'
 /// and 'U' name no other quantity a passive is written in, so "24K" is 24k and
-/// "33P" is 33p (issue #18). 'm'/'M' stays strict — milli and mega are both
-/// real for a resistor and case is the only thing separating them, so folding
-/// it would turn 1mΩ into 1MΩ. 'G' likewise keeps its case, since a lowercase
-/// giga is never written and folding it buys nothing.
+/// "33P" is 33p (issue #18). 'G' keeps its case, since a lowercase giga is
+/// never written and folding it buys nothing.
+///
+/// 'M' is the one prefix whose reading depends on the class, because that is
+/// where the ambiguity does or does not exist:
+///
+/// - **R**: strict. Milli and mega are both real for a resistor and case is
+///   all that separates a 1mΩ shunt from a 1MΩ bleeder, so folding would turn
+///   one into the other.
+/// - **L**: milli. There is no megahenry, so uppercase "10MH" can only mean
+///   10mH — the same no-other-quantity argument that folds 'K' and 'P'.
+/// - **C**: refused, by the range rule below. Neither reading is safe: the
+///   megafarad does not exist, but legacy US notation spells the *micro*farad
+///   "MF"/"MFD", so uppercase 'M' on a capacitor is genuinely ambiguous and a
+///   null is the honest answer.
 ///
 /// A prefix is refused outright when it names a magnitude the class is not
 /// made in, because then the letter is something else — most often a tolerance
@@ -2683,6 +2694,8 @@ fn si_prefix(c: char, unit_letter: char) -> Option<f64> {
         'u' | 'U' | 'µ' | 'μ' => 1e-6,
         'm' => 1e-3,
         'k' | 'K' => 1e3,
+        // Uppercase 'M' is milli for an inductor, mega elsewhere; see above.
+        'M' if unit_letter == 'H' => 1e-3,
         'M' => 1e6,
         'G' => 1e9,
         _ => return None,
@@ -3254,13 +3267,31 @@ mod value_norm_tests {
     }
 
     #[test]
-    fn milli_and_mega_keep_their_case() {
-        // The one prefix folding must not touch: both cases are real for a
+    fn milli_and_mega_keep_their_case_on_a_resistor() {
+        // The one place folding must not touch: both cases are real for a
         // resistor, and case is all that separates a shunt from a bleeder.
         let milli = normalize_value("1m", "R").expect("should parse");
         assert_eq!(milli.canonical, "1mΩ");
         let mega = normalize_value("1M", "R").expect("should parse");
         assert_eq!(mega.canonical, "1MΩ");
+    }
+
+    #[test]
+    fn uppercase_m_is_milli_on_an_inductor() {
+        // No inductor is a megahenry, so an uppercase 'M' there can only be
+        // the millihenry — the same no-other-quantity argument that folds
+        // 'K' and 'P'. Case-converted BOMs are where this spelling comes from.
+        for (raw, canonical) in [("10MH", "10mH"), ("1MH", "1mH"), ("1M5", "1.5mH")] {
+            let v = normalize_value(raw, "L").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, canonical, "{raw}");
+        }
+        // Lowercase is unaffected, and neither reading of 'M' is safe on a
+        // capacitor — the megafarad is not a part, and legacy "MF"/"MFD"
+        // spells the microfarad — so C keeps its null.
+        let v = normalize_value("10mH", "L").expect("should parse");
+        assert_eq!(v.canonical, "10mH");
+        assert!(normalize_value("1MF", "C").is_none());
+        assert!(normalize_value("475M", "C").is_none());
     }
 
     #[test]

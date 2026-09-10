@@ -2668,11 +2668,11 @@ pub struct ValueNorm {
 /// it would turn 1mΩ into 1MΩ. 'G' likewise keeps its case, since a lowercase
 /// giga is never written and folding it buys nothing.
 ///
-/// Prefixes at or above kilo are refused for capacitors and inductors: no part
-/// is measured in kilofarads or kilohenries, so the letter is something else —
-/// most often the tolerance letter of an EIA three-digit code, where "104K" is
-/// 100nF ±10% and *not* 104kF. Refusing it leaves the honest null the caller
-/// already produced for such fields before uppercase folding.
+/// A prefix is refused outright when it names a magnitude the class is not
+/// made in, because then the letter is something else — most often a tolerance
+/// code, where "104K" is 100nF ±10% and *not* 104kF. Refusing it leaves the
+/// honest null these fields had before uppercase folding rather than a number
+/// that is confidently off by orders of magnitude. See [`prefix_is_real`].
 ///
 /// Both micro signs are accepted: U+00B5 MICRO SIGN and U+03BC GREEK SMALL
 /// LETTER MU, which exports use interchangeably.
@@ -2687,10 +2687,22 @@ fn si_prefix(c: char, unit_letter: char) -> Option<f64> {
         'G' => 1e9,
         _ => return None,
     };
-    if unit_letter != 'R' && mult >= 1e3 {
-        return None;
+    prefix_is_real(mult, unit_letter).then_some(mult)
+}
+
+/// Whether parts of this class are made in the decade `mult` names.
+///
+/// Resistors run from the microohm shunt at the bottom of current sensing up
+/// to the gigaohm bias resistor; a nanoohm or picoohm resistor is not a part,
+/// so "100 n" on an R is a misread, not a 100nΩ shunt. Capacitance and
+/// inductance stop at the part itself — a 10F supercap is real, a kilofarad or
+/// kilohenry is not — while their bottom end, the picofarad and the picohenry,
+/// is the smallest prefix there is.
+fn prefix_is_real(mult: f64, unit_letter: char) -> bool {
+    match unit_letter {
+        'R' => mult >= 1e-6,
+        _ => mult < 1e3,
     }
-    Some(mult)
 }
 
 /// True if `c` is the class's own base-unit letter (case-insensitive), or the
@@ -3302,11 +3314,9 @@ mod value_norm_tests {
     }
 
     #[test]
-    fn an_eia_code_is_not_a_kilo_capacitance() {
-        // "104K" is 100nF ±10% — the letter is the tolerance, not a prefix.
-        // No capacitor or inductor is measured in kilos, so refusing the
-        // prefix outright leaves the null these fields had before folding,
-        // rather than a value twelve orders of magnitude off.
+    fn a_prefix_the_class_is_not_made_in_is_refused() {
+        // "104K" is 100nF ±10% — the letter is the tolerance, not a prefix,
+        // and no capacitor or inductor is measured in kilos.
         for raw in ["104K", "103K", "224K", "104M"] {
             assert!(normalize_value(raw, "C").is_none(), "{raw}");
         }
@@ -3314,6 +3324,17 @@ mod value_norm_tests {
         // The same shape on a resistor is a real value and still parses.
         let v = normalize_value("104K", "R").expect("should parse");
         assert_eq!(v.canonical, "104kΩ");
+
+        // The other end of the same rule: no resistor is a nanoohm or a
+        // picoohm, so those letters are a misread of something else.
+        for raw in ["100n", "4n7", "33P", "1n5"] {
+            assert!(normalize_value(raw, "R").is_none(), "{raw}");
+        }
+        // The floor sits at the microohm shunt, which is a real part.
+        for (raw, canonical) in [("100u", "100µΩ"), ("500m", "500mΩ"), ("1G", "1GΩ")] {
+            let v = normalize_value(raw, "R").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, canonical, "{raw}");
+        }
     }
 
     #[test]
@@ -3326,6 +3347,11 @@ mod value_norm_tests {
 
         let v = normalize_value("22 uF X7R K", "C").expect("should parse");
         assert_eq!(v.canonical, "22µF");
+
+        // A split-off letter the class cannot be measured in is no multiplier
+        // either, adjacent or not: "100 n" is not a 100nΩ resistor.
+        let v = normalize_value("100 n", "R").expect("should parse");
+        assert_eq!(v.canonical, "100Ω");
     }
 
     #[test]

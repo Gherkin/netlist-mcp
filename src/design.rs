@@ -2659,7 +2659,7 @@ pub struct ValueNorm {
     pub canonical: String,
 }
 
-/// SI prefix letter -> multiplier.
+/// SI prefix letter -> multiplier, for a value of the given class.
 ///
 /// Case-tolerant exactly where the domain leaves no ambiguity: 'K', 'P', 'N'
 /// and 'U' name no other quantity a passive is written in, so "24K" is 24k and
@@ -2668,19 +2668,29 @@ pub struct ValueNorm {
 /// it would turn 1mΩ into 1MΩ. 'G' likewise keeps its case, since a lowercase
 /// giga is never written and folding it buys nothing.
 ///
+/// Prefixes at or above kilo are refused for capacitors and inductors: no part
+/// is measured in kilofarads or kilohenries, so the letter is something else —
+/// most often the tolerance letter of an EIA three-digit code, where "104K" is
+/// 100nF ±10% and *not* 104kF. Refusing it leaves the honest null the caller
+/// already produced for such fields before uppercase folding.
+///
 /// Both micro signs are accepted: U+00B5 MICRO SIGN and U+03BC GREEK SMALL
 /// LETTER MU, which exports use interchangeably.
-fn si_prefix(c: char) -> Option<f64> {
-    match c {
-        'p' | 'P' => Some(1e-12),
-        'n' | 'N' => Some(1e-9),
-        'u' | 'U' | 'µ' | 'μ' => Some(1e-6),
-        'm' => Some(1e-3),
-        'k' | 'K' => Some(1e3),
-        'M' => Some(1e6),
-        'G' => Some(1e9),
-        _ => None,
+fn si_prefix(c: char, unit_letter: char) -> Option<f64> {
+    let mult = match c {
+        'p' | 'P' => 1e-12,
+        'n' | 'N' => 1e-9,
+        'u' | 'U' | 'µ' | 'μ' => 1e-6,
+        'm' => 1e-3,
+        'k' | 'K' => 1e3,
+        'M' => 1e6,
+        'G' => 1e9,
+        _ => return None,
+    };
+    if unit_letter != 'R' && mult >= 1e3 {
+        return None;
     }
+    Some(mult)
 }
 
 /// True if `c` is the class's own base-unit letter (case-insensitive), or the
@@ -2705,6 +2715,12 @@ fn strip_long_unit_word(tok: &str, unit_letter: char) -> &str {
     }
 }
 
+/// How many digits may follow a decimal marker. Markings carry at most four
+/// significant figures ("1K00", "4R99"), so a longer digit run is not a value
+/// at all — it is a part number whose own letter landed where a prefix goes,
+/// and "2N7002" must stay unparsed rather than become 2.7002nΩ.
+const MAX_DECIMAL_MARKER_DIGITS: usize = 3;
+
 /// Parse one value token ("348k", "4R7", "0.1uF", "10R", "100n") into a
 /// base-unit magnitude. Handles a trailing SI-prefix/unit suffix ("100n",
 /// "0.1uF") and the decimal-marker style where the prefix or unit letter
@@ -2717,7 +2733,8 @@ fn parse_value_token(tok: &str, unit_letter: char) -> Option<f64> {
         return None;
     }
     let chars: Vec<char> = tok.chars().collect();
-    let marker_pos = chars.iter().position(|&c| si_prefix(c).is_some() || is_unit_char(c, unit_letter));
+    let marker_pos =
+        chars.iter().position(|&c| si_prefix(c, unit_letter).is_some() || is_unit_char(c, unit_letter));
 
     let Some(pos) = marker_pos else {
         return tok.parse::<f64>().ok();
@@ -2727,12 +2744,14 @@ fn parse_value_token(tok: &str, unit_letter: char) -> Option<f64> {
     if int_part.is_empty() {
         return None;
     }
-    let marker_mult = si_prefix(chars[pos]).unwrap_or(1.0);
+    let marker_mult = si_prefix(chars[pos], unit_letter).unwrap_or(1.0);
     let tail: String = chars[pos + 1..].iter().collect();
 
     if tail.is_empty() {
         int_part.parse::<f64>().ok().map(|n| n * marker_mult)
-    } else if tail.chars().all(|c| c.is_ascii_digit()) {
+    } else if tail.chars().all(|c| c.is_ascii_digit())
+        && tail.chars().count() <= MAX_DECIMAL_MARKER_DIGITS
+    {
         // Decimal-marker style: the marker itself acts as the decimal point.
         format!("{int_part}.{tail}").parse::<f64>().ok().map(|n| n * marker_mult)
     } else {
@@ -2754,14 +2773,17 @@ fn parse_value_token(tok: &str, unit_letter: char) -> Option<f64> {
 /// A lone prefix letter counts: "100 k" is 100k, not 100 (issue #18). That
 /// case used to fall through to the caller's multiplier of 1, which is worse
 /// than the null the issue reports — a wrong magnitude rather than a missing
-/// one.
-fn parse_unit_only_token(tok: &str, unit_letter: char) -> Option<f64> {
+/// one. It counts only in the token right after the number, which is where a
+/// split-off prefix is written — `adjacent` says so. Further out, a single
+/// letter is a tolerance or dielectric code that happens to spell a prefix:
+/// the K in "4.7 ohm K" is ±10%, not kilo.
+fn parse_unit_only_token(tok: &str, unit_letter: char, adjacent: bool) -> Option<f64> {
     let tok = strip_long_unit_word(tok, unit_letter);
     let chars: Vec<char> = tok.chars().collect();
     match chars.len() {
         1 if is_unit_char(chars[0], unit_letter) => Some(1.0),
-        1 => si_prefix(chars[0]),
-        2 if is_unit_char(chars[1], unit_letter) => si_prefix(chars[0]),
+        1 if adjacent => si_prefix(chars[0], unit_letter),
+        2 if is_unit_char(chars[1], unit_letter) => si_prefix(chars[0], unit_letter),
         _ => None,
     }
 }
@@ -2811,13 +2833,17 @@ pub fn normalize_value(value: &str, refdes_class: &str) -> Option<ValueNorm> {
     if stripped.is_empty() {
         return None;
     }
-    let has_marker = stripped.chars().any(|c| si_prefix(c).is_some() || is_unit_char(c, unit_letter));
+    let has_marker =
+        stripped.chars().any(|c| si_prefix(c, unit_letter).is_some() || is_unit_char(c, unit_letter));
 
     let magnitude = if has_marker {
         parse_value_token(first, unit_letter)?
     } else {
         let bare: f64 = stripped.parse().ok()?;
-        let mult = tokens.find_map(|t| parse_unit_only_token(t, unit_letter)).unwrap_or(1.0);
+        let mult = tokens
+            .enumerate()
+            .find_map(|(i, t)| parse_unit_only_token(t, unit_letter, i == 0))
+            .unwrap_or(1.0);
         bare * mult
     };
 
@@ -3264,6 +3290,42 @@ mod value_norm_tests {
         // the marker is what keeps them out: 4816P must not read as 4816p.
         assert!(normalize_value("4816P-1-103LF", "R").is_none());
         assert!(normalize_value("GRM155R71C104KA88D", "C").is_none());
+
+        // Semiconductor part numbers are all digits around the folded letter,
+        // so only the length of the digit run separates "2N7002" from "4k7".
+        for raw in ["2N7002", "1N4148", "2N3904", "1N5819"] {
+            assert!(normalize_value(raw, "R").is_none(), "{raw}");
+        }
+        // Four significant figures is still a value, not a part number.
+        let v = normalize_value("1K00", "R").expect("should parse");
+        assert_eq!(v.canonical, "1kΩ");
+    }
+
+    #[test]
+    fn an_eia_code_is_not_a_kilo_capacitance() {
+        // "104K" is 100nF ±10% — the letter is the tolerance, not a prefix.
+        // No capacitor or inductor is measured in kilos, so refusing the
+        // prefix outright leaves the null these fields had before folding,
+        // rather than a value twelve orders of magnitude off.
+        for raw in ["104K", "103K", "224K", "104M"] {
+            assert!(normalize_value(raw, "C").is_none(), "{raw}");
+        }
+        assert!(normalize_value("101K", "L").is_none());
+        // The same shape on a resistor is a real value and still parses.
+        let v = normalize_value("104K", "R").expect("should parse");
+        assert_eq!(v.canonical, "104kΩ");
+    }
+
+    #[test]
+    fn a_stray_letter_is_not_a_multiplier() {
+        // The lone-prefix rule reaches only the token after the number.
+        // Further out, a single letter is a tolerance or dielectric code:
+        // "4.7 ohm K" is a ±10% 4.7Ω part, not 4.7kΩ.
+        let v = normalize_value("4.7 ohm K", "R").expect("should parse");
+        assert_eq!(v.canonical, "4.7Ω");
+
+        let v = normalize_value("22 uF X7R K", "C").expect("should parse");
+        assert_eq!(v.canonical, "22µF");
     }
 
     #[test]

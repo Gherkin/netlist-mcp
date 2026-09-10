@@ -2723,13 +2723,23 @@ pub struct Component {
 /// (e.g. "33 pF" and "33p") without reparsing free text themselves.
 #[derive(Debug, Serialize, Clone)]
 pub struct ValueNorm {
-    /// The value in base SI units (ohms for R, farads for C, henries for L).
+    /// The value in base SI units (ohms for R and FB, farads for C, henries
+    /// for L).
     pub magnitude: f64,
     /// The base unit symbol: "Ω", "F", or "H".
     pub unit: String,
     /// A normalized display string using the SI prefix that puts the
-    /// mantissa in [1, 1000), e.g. "348kΩ", "33pF", "4.7µF", "0Ω".
+    /// mantissa in [1, 1000), e.g. "348kΩ", "33pF", "4.7µF", "0Ω". A bead's
+    /// carries its frequency too ("1kΩ@100MHz"), since that is part of what
+    /// makes two beads the same part — see `at_frequency`.
     pub canonical: String,
+    /// The frequency the magnitude is specified at, copied verbatim from the
+    /// value string ("100MHz"). Only ferrite beads have one: a bead's rating
+    /// is an impedance at a stated frequency, and 1kΩ@100MHz and 1kΩ@10MHz
+    /// are different parts. Omitted from the JSON when absent, so R/C/L are
+    /// serialized exactly as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_frequency: Option<String>,
 }
 
 /// SI prefix letter -> multiplier, for a value of the given class.
@@ -2911,20 +2921,28 @@ fn format_canonical(magnitude: f64, unit_symbol: &str) -> String {
 }
 
 /// Best-effort parse of a passive's raw `value` into a normalized magnitude.
-/// Only meaningful for R/C/L (resistors/capacitors/inductors); any other
-/// `refdes_class` returns `None`. The FIRST whitespace-separated token in
-/// `value` is taken as the value token; later tokens (ratings like "50V",
-/// dielectric codes like "C0G") are ignored for the magnitude, except that
-/// when the first token is a bare number, a later token may supply the
-/// prefix/unit (e.g. "33 pF").
+/// Only meaningful for R/C/L/FB (resistors, capacitors, inductors, ferrite
+/// beads); any other `refdes_class` returns `None`.
+///
+/// For R/C/L the FIRST whitespace-separated token in `value` is taken as the
+/// value token; later tokens (ratings like "50V", dielectric codes like
+/// "C0G") are ignored for the magnitude, except that when the first token is
+/// a bare number, a later token may supply the prefix/unit (e.g. "33 pF").
+///
+/// FB is ohms too but cannot use that rule — see [`normalize_bead_value`].
 pub fn normalize_value(value: &str, refdes_class: &str) -> Option<ValueNorm> {
-    let (unit_symbol, unit_letter) = match refdes_class {
-        "R" => ("Ω", 'R'),
-        "C" => ("F", 'F'),
-        "L" => ("H", 'H'),
-        _ => return None,
-    };
+    match refdes_class {
+        "R" => normalize_simple_value(value, "Ω", 'R'),
+        "C" => normalize_simple_value(value, "F", 'F'),
+        "L" => normalize_simple_value(value, "H", 'H'),
+        "FB" => normalize_bead_value(value),
+        _ => None,
+    }
+}
 
+/// The R/C/L reading described on [`normalize_value`]: the first token is the
+/// value, later tokens are ratings unless the first was a bare number.
+fn normalize_simple_value(value: &str, unit_symbol: &str, unit_letter: char) -> Option<ValueNorm> {
     let mut tokens = value.split_whitespace();
     let first = tokens.next()?;
     let stripped = strip_long_unit_word(first, unit_letter);
@@ -2949,7 +2967,91 @@ pub fn normalize_value(value: &str, refdes_class: &str) -> Option<ValueNorm> {
         magnitude,
         unit: unit_symbol.to_string(),
         canonical: format_canonical(magnitude, unit_symbol),
+        at_frequency: None,
     })
+}
+
+/// The FB reading: pick the *impedance*, not the first number that parses.
+///
+/// A bead is rated as an impedance at a frequency, and its value string
+/// normally lists two other ohm-valued quantities before it — the real ones
+/// from an 879-component board read `1.5A 120mΩ 1kΩ@100MHz` and
+/// `450mA 290mΩ 220Ω@100MHz`: current rating, DC resistance, then the
+/// impedance anyone actually means by "the value of the bead". Taking the
+/// first parseable token, which is what routing FB through
+/// [`normalize_simple_value`] would do, reports the 120mΩ DCR — a confident,
+/// plausible, wrong answer where the old `None` was merely incomplete
+/// (issue #20).
+///
+/// So, in order:
+///
+/// 1. An ohm token carrying an `@<freq>` suffix is unambiguously the
+///    impedance rating. Use it, and keep the frequency, since a bead's
+///    impedance means nothing without it. If more than one frequency is
+///    quoted, take the last — compound strings are written impedance-last —
+///    and let the reported `at_frequency` say which one it was.
+/// 2. Otherwise, if more than one token could be read as the ohms, there is
+///    nothing to tell DCR from impedance: return `None` rather than guess.
+/// 3. Otherwise it is a plain single-value string ("600R", "1kΩ", "120 ohm"),
+///    which reads exactly like a resistor's.
+fn normalize_bead_value(value: &str) -> Option<ValueNorm> {
+    // Every token that could be read as an ohm value, paired with the
+    // frequency it was quoted at. Ratings in other units ("1.5A", "25V")
+    // parse as nothing and drop out here, so they never make a string look
+    // ambiguous.
+    let candidates: Vec<(&str, Option<&str>)> = value
+        .split_whitespace()
+        .map(split_at_frequency)
+        .filter(|(base, _)| parse_value_token(base, 'R').is_some())
+        .collect();
+
+    let (base, freq) = match candidates.iter().rev().find(|(_, freq)| freq.is_some()) {
+        // 1. The impedance rating, named as such.
+        Some(&at_freq) => at_freq,
+        // 2. Several numbers that could each be the ohms, and nothing saying
+        //    which is the impedance.
+        None if candidates.len() > 1 => return None,
+        // 3. A lone ohm-marked value, which need not be the first token:
+        //    "2A 600R" is still a 600Ω bead.
+        None if candidates.len() == 1 && is_ohm_marked_token(candidates[0].0) => candidates[0],
+        // 3. Otherwise the unit is split off or absent ("120 ohm", "100 k"),
+        //    and the value reads exactly like a resistor's.
+        None => return normalize_simple_value(value, "Ω", 'R'),
+    };
+
+    let magnitude = parse_value_token(base, 'R')?;
+    let canonical = format_canonical(magnitude, "Ω");
+    Some(ValueNorm {
+        magnitude,
+        unit: "Ω".to_string(),
+        canonical: match freq {
+            Some(freq) => format!("{canonical}@{freq}"),
+            None => canonical,
+        },
+        at_frequency: freq.map(str::to_string),
+    })
+}
+
+/// Split a token at the `@` that introduces a frequency: "1kΩ@100MHz" ->
+/// ("1kΩ", Some("100MHz")). The frequency is kept verbatim; parsing it would
+/// buy nothing the caller cannot do, and getting it wrong would be worse than
+/// echoing it.
+fn split_at_frequency(tok: &str) -> (&str, Option<&str>) {
+    match tok.split_once('@') {
+        Some((base, freq)) if !base.is_empty() && !freq.is_empty() => (base, Some(freq)),
+        _ => (tok, None),
+    }
+}
+
+/// True if `tok` is a parseable ohm value that *says* it is ohms — "120mΩ",
+/// "600R", "120ohm" — as opposed to a bare number. That distinction is what
+/// lets a lone value be read where it stands: "600R" carries its own unit, so
+/// it is the value even when it is not the first token, while a bare "100"
+/// may still be waiting for the "k" in the token after it.
+fn is_ohm_marked_token(tok: &str) -> bool {
+    let stripped = strip_long_unit_word(tok, 'R');
+    let marked = stripped.len() != tok.len() || stripped.chars().any(|c| is_unit_char(c, 'R'));
+    marked && parse_value_token(tok, 'R').is_some()
 }
 
 impl Component {
@@ -3471,6 +3573,74 @@ mod value_norm_tests {
     #[test]
     fn non_passive_class_returns_none() {
         assert!(normalize_value("STM32F407VGT6", "U").is_none());
+    }
+
+    #[test]
+    fn a_bead_reads_its_impedance_not_its_dc_resistance() {
+        // Issue #20. The compound form real boards use: current rating, DC
+        // resistance, impedance@frequency. The first parseable token is the
+        // 120mΩ DCR — reporting that would be a confident wrong answer.
+        let v = normalize_value("1.5A 120mΩ 1kΩ@100MHz", "FB").expect("should parse");
+        assert_eq!(v.canonical, "1kΩ@100MHz");
+        assert_eq!(v.unit, "Ω");
+        assert_eq!(v.at_frequency.as_deref(), Some("100MHz"));
+        assert!((v.magnitude - 1000.0).abs() < 1e-9);
+
+        let v = normalize_value("450mA 290mΩ 220Ω@100MHz", "FB").expect("should parse");
+        assert_eq!(v.canonical, "220Ω@100MHz");
+        assert!((v.magnitude - 220.0).abs() < 1e-9);
+
+        // The same rule with the current rating left off, and on its own —
+        // the bare "@freq" suffix used to defeat the parser entirely.
+        for raw in ["120mΩ 1kΩ@100MHz", "1kΩ@100MHz"] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "1kΩ@100MHz", "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_single_valued_bead_reads_like_a_resistor() {
+        for (raw, canonical) in [("600R", "600Ω"), ("1kΩ", "1kΩ"), ("120 ohm", "120Ω")] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, canonical, "{raw}");
+            assert_eq!(v.at_frequency, None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn an_unmarked_pair_of_ohm_values_stays_null() {
+        // DCR and impedance with nothing to tell them apart. Null is the
+        // honest answer here; picking either one is a coin flip that reads
+        // downstream as fact.
+        assert!(normalize_value("120mΩ 1kΩ", "FB").is_none());
+        assert!(normalize_value("1.5A 120mΩ 1k", "FB").is_none());
+    }
+
+    #[test]
+    fn a_bead_ignores_ratings_that_are_not_ohms() {
+        // Only ohm-*marked* tokens count towards the ambiguity test, or
+        // every compound string would look like it held two impedances.
+        let v = normalize_value("1.5A 1kΩ@100MHz 25V", "FB").expect("should parse");
+        assert_eq!(v.canonical, "1kΩ@100MHz");
+        // ...and with no marked token at all, the resistor reading still
+        // applies to the one value present.
+        let v = normalize_value("2A 600R", "FB").expect("should parse");
+        assert_eq!(v.canonical, "600Ω");
+    }
+
+    #[test]
+    fn two_quoted_frequencies_take_the_last_and_say_so() {
+        // Rare, but determinate: compound strings run impedance-last, and
+        // at_frequency makes the choice visible rather than silent.
+        let v = normalize_value("600Ω@10MHz 1kΩ@100MHz", "FB").expect("should parse");
+        assert_eq!(v.canonical, "1kΩ@100MHz");
+        assert_eq!(v.at_frequency.as_deref(), Some("100MHz"));
+    }
+
+    #[test]
+    fn a_bead_with_no_readable_value_stays_null() {
+        assert!(normalize_value("BLM18PG121SN1D", "FB").is_none());
+        assert!(normalize_value("FerriteBead", "FB").is_none());
     }
 
     #[test]

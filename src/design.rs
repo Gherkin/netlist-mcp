@@ -3156,10 +3156,22 @@ enum Mark {
 
 impl Mark {
     fn read(mark: &str) -> Mark {
-        match canonical_frequency(mark) {
-            Some(freq) => Mark::Frequency(freq),
+        let mark = trim_frequency(mark);
+        match frequency_hz(mark) {
+            Some(hz) => Mark::from_hz(hz),
             None if matches!(mark.to_ascii_lowercase().as_str(), "dc" | "dcr") => Mark::Dc,
             None => Mark::Other,
+        }
+    }
+
+    /// A frequency in one spelling, so two spellings of one point ("100MHz",
+    /// "0.1GHz", "100.0MHz") give one `at_frequency`. Zero hertz is DC
+    /// written another way ("@0Hz"), not an impedance rating.
+    fn from_hz(hz: f64) -> Mark {
+        if hz == 0.0 {
+            Mark::Dc
+        } else {
+            Mark::Frequency(format_canonical(hz, "Hz"))
         }
     }
 }
@@ -3214,8 +3226,8 @@ fn bead_tokens<'a>(tokens: &[&'a str]) -> Option<Vec<BeadToken<'a>>> {
 
         // A frequency literal standing on its own ("100MHz") marks what came
         // before it, the same as an "@" would.
-        if let Some(freq) = frequency_literal(tok) {
-            attach_mark(&mut out, Mark::Frequency(freq), Binding::OhmMarked)?;
+        if let Some(hz) = frequency_literal(tok) {
+            attach_mark(&mut out, Mark::from_hz(hz), Binding::OhmMarked)?;
             continue;
         }
 
@@ -3236,24 +3248,24 @@ fn bead_tokens<'a>(tokens: &[&'a str]) -> Option<Vec<BeadToken<'a>>> {
 /// differently depending on the order someone wrote it in.
 fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option<()> {
     let pos = match binding {
-        // An "@" binds where it was written: the nearest value before it,
-        // plausible impedance or not. Walking past an implausible one would
-        // let the "@DC" of "1kΩ@100MHz 120mΩ@DC" reach back and strike out
-        // the 1kΩ.
+        // An "@" binds where it was written: the nearest quantity before it,
+        // whatever its unit. Only a bare unit word ("600 ohm @ 100 MHz") is
+        // stepped over. Walking past a quantity that is not ohms would let
+        // the "@DC" of "1.2Ω 2kΩ 200mA@DC" reach back and strike out the 2kΩ,
+        // and walking past one that is no plausible impedance would let the
+        // "@DC" of "1kΩ@100MHz 120mΩ@DC" do the same to the 1kΩ.
         Binding::AnyValue => out
             .iter()
-            .rposition(|tok| parse_value_token(tok.base, 'R').is_some()),
+            .rposition(|tok| tok.base.chars().any(|c| c.is_ascii_digit())),
         Binding::OhmMarked => out
             .iter()
             .rposition(|tok| bead_ohms(tok.base).is_some() && is_ohm_marked_token(tok.base)),
     };
     let Some(pos) = pos else { return Some(()) };
-    // A mark on a value that is no plausible impedance says nothing about the
-    // bead either way: that value is not a candidate to begin with.
-    if bead_ohms(out[pos].base).is_none() {
-        return Some(());
-    }
     match mark {
+        // A frequency on a value that is no plausible impedance says nothing
+        // about the bead: that value is not a candidate to begin with.
+        Mark::Frequency(_) if bead_ohms(out[pos].base).is_none() => {}
         Mark::Frequency(freq) => match &out[pos].freq {
             Some(quoted) if quoted != &freq => return None,
             _ => out[pos].freq = Some(freq),
@@ -3261,15 +3273,17 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
         // "120mΩ@DC" is a DC resistance saying so. It is not an impedance
         // rating at any frequency, so it is not a candidate for the bead's
         // value at all — not even a rival that makes the string ambiguous.
-        Mark::Dc => out[pos].dc = true,
-        Mark::Other => {}
+        // Any ohm value counts, in band or not: "0.5 kΩ@DC" binds to the
+        // 0.5, and only reaches the band once the split prefix applies.
+        Mark::Dc if parse_value_token(out[pos].base, 'R').is_some() => out[pos].dc = true,
+        Mark::Dc | Mark::Other => {}
     }
     Some(())
 }
 
-/// Read the frequency out of an `@` mark, in one spelling: "100MHZ",
-/// "100mhz", "100M" and "100MHz/1.5A" all give "100MHz". The number is kept
-/// as written, the unit is not — two spellings of one point have to give one
+/// Read the frequency out of an `@` mark, in hertz: "100MHZ", "100mhz",
+/// "100M", "0.1GHz" and "100MHz/1.5A" all give 1e8. [`Mark::from_hz`] spells
+/// it one way, since two spellings of one point have to give one
 /// `at_frequency`, or the grouping it exists for splits a part in two.
 ///
 /// A lowercase "m" here is mega, not milli: nothing is rated in millihertz,
@@ -3277,40 +3291,44 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
 ///
 /// `None` means the mark is not a frequency at all: "@DC", "@25C", or a bare
 /// "@100" with neither unit nor prefix to say what it measures.
-fn canonical_frequency(mark: &str) -> Option<String> {
-    let mark = trim_frequency(mark);
+fn frequency_hz(mark: &str) -> Option<f64> {
     let number: String = mark.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
-    if number.parse::<f64>().is_err() {
-        return None;
-    }
+    let value: f64 = number.parse().ok()?;
     let rest = &mark[number.len()..];
-    let (prefix, rest) = match rest.chars().next().map(|c| c.to_ascii_lowercase()) {
-        Some('k') => ("k", &rest[1..]),
-        Some('m') => ("M", &rest[1..]),
-        Some('g') => ("G", &rest[1..]),
-        _ => ("", rest),
+    let (multiplier, rest) = match rest.chars().next().map(|c| c.to_ascii_lowercase()) {
+        Some('k') => (1e3, &rest[1..]),
+        Some('m') => (1e6, &rest[1..]),
+        Some('g') => (1e9, &rest[1..]),
+        _ => (1.0, rest),
     };
-    let hertz = rest.len() >= 2 && rest.is_char_boundary(2) && rest[..2].eq_ignore_ascii_case("hz");
-    let tail = if hertz { &rest[2..] } else { rest };
+    let (hertz, tail) = match rest.get(..2) {
+        Some(unit) if unit.eq_ignore_ascii_case("hz") => (true, &rest[2..]),
+        _ => (false, rest),
+    };
     // With neither unit nor prefix there is nothing saying this is a
     // frequency; with either, whatever follows has to be separated from it
     // ("100MHz/1.5A") rather than part of it ("25C", "120mΩ").
-    if (!hertz && prefix.is_empty()) || tail.starts_with(char::is_alphanumeric) {
+    if (!hertz && multiplier == 1.0) || tail.starts_with(char::is_alphanumeric) {
         return None;
     }
-    Some(format!("{number}{prefix}Hz"))
+    Some(value * multiplier)
 }
 
 /// The frequency a bare token spells out, if it is one — "100MHz", "1GHz".
 /// The hertz has to be there: "100M" standing beside a value is a magnitude,
 /// not a frequency.
-fn frequency_literal(tok: &str) -> Option<String> {
+fn frequency_literal(tok: &str) -> Option<f64> {
     let tok = trim_frequency(tok);
+    strip_hertz(tok)?;
+    frequency_hz(tok)
+}
+
+/// `tok` without a trailing "Hz" in any case, or `None` if it has none.
+fn strip_hertz(tok: &str) -> Option<&str> {
     let split = tok.len().checked_sub(2)?;
-    if !(tok.is_char_boundary(split) && tok[split..].eq_ignore_ascii_case("hz")) {
-        return None;
-    }
-    canonical_frequency(tok)
+    tok.get(split..)
+        .filter(|unit| unit.eq_ignore_ascii_case("hz"))
+        .map(|_| &tok[..split])
 }
 
 /// Strip the punctuation a value string wraps a frequency in: the comma in
@@ -3319,17 +3337,15 @@ fn trim_frequency(tok: &str) -> &str {
     tok.trim_matches(|c: char| !c.is_alphanumeric())
 }
 
-/// True if `tok` is the hertz unit on its own, prefix and all — the "MHz" of
-/// a frequency someone wrote as two tokens ("@ 100 MHz").
+/// True if `tok` is the unit of a frequency someone wrote as two tokens: the
+/// "MHz" of "@ 100 MHz", or a lone prefix ("@ 100 M"), which reads the same
+/// way it does glued on ("@100M").
 fn is_frequency_unit(tok: &str) -> bool {
     let tok = trim_frequency(tok);
-    let split = match tok.len().checked_sub(2) {
-        Some(split) => split,
-        None => return false,
-    };
-    tok.is_char_boundary(split)
-        && tok[split..].eq_ignore_ascii_case("hz")
-        && tok[..split].chars().all(|c| c.is_ascii_alphabetic())
+    match strip_hertz(tok) {
+        Some(prefix) => prefix.chars().all(|c| c.is_ascii_alphabetic()),
+        None => matches!(tok, "k" | "K" | "m" | "M" | "g" | "G"),
+    }
 }
 
 /// True if `tok` is a parseable ohm value that *says* it is ohms — "120mΩ",
@@ -3985,6 +4001,40 @@ mod value_norm_tests {
         assert!(normalize_value("1kΩ@1GHz 1kΩ@100MHz", "FB").is_none());
         // The same figure quoted twice is not a disagreement.
         let v = normalize_value("1kΩ@100MHz 1kΩ@100MHz", "FB").expect("should parse");
+        assert_eq!(v.canonical, "1kΩ@100MHz");
+    }
+
+    #[test]
+    fn an_at_mark_binds_to_the_quantity_it_follows() {
+        // A mark on a current rating is about the current rating. Walking
+        // back past it to an ohm value struck out the impedance and read the
+        // DCR, or took the rating's frequency as a second impedance point.
+        let v = normalize_value("1.2Ω 2kΩ 200mA@DC", "FB");
+        assert!(v.is_none(), "{v:?}");
+        for raw in ["600Ω@100MHz 1.5A@DC", "600Ω@100MHz 2A@1MHz"] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "600Ω@100MHz", "{raw}");
+        }
+    }
+
+    #[test]
+    fn dc_reads_as_dc_however_it_is_written() {
+        for raw in ["1.5Ω@DC,", "1.5Ω@(DC)", "1.5Ω@DC, 2A", "1.5Ω@0Hz", "0.5 kΩ@DC"] {
+            let v = normalize_value(raw, "FB");
+            assert!(v.is_none(), "{raw}: {v:?}");
+        }
+        let v = normalize_value("1kΩ@100MHz 1.5Ω@0Hz", "FB").expect("should parse");
+        assert_eq!(v.canonical, "1kΩ@100MHz");
+    }
+
+    #[test]
+    fn one_frequency_point_has_one_spelling() {
+        for raw in ["1kΩ@0.1GHz", "1kΩ@100.0MHz", "1kΩ@100000kHz", "1k @ 100 M"] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "1kΩ@100MHz", "{raw}");
+            assert_eq!(v.at_frequency.as_deref(), Some("100MHz"), "{raw}");
+        }
+        let v = normalize_value("1kΩ@100MHz 1kΩ@0.1GHz", "FB").expect("should parse");
         assert_eq!(v.canonical, "1kΩ@100MHz");
     }
 

@@ -151,7 +151,7 @@ struct WalkParams {
     /// first.
     /// Nets only the cut parts reach are left out too. `topology.truncated`
     /// and the `omitted_parts`/`omitted_nets` counts report the cut; a net's
-    /// own `omitted_parts` counts the cut parts on it.
+    /// own `omitted_parts` counts the cut parts on it (left out when 0).
     #[serde(default)]
     max_topology_parts: Option<u32>,
 }

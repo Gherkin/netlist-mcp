@@ -2557,7 +2557,13 @@ struct TopoNet {
     /// Parts with a pin on this net that `max_topology_parts` cut. Above 0,
     /// this node's edges in the graph are incomplete. Like
     /// `Topology::truncated`, it does not count `max_endpoints` drops.
+    /// Left out when 0.
+    #[serde(skip_serializing_if = "is_zero")]
     omitted_parts: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Serialize)]
@@ -5544,7 +5550,8 @@ mod walk_topology_tests {
         assert_eq!(nets(&two), sens());
         assert_eq!(pins(part(&two, "J2").unwrap()), [pn("1", "/SENSIN1")]);
         assert_eq!(two["topology"]["omitted_nets"], 1);
-        assert_eq!(two["topology"]["nets"][0]["omitted_parts"], 0, "{two}");
+        // Nothing cut on /SENSIN1 any more: the field is left out.
+        assert!(two["topology"]["nets"][0].get("omitted_parts").is_none(), "{two}");
 
         // The endpoint list is not touched by the topology cap.
         assert_eq!(one["endpoints"], full["endpoints"]);
@@ -5593,7 +5600,11 @@ mod walk_topology_tests {
                 assert_eq!(listed.len() + t["omitted_nets"].as_u64().unwrap() as usize, n_nets, "{ctx}");
                 assert_eq!(t["truncated"], cap < n_parts as u32, "{ctx}");
                 let net_cut: u64 =
-                    t["nets"].as_array().unwrap().iter().map(|n| n["omitted_parts"].as_u64().unwrap()).sum();
+                    t["nets"].as_array().unwrap().iter().map(|n| n["omitted_parts"].as_u64().unwrap_or(0)).sum();
+                assert!(
+                    t["nets"].as_array().unwrap().iter().all(|n| n["omitted_parts"] != 0),
+                    "{ctx}: a zero per-net omitted_parts was serialized"
+                );
                 assert_eq!(net_cut > 0, cap < n_parts as u32, "{ctx}: per-net omitted_parts");
             }
         }

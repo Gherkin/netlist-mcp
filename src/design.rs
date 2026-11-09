@@ -2285,7 +2285,8 @@ struct ComponentDetail {
     keywords: Option<String>,
     footprint: Option<String>,
     sheet: Option<String>,
-    /// The symbol's library id, "lib:part" (e.g. "Device:R").
+    /// The symbol's library id, "lib:part" (e.g. "Device:R"). Raw: KiCad
+    /// escape tokens like `{slash}` are kept (#51).
     lib_id: String,
     /// Do Not Populate: the part is on the schematic but deliberately not
     /// fitted. Always emitted, never null — see `presence_flag`.
@@ -3437,7 +3438,7 @@ pub struct Component {
     sheet: Option<String>,
     /// The symbol's library id, "lib:part" (e.g. "Device:R"). A part-identity
     /// key independent of `value`, which is an MPN for ICs and a spec for
-    /// passives.
+    /// passives. Raw: KiCad escape tokens like `{slash}` are kept (#51).
     lib_id: String,
     /// True if the schematic marks this part Do Not Populate. Derived from the
     /// netlist's presence-only `dnp` property (see `presence_flag`) and lifted

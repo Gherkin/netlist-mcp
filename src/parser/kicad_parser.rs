@@ -364,6 +364,8 @@ fn parse_component(node: &NetListNode, base_tree: &NetListNode) -> anyhow::Resul
     let comp_lib_part = libsource
         .get_only_child_val(&Token::sym("part"))
         .with_context(|| format!("error looking for part child of libsource of node {:?}", node))?;
+    // Kept raw, unlike `value`: a `:` inside a name stays `{colon}`, so the
+    // first `:` is always the lib/part split. It is the #46 sidecar key (#51).
     comp.lib_id = format!("{comp_lib}:{comp_lib_part}");
 
     let lib_part = base_tree.get_only_child(&Token::sym("libparts"))
@@ -642,5 +644,29 @@ mod parse_sheets_tests {
             (sheet (number "1") (name "/AB{slash}C/") (tstamps "/x/"))
         ))"#);
         assert_eq!(parse_sheets(&node).unwrap(), vec!["/AB/C/"]);
+    }
+}
+
+#[cfg(test)]
+mod lib_id_tests {
+    use super::parse_netlist;
+
+    /// #51: `lib_id` keeps KiCad's escape tokens, while `value` is decoded.
+    /// Raw, neither name holds a `:`; decoded, "A:B:C" could be lib "A" or
+    /// lib "A:B".
+    #[test]
+    fn lib_id_keeps_escape_tokens() {
+        let src = r#"(export
+            (components
+                (comp (ref "U1") (value "A{slash}B")
+                    (libsource (lib "My{slash}Lib") (part "A{slash}B{colon}C"))))
+            (libparts
+                (libpart (lib "My{slash}Lib") (part "A{slash}B{colon}C")))
+            (nets))"#.to_string();
+        let netlist = parse_netlist(&src).expect("parse");
+        let comp = &netlist.components[0];
+        assert_eq!(comp.lib_id, "My{slash}Lib:A{slash}B{colon}C");
+        assert_eq!(comp.lib_id.split_once(':'), Some(("My{slash}Lib", "A{slash}B{colon}C")));
+        assert_eq!(comp.value, "A/B");
     }
 }

@@ -3330,13 +3330,20 @@ fn bead_tokens(tokens: &[(String, bool)]) -> Option<Vec<BeadToken>> {
 /// frequency landed on a bare number while a value with an ohm unit stands
 /// before it ("1kΩ 0603 @100MHz"): either could be the impedance.
 fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option<()> {
+    // A mark that is neither a frequency nor DC ("@25C") says nothing about
+    // the value, wherever it would land.
+    if matches!(mark, Mark::Other) {
+        return Some(());
+    }
     // Where a mark lands when nothing is stuck to it. A DC mark is about the
     // nearest quantity, whatever its unit: "1.2Ω 2kΩ 200mA @DC" is about the
-    // 200mA. A frequency is about the nearest ohm value, stepping over a
-    // current or a package code: "1kΩ 1.5A @100MHz" rates the 1kΩ.
+    // 200mA. A frequency is about the nearest token that parses as ohms,
+    // stepping over a current: "1kΩ 1.5A @100MHz" rates the 1kΩ. A bare
+    // package code parses as ohms, so it is not stepped over
+    // ("1kΩ 0603 @100MHz" lands on the 0603).
     let nearest = |out: &[BeadToken]| match mark {
         Mark::Dc => out.iter().rposition(|tok| is_quantity(&tok.base)),
-        Mark::Frequency(_) | Mark::Other => out.iter().rposition(|tok| parse_value_token(&tok.base, 'R').is_some()),
+        _ => out.iter().rposition(|tok| parse_value_token(&tok.base, 'R').is_some()),
     };
     let pos = match binding {
         // Stuck to "200mA", an "@DC" is about the 200mA, so it cannot reach

@@ -136,7 +136,9 @@ struct WalkParams {
     /// Max passthrough hops before a branch is cut (default 4).
     #[serde(default)]
     max_depth: Option<u32>,
-    /// Max endpoints to return (default 50). Does not cap `topology`.
+    /// Max endpoints to return (default 50). Also caps `dead_ends` and the
+    /// repeat `rails_reached` entries (the first arrival at each rail is always
+    /// listed). Does not cap `topology`.
     #[serde(default)]
     max_endpoints: Option<u32>,
     /// Stop at power/ground rails instead of enumerating them (default true).

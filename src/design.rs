@@ -1142,7 +1142,8 @@ impl Design {
     /// of every side (see `build_topology`). Without it the output is the flat
     /// endpoint list only, unchanged. `max_topology_parts` caps the parts in
     /// that graph, nearest first (minimum 1); it does not change `endpoints`.
-    /// `max_endpoints` caps only the `endpoints` list, not the graph: endpoint
+    /// `max_endpoints` caps the `endpoints` and `dead_ends` lists and the
+    /// repeat `rails_reached` entries (issue #31), not the graph: endpoint
     /// parts it drops are still graph candidates (issue #35).
     ///
     /// The BFS core lives in `walk_bfs`, shared with `path_between`.
@@ -1276,8 +1277,10 @@ impl Design {
             if !visited_nets.insert(net_idx) {
                 if let Some(&score) = rail_scores.get(&net_idx) {
                     // A repeat arrival. Each part is traversed once, so the
-                    // via chain is new. Only repeats count against the cap:
-                    // the first arrival at every rail is always kept.
+                    // via chain is new. A repeat is kept only while the whole
+                    // `rails_reached` list (first arrivals included) is under
+                    // `max_endpoints`. First arrivals are never cut, so the
+                    // list can still end up longer than the cap.
                     if rails_reached.len() >= max_endpoints as usize {
                         truncated = true;
                     } else {
@@ -2710,9 +2713,10 @@ struct DeadEnd {
 /// One arrival at a power/ground rail the walk stopped at (reported, never
 /// enumerated). A rail reached over several series parts has one entry per
 /// arrival, in BFS order (nearest first), so shunt parts to the rail — filter
-/// caps, pull-downs, TVS — each show up (issue #31). Repeat arrivals count
-/// against `max_endpoints` and set `truncated` when cut; the first arrival
-/// at each rail is always listed.
+/// caps, pull-downs, TVS — each show up (issue #31). A repeat arrival is
+/// listed only while `rails_reached` is shorter than `max_endpoints`, and a
+/// cut one sets `truncated`. The first arrival at each rail is always listed,
+/// even past the cap.
 #[derive(Debug, Serialize)]
 struct RailReached {
     net: String,
@@ -5786,16 +5790,26 @@ mod walk_topology_tests {
     }
 
     /// Repeat arrivals count against `max_endpoints`; the first arrival at a
-    /// rail is kept, and the cut sets `truncated`.
+    /// rail is kept, and the cut sets `truncated`. From J2:1 the only endpoint
+    /// is TP11:1, so with a cap of 1 the endpoint list is not cut and
+    /// `truncated` can only come from the rail cut.
     #[test]
     fn max_endpoints_cuts_repeat_rail_arrivals_only() {
-        let json = fixture().walk("/SENSIN1", 4, 1, true, false, 200).expect("walk");
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let run = |cap| {
+            let json = fixture().walk("J2:1", 4, cap, true, false, 200).expect("walk");
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()
+        };
+        let cut = run(1);
+        assert_eq!(cut["endpoints"].as_array().unwrap().len(), 1);
         assert_eq!(
-            rail_arrivals(&v),
+            rail_arrivals(&cut),
             [("GND".to_string(), vec!["R11".to_string(), "R21".to_string()])]
         );
-        assert_eq!(v["truncated"], true);
+        assert_eq!(cut["truncated"], true);
+        // Room for both arrivals: nothing is cut.
+        let full = run(2);
+        assert_eq!(rail_arrivals(&full).len(), 2);
+        assert_eq!(full["truncated"], false);
     }
 
     #[test]

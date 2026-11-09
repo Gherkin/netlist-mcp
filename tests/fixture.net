@@ -636,6 +636,18 @@
 							(num "4")
 						)
 						(pin
+							(num "5")
+						)
+						(pin
+							(num "7")
+						)
+						(pin
+							(num "8")
+						)
+						(pin
+							(num "10")
+						)
+						(pin
 							(num "11")
 						)
 						(pin
@@ -1423,6 +1435,134 @@
 			)
 		)
 		(comp
+			(ref "J4")
+			(value "Buffer_Header")
+			(footprint "Fixture:CONN2")
+			(description "2-pin header")
+			(libsource
+				(lib "Connector")
+				(part "Conn_01x02")
+				(description "2-pin header")
+			)
+			(property
+				(name "ki_keywords")
+				(value "connector header")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R60")
+			(value "1k")
+			(footprint "Fixture:R")
+			(description "Resistor")
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "C60")
+			(value "10n")
+			(footprint "Fixture:C")
+			(description "Unpolarized capacitor")
+			(libsource
+				(lib "Device")
+				(part "C")
+				(description "Unpolarized capacitor")
+			)
+			(property
+				(name "ki_keywords")
+				(value "cap capacitor")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "TP60")
+			(value "TestPoint")
+			(footprint "Fixture:TP")
+			(description "Test point")
+			(libsource
+				(lib "Connector")
+				(part "TestPoint")
+				(description "Test point")
+			)
+			(property
+				(name "exclude_from_bom")
+			)
+			(property
+				(name "ki_keywords")
+				(value "test point")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+					)
+				)
+			)
+		)
+		(comp
 			(ref "U2")
 			(value "LAN8720A")
 			(footprint "Fixture:PHY")
@@ -1809,6 +1949,108 @@
 			(property
 				(name "ki_keywords")
 				(value "ferrite bead emi filter")
+			)
+			(sheetpath
+				(names "/Ethernet/")
+				(tstamps "/Ethernet/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "U4")
+			(value "CANXCVR")
+			(footprint "Fixture:XCVR")
+			(description "CAN transceiver")
+			(libsource
+				(lib "Interface")
+				(part "CAN_Transceiver")
+				(description "CAN transceiver")
+			)
+			(property
+				(name "ki_keywords")
+				(value "can transceiver bus")
+			)
+			(sheetpath
+				(names "/Ethernet/")
+				(tstamps "/Ethernet/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "6")
+						)
+						(pin
+							(num "7")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "L2")
+			(value "CMC-FIXTURE")
+			(footprint "Fixture:CMC")
+			(description "Common mode choke")
+			(libsource
+				(lib "Device")
+				(part "L_CMC")
+				(description "Common mode choke")
+			)
+			(property
+				(name "ki_keywords")
+				(value "common mode choke filter")
+			)
+			(sheetpath
+				(names "/Ethernet/")
+				(tstamps "/Ethernet/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+						(pin
+							(num "3")
+						)
+						(pin
+							(num "4")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "J5")
+			(value "CAN_Header")
+			(footprint "Fixture:CONN2")
+			(description "2-pin header")
+			(libsource
+				(lib "Connector")
+				(part "Conn_01x02")
+				(description "2-pin header")
+			)
+			(property
+				(name "ki_keywords")
+				(value "connector header")
 			)
 			(sheetpath
 				(names "/Ethernet/")
@@ -2267,6 +2509,50 @@
 				)
 			)
 		)
+		(libpart
+			(lib "Device")
+			(part "L_CMC")
+			(description "Common mode choke")
+			(pins
+				(pin
+					(num "1")
+					(name "1")
+					(type "passive")
+				)
+				(pin
+					(num "2")
+					(name "2")
+					(type "passive")
+				)
+				(pin
+					(num "3")
+					(name "3")
+					(type "passive")
+				)
+				(pin
+					(num "4")
+					(name "4")
+					(type "passive")
+				)
+			)
+		)
+		(libpart
+			(lib "Interface")
+			(part "CAN_Transceiver")
+			(description "CAN transceiver")
+			(pins
+				(pin
+					(num "6")
+					(name "CANL")
+					(type "bidirectional")
+				)
+				(pin
+					(num "7")
+					(name "CANH")
+					(type "bidirectional")
+				)
+			)
+		)
 	)
 	(nets
 		(net
@@ -2341,6 +2627,131 @@
 		)
 		(net
 			(code "3")
+			(name "/BUFIN")
+			(class "Default")
+			(node
+				(ref "J4")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U3")
+				(pin "5")
+				(pintype "input")
+			)
+		)
+		(net
+			(code "4")
+			(name "/BUFMID")
+			(class "Default")
+			(node
+				(ref "U3")
+				(pin "7")
+				(pintype "output")
+			)
+			(node
+				(ref "R60")
+				(pin "1")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "5")
+			(name "/BUFOUT")
+			(class "Default")
+			(node
+				(ref "U3")
+				(pin "8")
+				(pintype "output")
+			)
+			(node
+				(ref "TP60")
+				(pin "1")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "6")
+			(name "/BUFRC")
+			(class "Default")
+			(node
+				(ref "R60")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "C60")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U3")
+				(pin "10")
+				(pintype "input")
+			)
+		)
+		(net
+			(code "7")
+			(name "/CANH")
+			(class "Default")
+			(node
+				(ref "U4")
+				(pin "7")
+				(pintype "bidirectional")
+			)
+			(node
+				(ref "L2")
+				(pin "1")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "8")
+			(name "/CANH_J")
+			(class "Default")
+			(node
+				(ref "L2")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "J5")
+				(pin "1")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "9")
+			(name "/CANL")
+			(class "Default")
+			(node
+				(ref "U4")
+				(pin "6")
+				(pintype "bidirectional")
+			)
+			(node
+				(ref "L2")
+				(pin "4")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "10")
+			(name "/CANL_J")
+			(class "Default")
+			(node
+				(ref "L2")
+				(pin "3")
+				(pintype "passive")
+			)
+			(node
+				(ref "J5")
+				(pin "2")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "11")
 			(name "/Ethernet/LED1/REGOFF")
 			(class "Default")
 			(node
@@ -2355,7 +2766,7 @@
 			)
 		)
 		(net
-			(code "4")
+			(code "12")
 			(name "/Ethernet/MODE0")
 			(class "Default")
 			(node
@@ -2370,7 +2781,7 @@
 			)
 		)
 		(net
-			(code "5")
+			(code "13")
 			(name "/Ethernet/MX1+")
 			(class "Default")
 			(node
@@ -2390,7 +2801,7 @@
 			)
 		)
 		(net
-			(code "6")
+			(code "14")
 			(name "/Ethernet/MX1-")
 			(class "Default")
 			(node
@@ -2405,7 +2816,7 @@
 			)
 		)
 		(net
-			(code "7")
+			(code "15")
 			(name "/Ethernet/Magnetics/CT")
 			(class "Default")
 			(node
@@ -2420,7 +2831,7 @@
 			)
 		)
 		(net
-			(code "8")
+			(code "16")
 			(name "/Ethernet/RXN")
 			(class "Default")
 			(node
@@ -2435,7 +2846,7 @@
 			)
 		)
 		(net
-			(code "9")
+			(code "17")
 			(name "/Ethernet/RXP")
 			(class "Default")
 			(node
@@ -2450,7 +2861,7 @@
 			)
 		)
 		(net
-			(code "10")
+			(code "18")
 			(name "/Ethernet/TXN")
 			(class "Default")
 			(node
@@ -2465,7 +2876,7 @@
 			)
 		)
 		(net
-			(code "11")
+			(code "19")
 			(name "/Ethernet/TXP")
 			(class "Default")
 			(node
@@ -2480,7 +2891,7 @@
 			)
 		)
 		(net
-			(code "12")
+			(code "20")
 			(name "/Ethernet/VDDCR")
 			(class "Default")
 			(node
@@ -2495,7 +2906,7 @@
 			)
 		)
 		(net
-			(code "13")
+			(code "21")
 			(name "/Ethernet/XTAL1")
 			(class "Default")
 			(node
@@ -2515,7 +2926,7 @@
 			)
 		)
 		(net
-			(code "14")
+			(code "22")
 			(name "/Ethernet/XTAL2")
 			(class "Default")
 			(node
@@ -2535,7 +2946,7 @@
 			)
 		)
 		(net
-			(code "15")
+			(code "23")
 			(name "/PATHA")
 			(class "Default")
 			(node
@@ -2560,7 +2971,7 @@
 			)
 		)
 		(net
-			(code "16")
+			(code "24")
 			(name "/PATHB")
 			(class "Default")
 			(node
@@ -2595,7 +3006,7 @@
 			)
 		)
 		(net
-			(code "17")
+			(code "25")
 			(name "/PATHC")
 			(class "Default")
 			(node
@@ -2615,7 +3026,7 @@
 			)
 		)
 		(net
-			(code "18")
+			(code "26")
 			(name "/PATHSTUB")
 			(class "Default")
 			(node
@@ -2630,7 +3041,7 @@
 			)
 		)
 		(net
-			(code "19")
+			(code "27")
 			(name "/SENSIN1")
 			(class "Default")
 			(node
@@ -2645,7 +3056,7 @@
 			)
 		)
 		(net
-			(code "20")
+			(code "28")
 			(name "/SENSIN2")
 			(class "Default")
 			(node
@@ -2660,7 +3071,7 @@
 			)
 		)
 		(net
-			(code "21")
+			(code "29")
 			(name "/SENSIN3")
 			(class "Default")
 			(node
@@ -2675,7 +3086,7 @@
 			)
 		)
 		(net
-			(code "22")
+			(code "30")
 			(name "/SENSMID1")
 			(class "Default")
 			(node
@@ -2700,7 +3111,7 @@
 			)
 		)
 		(net
-			(code "23")
+			(code "31")
 			(name "/SENSMID2")
 			(class "Default")
 			(node
@@ -2725,7 +3136,7 @@
 			)
 		)
 		(net
-			(code "24")
+			(code "32")
 			(name "/SENSMID3")
 			(class "Default")
 			(node
@@ -2745,7 +3156,7 @@
 			)
 		)
 		(net
-			(code "25")
+			(code "33")
 			(name "/SENSOUT")
 			(class "Default")
 			(node
@@ -2760,7 +3171,7 @@
 			)
 		)
 		(net
-			(code "26")
+			(code "34")
 			(name "/SENSREF")
 			(class "Default")
 			(node
@@ -2775,7 +3186,7 @@
 			)
 		)
 		(net
-			(code "27")
+			(code "35")
 			(name "EN")
 			(class "Default")
 			(node
@@ -2795,7 +3206,7 @@
 			)
 		)
 		(net
-			(code "28")
+			(code "36")
 			(name "FLAG")
 			(class "Default")
 			(node
@@ -2810,7 +3221,7 @@
 			)
 		)
 		(net
-			(code "29")
+			(code "37")
 			(name "GATE")
 			(class "Default")
 			(node
@@ -2825,7 +3236,7 @@
 			)
 		)
 		(net
-			(code "30")
+			(code "38")
 			(name "GND")
 			(class "Default")
 			(node
@@ -2988,9 +3399,19 @@
 				(pin "2")
 				(pintype "passive")
 			)
+			(node
+				(ref "C60")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "J4")
+				(pin "2")
+				(pintype "passive")
+			)
 		)
 		(net
-			(code "31")
+			(code "39")
 			(name "Net-(R41-Pad2)")
 			(class "Default")
 			(node
@@ -3000,7 +3421,7 @@
 			)
 		)
 		(net
-			(code "32")
+			(code "40")
 			(name "PG")
 			(class "Default")
 			(node
@@ -3015,7 +3436,7 @@
 			)
 		)
 		(net
-			(code "33")
+			(code "41")
 			(name "VIN")
 			(class "Default")
 			(node
@@ -3040,7 +3461,7 @@
 			)
 		)
 		(net
-			(code "34")
+			(code "42")
 			(name "VIN_F")
 			(class "Default")
 			(node

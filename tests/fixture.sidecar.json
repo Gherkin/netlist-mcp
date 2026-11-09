@@ -8,10 +8,67 @@
   "mpn": {
     "TLV9004": {
       "note": "from mpn",
-      "family": "TLV900x"
+      "family": "TLV900x",
+      "through": [
+        {
+          "name": "A",
+          "pins": [
+            "3",
+            "1"
+          ]
+        },
+        {
+          "name": "B",
+          "pins": [
+            "5",
+            "7"
+          ]
+        },
+        {
+          "name": "C",
+          "pins": [
+            "10",
+            "8"
+          ]
+        },
+        {
+          "name": "D",
+          "pins": [
+            "12",
+            "14"
+          ]
+        }
+      ]
     },
     "2N7002-7-F": {
-      "note": "matched by the MPN property"
+      "note": "matched by the MPN property",
+      "through": [
+        {
+          "pins": [
+            "3",
+            "2"
+          ],
+          "gate": "1"
+        }
+      ]
+    },
+    "CMC-FIXTURE": {
+      "through": [
+        {
+          "name": "1",
+          "pins": [
+            "1",
+            "2"
+          ]
+        },
+        {
+          "name": "2",
+          "pins": [
+            "4",
+            "3"
+          ]
+        }
+      ]
     },
     "2N7002": {
       "note": "should never match"

@@ -19,7 +19,22 @@
 //! ```
 //!
 //! `refdes` entries belong to one board, so only the project file may hold
-//! them. An entry is any JSON object; its fields are not interpreted here.
+//! them. An entry is any JSON object. One field is interpreted: `through`
+//! (issue #47), the pin pairs `walk` and `path_between` may cross:
+//!
+//! ```json
+//! {"mpn": {"TLV9004IPWR": {"through": [
+//!     {"name": "A", "pins": ["3", "1"]},
+//!     {"name": "B", "pins": ["5", "7"]}
+//! ]},
+//! "2N7002": {"through": [{"pins": ["3", "2"], "gate": "1"}]}}}
+//! ```
+//!
+//! `pins` is two pin numbers, first the input side. `name` is optional.
+//! `gate` (optional) names the pin that controls the pair, which makes the
+//! pair conditional. The shape is checked when a file is read or written;
+//! whether the pins exist on a component is checked by the design.
+//! Every other field is not interpreted here.
 //!
 //! A component matches by `lib_id` (raw, escape tokens kept: #51), by MPN (the
 //! `MPN` property, else `value`) and by refdes, all exact after trimming the
@@ -135,6 +150,9 @@ impl SidecarFile {
                 let Value::Object(entry) = entry else {
                     bail!("sidecar {path}: entry {key}.{k:?} must be a JSON object");
                 };
+                if let Err(e) = through_pairs(&entry) {
+                    bail!("sidecar {path}: entry {key}.{k:?}: {e}");
+                }
                 entries.insert(k, entry);
             }
             *file.table_mut(scope) = entries;
@@ -240,8 +258,71 @@ impl Edit<'_> {
         if !self.delete && self.fields.is_empty() {
             bail!("sidecar: nothing to write for {table}.{:?}: give `fields`, or `delete`", self.key);
         }
+        if let Err(e) = through_pairs(self.fields) {
+            bail!("sidecar: {table}.{:?}: {e}", self.key);
+        }
         Ok(())
     }
+}
+
+/// The entry field that holds through-models (issue #47).
+pub const THROUGH_FIELD: &str = "through";
+
+/// One declared pin pair a walk may cross (issue #47).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThroughPair {
+    pub name: Option<String>,
+    /// Two pin numbers, trimmed; first the input side.
+    pub pins: [String; 2],
+    /// The pin number that controls the pair (a MOSFET gate). Its presence
+    /// makes the pair conditional.
+    pub gate: Option<String>,
+}
+
+/// Read an entry's `through` field: None when absent or null (a null in an
+/// edit removes the field). An empty list is valid: it turns off a model a
+/// lower-precedence entry declares.
+pub fn through_pairs(entry: &Map<String, Value>) -> Result<Option<Vec<ThroughPair>>, String> {
+    let field = THROUGH_FIELD;
+    let list = match entry.get(field) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Array(list)) => list,
+        Some(_) => return Err(format!("\"{field}\" must be a list of pin pairs")),
+    };
+    let text = |v: &Value, what: &str, i: usize| -> Result<String, String> {
+        match v.as_str().map(str::trim) {
+            Some(s) if !s.is_empty() => Ok(s.to_string()),
+            _ => Err(format!("\"{field}\"[{i}]: {what} must be a non-empty string")),
+        }
+    };
+    let mut out = Vec::new();
+    for (i, item) in list.iter().enumerate() {
+        let Value::Object(item) = item else {
+            return Err(format!("\"{field}\"[{i}] must be an object like {{\"pins\": [\"3\", \"1\"]}}"));
+        };
+        // A typo ("pin", "gates") would otherwise be dropped without a word.
+        if let Some(k) = item.keys().find(|k| !["pins", "name", "gate"].contains(&k.as_str())) {
+            return Err(format!(
+                "\"{field}\"[{i}]: unknown key {k:?} (expected \"pins\", \"name\" or \"gate\")"
+            ));
+        }
+        let pins = match item.get("pins") {
+            Some(Value::Array(p)) if p.len() == 2 => {
+                [text(&p[0], "a pin", i)?, text(&p[1], "a pin", i)?]
+            }
+            _ => return Err(format!("\"{field}\"[{i}]: \"pins\" must be a list of two pin numbers")),
+        };
+        if pins[0] == pins[1] {
+            return Err(format!("\"{field}\"[{i}]: the two pins are the same ({:?})", pins[0]));
+        }
+        let name = item.get("name").map(|v| text(v, "\"name\"", i)).transpose()?;
+        let gate = item.get("gate").map(|v| text(v, "\"gate\"", i)).transpose()?;
+        if gate.as_ref().is_some_and(|g| pins.contains(g)) {
+            return Err(format!("\"{field}\"[{i}]: the gate is one of the pair's own pins"));
+        }
+        out.push(ThroughPair { name, pins, gate });
+    }
+    Ok(Some(out))
 }
 
 /// What `write_file` did.
@@ -606,6 +687,49 @@ mod tests {
     fn rejects_bad_json_and_non_object_root() {
         assert!(SidecarFile::parse("{", "t.json", Origin::Project).is_err());
         assert!(SidecarFile::parse("[]", "t.json", Origin::Project).is_err());
+    }
+
+    // Issue #47: `through` is read into pairs, trimmed.
+    #[test]
+    fn through_pairs_parse() {
+        let e = fields(json!({"through": [
+            {"name": "A", "pins": [" 3", "1"]},
+            {"pins": ["3", "2"], "gate": "1"}
+        ]}));
+        assert_eq!(through_pairs(&e).unwrap().unwrap(), vec![
+            ThroughPair { name: Some("A".into()), pins: ["3".into(), "1".into()], gate: None },
+            ThroughPair { name: None, pins: ["3".into(), "2".into()], gate: Some("1".into()) },
+        ]);
+        assert_eq!(through_pairs(&fields(json!({"note": 1}))).unwrap(), None);
+        assert_eq!(through_pairs(&fields(json!({"through": []}))).unwrap(), Some(vec![]));
+    }
+
+    // A malformed `through` stops a file from loading, and a write that
+    // would store one is refused before the file is touched.
+    #[test]
+    fn through_shape_is_checked() {
+        let cases = [
+            (json!({"through": {"pins": ["1", "2"]}}), "must be a list of pin pairs"),
+            (json!({"through": [["1", "2"]]}), "must be an object"),
+            (json!({"through": [{"pins": ["1"]}]}), "list of two pin numbers"),
+            (json!({"through": [{"pins": ["1", 2]}]}), "a pin must be a non-empty string"),
+            (json!({"through": [{"pins": ["1", "1"]}]}), "the two pins are the same"),
+            (json!({"through": [{"pin": ["1", "2"]}]}), "unknown key \"pin\""),
+            (json!({"through": [{"pins": ["1", "2"], "gate": "2"}]}), "the gate is one of"),
+            (json!({"through": [{"pins": ["1", "2"], "name": ""}]}), "\"name\" must be"),
+        ];
+        for (entry, want) in cases {
+            let text = json!({"mpn": {"X": entry}}).to_string();
+            let err = SidecarFile::parse(&text, "t.json", Origin::Project).unwrap_err();
+            assert!(format!("{err:#}").contains(want), "{want}: {err:#}");
+        }
+        let dir = temp_dir("through");
+        let path = dir.join("board.sidecar.json");
+        let f = fields(json!({"through": [{"pins": ["1"]}]}));
+        let err = write_file(&path, &edit(Origin::Project, Scope::Mpn, "X", &f)).unwrap_err();
+        assert!(format!("{err:#}").contains("list of two pin numbers"), "{err:#}");
+        assert!(!path.exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

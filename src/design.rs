@@ -55,12 +55,114 @@ pub struct Design {
     // writes in this server cannot reload out of order. `sidecar` itself is
     // write-locked only for the swap, so readers never wait on the file lock.
     sidecar_write: Mutex<()>,
+    // The sidecar's through-models resolved to pins (issue #47), rebuilt
+    // whenever `sidecar` is replaced.
+    through: RwLock<ThroughModels>,
+}
+
+/// One through-model pair resolved to this design's pins (issue #47).
+#[derive(Debug)]
+struct ResolvedPair {
+    name: Option<String>,
+    /// As declared: first the input side.
+    pins: [PinId; 2],
+    /// The controlling pin, as "REFDES:PIN".
+    gate: Option<String>,
+}
+
+/// Every component's through-model pairs, plus the problems found while
+/// resolving them (shown by `get_component`).
+#[derive(Debug, Default)]
+struct ThroughModels {
+    /// Component index -> its pairs, in declared order. Only parts with at
+    /// least one usable pair.
+    pairs: HashMap<usize, Vec<ResolvedPair>>,
+    /// Component index -> why a declared pair was skipped or is odd.
+    warnings: HashMap<usize, Vec<String>>,
+}
+
+/// Marks a 2-pin passive in `walk_bfs`'s visited set; a through-model part is
+/// keyed by its pair index instead, so each pair is crossed once (issue #47).
+const PASSIVE_PAIR: usize = usize::MAX;
+
+/// One part crossed on a walk path. `cross` is set for a through-model pair
+/// (issue #47), unset for a 2-pin passive.
+#[derive(Debug, Clone, Copy)]
+struct Hop {
+    comp: usize,
+    cross: Option<Cross>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Cross {
+    /// Index into the part's `ResolvedPair`s.
+    pair: usize,
+    /// Crossed from the second declared pin to the first.
+    against: bool,
 }
 
 impl Design {
     /// Attach the enrichment sidecar loaded at startup (issue #46).
     pub fn attach_sidecar(&mut self, sidecar: Sidecar) {
+        self.through = RwLock::new(self.resolve_through(&sidecar));
         self.sidecar = RwLock::new(sidecar);
+    }
+
+    fn through_models(&self) -> std::sync::RwLockReadGuard<'_, ThroughModels> {
+        self.through.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Resolve each component's joined `through` field to its pins (issue
+    /// #47). A pair naming a pin the part does not have is skipped with a
+    /// warning; so is any model on a 2-pin passive, which a walk always
+    /// crosses anyway.
+    fn resolve_through(&self, sidecar: &Sidecar) -> ThroughModels {
+        let mut out = ThroughModels::default();
+        for comp in &self.components {
+            let Some(joined) = sidecar.join(&Self::sidecar_keys(comp)) else { continue };
+            let mut warn = |w: String| out.warnings.entry(comp.id.0).or_default().push(w);
+            let declared = match crate::sidecar::through_pairs(&joined.entry) {
+                Ok(Some(d)) if !d.is_empty() => d,
+                Ok(_) => continue,
+                // Checked when the file was read, so not expected.
+                Err(e) => {
+                    warn(e);
+                    continue;
+                }
+            };
+            if is_passive_passthrough(&Self::refdes_class(&comp.refdes), comp.pins.len()) {
+                warn("\"through\" ignored: a 2-pin passive is always crossed".to_string());
+                continue;
+            }
+            let pin = |num: &str| self.pin_map.get(&format!("{}:{}", comp.refdes, num));
+            let mut pairs = Vec::new();
+            for (i, d) in declared.into_iter().enumerate() {
+                let label = d.name.clone().unwrap_or_else(|| format!("#{i}"));
+                let (Some(a), Some(b)) = (pin(&d.pins[0]), pin(&d.pins[1])) else {
+                    let missing: Vec<&str> =
+                        d.pins.iter().filter(|p| pin(p).is_none()).map(String::as_str).collect();
+                    warn(format!(
+                        "through pair {label} skipped: no pin {} on {}",
+                        missing.join(", "), comp.refdes
+                    ));
+                    continue;
+                };
+                if let Some(g) = &d.gate {
+                    if pin(g).is_none() {
+                        warn(format!("through pair {label}: gate pin {g} is not on {}", comp.refdes));
+                    }
+                }
+                pairs.push(ResolvedPair {
+                    name: d.name,
+                    pins: [PinId(a.0), PinId(b.0)],
+                    gate: d.gate.map(|g| format!("{}:{}", comp.refdes, g)),
+                });
+            }
+            if !pairs.is_empty() {
+                out.pairs.insert(comp.id.0, pairs);
+            }
+        }
+        out
     }
 
     /// The sidecar for reading. A writer that panicked left the old,
@@ -88,7 +190,9 @@ impl Design {
         let reloaded = self.sidecar().reload();
         let reload_error = match reloaded {
             Ok(fresh) => {
+                let through = self.resolve_through(&fresh);
                 *self.sidecar.write().unwrap_or_else(PoisonError::into_inner) = fresh;
+                *self.through.write().unwrap_or_else(PoisonError::into_inner) = through;
                 None
             }
             Err(e) => Some(format!("{e:#}")),
@@ -187,6 +291,7 @@ impl Design {
             exclude_from_bom: comp.exclude_from_bom,
             properties: comp.properties.clone(),
             sidecar: self.sidecar().join(&Self::sidecar_keys(comp)),
+            through_warnings: self.through_models().warnings.get(&comp.id.0).cloned().unwrap_or_default(),
             pin_count,
             offset,
             limit,
@@ -1210,16 +1315,28 @@ impl Design {
 
     /// Map a via chain of passthrough components to the compact {refdes,value,class}
     /// rows the walk envelope reports.
-    fn via_parts(&self, via: &[CompId]) -> Vec<ViaPart> {
+    fn via_parts(&self, via: &[Hop], through: &ThroughModels) -> Vec<ViaPart> {
         via.iter()
-            .map(|c| {
-                let comp = self.component(c);
-                ViaPart {
+            .map(|hop| {
+                let comp = self.component(&CompId(hop.comp));
+                let mut part = ViaPart {
                     refdes: comp.refdes.clone(),
                     value: comp.value.clone(),
                     class: Self::refdes_class(&comp.refdes),
                     dnp: comp.dnp,
+                    ..Default::default()
+                };
+                if let Some(cross) = hop.cross {
+                    let pair = &through.pairs[&hop.comp][cross.pair];
+                    let [a, b] = &pair.pins;
+                    let (from, to) = if cross.against { (b, a) } else { (a, b) };
+                    part.pins = Some([self.pin_name(from), self.pin_name(to)]);
+                    part.pair = pair.name.clone();
+                    part.against = cross.against;
+                    part.conditional = pair.gate.is_some();
+                    part.gate = pair.gate.clone();
                 }
+                part
             })
             .collect()
     }
@@ -1298,13 +1415,15 @@ impl Design {
 
         let topology = include_topology.then(|| {
             let order = self.walk_part_order(&data.topo, &data.endpoints, start_comp.as_ref());
-            self.build_topology(
+            let mut t = self.build_topology(
                 &data.topo.nets,
                 order,
                 &[start_net_id.0],
                 // At least 1, so the start part is always kept.
                 max_topology_parts.max(1) as usize,
-            )
+            );
+            t.through_not_drawn = self.through_not_drawn(&data.topo);
+            t
         });
 
         let envelope = WalkEnvelope {
@@ -1343,8 +1462,18 @@ impl Design {
         let start_net_idx = start_net.0;
         let start_comp_idx = start_comp.map(|c| c.0);
 
+        let through = self.through_models();
+        let through = &*through;
         let mut visited_nets: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut visited_comps: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // (part, pair) crossed so far: `PASSIVE_PAIR` for a 2-pin passive, the
+        // pair index for a through-model part, so crossing one channel of a
+        // quad op-amp leaves the other three open (issue #47).
+        let mut visited_comps: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
+        // The far pins of crossed through pairs: on their net they are where
+        // the walk came out, not endpoints, and not crossed again.
+        let mut crossed_pins: HashSet<usize> = HashSet::new();
+        let mut crossed: Vec<CrossedPin> = Vec::new();
         let mut endpoint_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut dead_end_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1355,7 +1484,7 @@ impl Design {
         let mut truncated = false;
         let mut topo = TopoTrace::new(record_topology);
 
-        let mut queue: std::collections::VecDeque<(usize, Vec<CompId>, u32)> =
+        let mut queue: std::collections::VecDeque<(usize, Vec<Hop>, u32)> =
             std::collections::VecDeque::new();
         queue.push_back((start_net_idx, Vec::new(), 0));
 
@@ -1366,6 +1495,9 @@ impl Design {
         let mut rail_scores: HashMap<usize, f32> = HashMap::new();
 
         while let Some((net_idx, via, depth)) = queue.pop_front() {
+            // The topology graph stops at a through-model part: nothing past
+            // one is recorded for it (drawing it is a follow-up to #47).
+            let drawn = via.iter().all(|h| h.cross.is_none());
             if !visited_nets.insert(net_idx) {
                 if let Some(&score) = rail_scores.get(&net_idx) {
                     // A repeat arrival. Each part is traversed once, so the
@@ -1379,7 +1511,7 @@ impl Design {
                         rails_reached.push(RailReached {
                             net: self.net(&NetId(net_idx)).name.clone(),
                             score,
-                            via: self.via_parts(&via),
+                            via: self.via_parts(&via, through),
                         });
                     }
                 }
@@ -1393,23 +1525,27 @@ impl Design {
                 if stop_at_power {
                     let (score, _evidence) = self.rail_score(net);
                     if score >= RAIL_THRESHOLD {
-                        topo.note_net(net_idx, NetState::Rail);
+                        if drawn {
+                            topo.note_net(net_idx, NetState::Rail);
+                        }
                         let score = (score * 100.0).round() / 100.0;
                         rail_scores.insert(net_idx, score);
                         rails_reached.push(RailReached {
                             net: net.name.clone(),
                             score,
-                            via: self.via_parts(&via),
+                            via: self.via_parts(&via, through),
                         });
                         continue;
                     }
                 }
                 if net.pins.len() > 40 {
-                    topo.note_net(net_idx, NetState::LargeNet);
+                    if drawn {
+                        topo.note_net(net_idx, NetState::LargeNet);
+                    }
                     large_nets.push(LargeNet {
                         net: net.name.clone(),
                         fanout: net.pins.len(),
-                        via: self.via_parts(&via),
+                        via: self.via_parts(&via, through),
                     });
                     continue;
                 }
@@ -1440,6 +1576,7 @@ impl Design {
                                 value: comp.value.clone(),
                                 class,
                                 dnp: comp.dnp,
+                                ..Default::default()
                             });
                         }
                     }
@@ -1456,13 +1593,15 @@ impl Design {
                     dead_ends.push(DeadEnd {
                         net: Some(net.name.clone()),
                         fanout: net.pins.len(),
-                        via: self.via_parts(&via),
+                        via: self.via_parts(&via, through),
                         parts: inert_parts,
                         reason: reason.to_string(),
                     });
                 }
             }
-            topo.note_net(net_idx, NetState::Expanded);
+            if drawn {
+                topo.note_net(net_idx, NetState::Expanded);
+            }
 
             for pin_id in &net.pins {
                 let pin = self.pin(pin_id);
@@ -1472,8 +1611,8 @@ impl Design {
                 if via.is_empty() && Some(comp_id.0) == start_comp_idx {
                     continue;
                 }
-                // Already-traversed passthrough — avoid bouncing back.
-                if visited_comps.contains(&comp_id.0) {
+                // Where the walk came out of a through-model pair.
+                if crossed_pins.contains(&pin_id.0) {
                     continue;
                 }
 
@@ -1481,30 +1620,69 @@ impl Design {
                 let class = Self::refdes_class(&comp.refdes);
                 let is_passthrough = is_passive_passthrough(&class, comp.pins.len());
 
+                // The ways across this part from `pin_id`: (far pin, hop).
+                let mut crossings: Vec<(Option<&PinId>, Hop)> = Vec::new();
                 if is_passthrough {
+                    // Already-traversed passthrough — avoid bouncing back.
+                    if !visited_comps.insert((comp_id.0, PASSIVE_PAIR)) {
+                        continue;
+                    }
                     // The OTHER pin on this 2-pin component (not the one we
                     // arrived on).
-                    let other_pin_id = comp.pins.iter().find(|p| p.0 != pin_id.0);
+                    crossings.push((
+                        comp.pins.iter().find(|p| p.0 != pin_id.0),
+                        Hop { comp: comp_id.0, cross: None },
+                    ));
+                } else if let Some(pairs) = through.pairs.get(&comp_id.0) {
+                    // Every declared pair this pin is on, either way round
+                    // (issue #47). Each pair is crossed once per walk.
+                    for (i, pair) in pairs.iter().enumerate() {
+                        let against = match pair.pins.iter().position(|p| p.0 == pin_id.0) {
+                            Some(side) => side == 1,
+                            None => continue,
+                        };
+                        if !visited_comps.insert((comp_id.0, i)) {
+                            continue;
+                        }
+                        let far = &pair.pins[if against { 0 } else { 1 }];
+                        crossed_pins.insert(far.0);
+                        crossings.push((
+                            Some(far),
+                            Hop { comp: comp_id.0, cross: Some(Cross { pair: i, against }) },
+                        ));
+                    }
+                }
+
+                for (other_pin_id, hop) in crossings {
                     let other_pin_has_no_net = other_pin_id
                         .map(|p| self.pin(p).net.is_none())
                         .unwrap_or(false);
                     let other_net_idx: Option<usize> = other_pin_id
                         .and_then(|p| self.pin(p).net.as_ref().map(|n| n.0))
                         .filter(|n| *n != net_idx);
-
-                    visited_comps.insert(comp_id.0);
-                    topo.note_series(comp_id.0, depth);
+                    // The graph is drawn up to a through-model part, which is
+                    // named in the topology's `through_not_drawn`.
+                    let next_drawn = drawn && hop.cross.is_none();
+                    if drawn {
+                        match hop.cross {
+                            None => topo.note_series(comp_id.0, depth),
+                            Some(_) => topo.note_through(comp_id.0),
+                        }
+                    }
+                    let mut via_here = via.clone();
+                    via_here.push(hop);
 
                     if other_pin_has_no_net {
                         // Far pin is NC -> dangling, goes nowhere.
-                        let mut via_here = via.clone();
-                        via_here.push(CompId(comp_id.0));
-                        let key = format!("nc:{}", comp.refdes);
+                        let key = match other_pin_id {
+                            Some(p) => format!("nc:{}", self.pin_name(p)),
+                            None => format!("nc:{}", comp.refdes),
+                        };
                         if dead_end_seen.insert(key) && dead_ends.len() < max_endpoints as usize {
                             dead_ends.push(DeadEnd {
                                 net: None,
                                 fanout: 0,
-                                via: self.via_parts(&via_here),
+                                via: self.via_parts(&via_here, through),
                                 parts: Vec::new(),
                                 reason: "dangling (goes nowhere)".to_string(),
                             });
@@ -1516,20 +1694,32 @@ impl Design {
                         // nothing further to traverse.
                         continue;
                     };
+                    // A through pair's far pin is no endpoint; record how it
+                    // was reached, for `path_between` (issue #47).
+                    let mut record_crossed = |dist: u32| {
+                        if let (Some(_), Some(p)) = (hop.cross, other_pin_id) {
+                            crossed.push(CrossedPin {
+                                pin: self.pin_name(p),
+                                via: self.via_parts(&via_here, through),
+                                distance: dist,
+                            });
+                        }
+                    };
                     let other_net = self.net(&NetId(other_net_idx));
                     if other_net.pins.len() == 1 {
                         // Far pin's net has fanout 1 (only that pin) ->
                         // dangling, goes nowhere.
-                        topo.note_net(other_net_idx, NetState::Dangling);
-                        let mut via_here = via.clone();
-                        via_here.push(CompId(comp_id.0));
+                        record_crossed(depth + 1);
+                        if next_drawn {
+                            topo.note_net(other_net_idx, NetState::Dangling);
+                        }
                         if dead_end_seen.insert(other_net.name.clone())
                             && dead_ends.len() < max_endpoints as usize
                         {
                             dead_ends.push(DeadEnd {
                                 net: Some(other_net.name.clone()),
                                 fanout: 1,
-                                via: self.via_parts(&via_here),
+                                via: self.via_parts(&via_here, through),
                                 parts: Vec::new(),
                                 reason: "dangling (goes nowhere)".to_string(),
                             });
@@ -1537,16 +1727,20 @@ impl Design {
                         continue;
                     }
                     if depth < max_depth {
-                        let mut next_via = via.clone();
-                        next_via.push(CompId(comp_id.0));
-                        queue.push_back((other_net_idx, next_via, depth + 1));
+                        record_crossed(depth + 1);
+                        queue.push_back((other_net_idx, via_here, depth + 1));
                     } else {
                         // Depth-limited branch.
-                        topo.note_net(other_net_idx, NetState::DepthLimit);
+                        if next_drawn {
+                            topo.note_net(other_net_idx, NetState::DepthLimit);
+                        }
                         truncated = true;
                     }
-                } else {
-                    // Endpoint. Never report the start component.
+                }
+
+                if !is_passthrough {
+                    // Endpoint. A through-model part is one too, on the pin
+                    // the walk arrived on. Never report the start component.
                     if Some(comp_id.0) == start_comp_idx {
                         continue;
                     }
@@ -1558,7 +1752,9 @@ impl Design {
                         truncated = true;
                         // Still a graph candidate (issue #35): only
                         // `max_topology_parts` limits the graph.
-                        topo.note_dropped_endpoint(comp_id.0, depth);
+                        if drawn {
+                            topo.note_dropped_endpoint(comp_id.0, depth);
+                        }
                         continue;
                     }
                     endpoints.push(WalkEndpoint {
@@ -1573,16 +1769,18 @@ impl Design {
                             dnp: comp.dnp,
                         },
                         kind: Self::endpoint_kind(&class),
-                        via: self.via_parts(&via),
+                        via: self.via_parts(&via, through),
                         distance: depth,
                         comp_idx: comp_id.0,
                         net_idx,
+                        drawn,
                     });
                 }
             }
         }
 
         WalkData {
+            crossed,
             endpoints,
             rails_reached,
             large_nets,
@@ -1614,7 +1812,11 @@ impl Design {
         // Endpoint parts `max_endpoints` dropped from the list are still in
         // the graph (issue #35). Listed and dropped sort together by distance
         // and natural refdes, so the graph does not depend on that cap.
-        let mut ends: Vec<(usize, u32)> = endpoints.iter().map(|e| (e.comp_idx, e.distance)).collect();
+        let mut ends: Vec<(usize, u32)> = endpoints
+            .iter()
+            .filter(|e| e.drawn)
+            .map(|e| (e.comp_idx, e.distance))
+            .collect();
         ends.extend(topo.dropped_endpoints.iter().copied());
         // The part index breaks `pin_sort_key` ties (R1 vs R01), so listed
         // parts do not sort ahead of dropped ones.
@@ -1763,12 +1965,14 @@ impl Design {
             omitted_nets,
             nets,
             parts,
+            through_not_drawn: Vec::new(),
         }
     }
 
     /// Report whether two pins are connected through the signal/passthrough
-    /// graph (same semantics as `walk`: through 2-pin series R/L/FB/C, never
-    /// through ICs, never across power rails) and, if so, the series parts on
+    /// graph (same semantics as `walk`: through 2-pin series R/L/FB/C and
+    /// declared through-model pairs (issue #47), through no other IC, never
+    /// across power rails) and, if so, the series parts on
     /// the path. Reuses `walk_bfs` from `from`'s net/component, then looks for
     /// `to` among the reached endpoints (or, failing that, among the rails
     /// reached, in case the only route is a shared power/ground net).
@@ -1871,7 +2075,22 @@ impl Design {
                 to,
                 true,
                 Some(ep.distance),
-                Self::clone_via(&ep.via),
+                ep.via.to_vec(),
+                None,
+                None,
+                topology(to_net),
+            );
+        }
+        // `to` is the far pin of a through-model pair the walk crossed (an
+        // op-amp output): reached, though not an endpoint (issue #47).
+        if let Some(c) = data.crossed.iter().find(|c| c.pin == to_canonical) {
+            let to_net = to_pin.net.as_ref().expect("a crossed pin has a net").0;
+            return Self::path_between_envelope(
+                from,
+                to,
+                true,
+                Some(c.distance),
+                c.via.to_vec(),
                 None,
                 None,
                 topology(to_net),
@@ -1888,7 +2107,7 @@ impl Design {
                     to,
                     true,
                     Some(rail.via.len() as u32),
-                    Self::clone_via(&rail.via),
+                    rail.via.to_vec(),
                     Some(format!(
                         "only via rail {} (shared power/ground, not a signal path)",
                         rail.net
@@ -1982,7 +2201,7 @@ impl Design {
             .endpoints
             .iter()
             .filter(|e| e.comp_idx != from_comp && e.comp_idx != to_comp)
-            .filter(|e| kept_nets.contains(&e.net_idx))
+            .filter(|e| e.drawn && kept_nets.contains(&e.net_idx))
             .map(|e| (e.comp_idx, e.distance))
             .collect();
         others.sort_by_cached_key(|&(c, d)| {
@@ -1997,17 +2216,19 @@ impl Design {
             .collect();
         let nets: Vec<(usize, NetState)> =
             topo.nets.iter().copied().filter(|(n, _)| kept_nets.contains(n)).collect();
-        self.build_topology(&nets, order, &[from_net, to_net], max_parts)
+        let mut out = self.build_topology(&nets, order, &[from_net, to_net], max_parts);
+        out.through_not_drawn = self.through_not_drawn(topo);
+        out
     }
 
-    fn clone_via(via: &[ViaPart]) -> Vec<ViaPart> {
-        via.iter()
-            .map(|v| ViaPart {
-                refdes: v.refdes.clone(),
-                value: v.value.clone(),
-                class: v.class.clone(),
-                dnp: v.dnp,
-            })
+    /// The through-model parts the graph stops at (issue #47), each once,
+    /// in BFS order.
+    fn through_not_drawn(&self, topo: &TopoTrace) -> Vec<String> {
+        let mut seen = HashSet::new();
+        topo.through
+            .iter()
+            .filter(|c| seen.insert(**c))
+            .map(|c| self.component(&CompId(*c)).refdes.clone())
             .collect()
     }
 
@@ -2185,6 +2406,7 @@ impl Design {
             sheet_paths,
             sidecar: Default::default(),
             sidecar_write: Default::default(),
+            through: Default::default(),
         });
     }
 }
@@ -2390,6 +2612,11 @@ struct ComponentDetail {
     /// The joined sidecar entry (issue #46), or null when no entry matches.
     /// Always emitted.
     sidecar: Option<Joined>,
+    /// Problems with the joined `through` field (issue #47): a pair naming a
+    /// pin this part does not have (that pair is not crossed), a gate pin
+    /// that is missing, or a model on a 2-pin passive. Left out when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    through_warnings: Vec<String>,
     pin_count: usize,
     offset: u32,
     limit: u32,
@@ -2761,6 +2988,9 @@ struct FindEnvelope {
 /// Internal result of the `walk_bfs` traversal core, before the endpoints are
 /// sorted and wrapped in the public envelope.
 struct WalkData {
+    /// The far pins of through-model pairs the walk crossed (issue #47).
+    /// They are not endpoints, but `path_between` can end on one.
+    crossed: Vec<CrossedPin>,
     endpoints: Vec<WalkEndpoint>,
     rails_reached: Vec<RailReached>,
     large_nets: Vec<LargeNet>,
@@ -2773,6 +3003,13 @@ struct WalkData {
     reached_net_count: usize,
     /// What `build_topology` needs, recorded during the BFS.
     topo: TopoTrace,
+}
+
+/// The far pin of a crossed through-model pair, and how it was reached.
+struct CrossedPin {
+    pin: String,
+    via: Vec<ViaPart>,
+    distance: u32,
 }
 
 /// How a net in the walk topology was handled by the BFS.
@@ -2825,9 +3062,18 @@ struct TopoTrace {
     /// (endpoint part, depth) for endpoint pins past `max_endpoints`, in
     /// BFS order. A part can appear more than once.
     dropped_endpoints: Vec<(usize, u32)>,
+    /// Through-model parts crossed from a drawn net (issue #47), in BFS
+    /// order. The graph stops at them; a part can appear more than once.
+    through: Vec<usize>,
 }
 
 impl TopoTrace {
+    fn note_through(&mut self, comp_idx: usize) {
+        if self.record {
+            self.through.push(comp_idx);
+        }
+    }
+
     fn new(record: bool) -> Self {
         TopoTrace { record, ..Default::default() }
     }
@@ -3048,6 +3294,11 @@ struct Topology {
     omitted_nets: usize,
     nets: Vec<TopoNet>,
     parts: Vec<TopoPart>,
+    /// Through-model parts the walk crossed (issue #47). The graph does not
+    /// draw them as edges yet: it stops at each one, and nothing past it is
+    /// listed. Left out when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    through_not_drawn: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3100,7 +3351,7 @@ struct TopoPin {
 }
 
 /// One series part traversed on the way to an endpoint or terminal net.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 struct ViaPart {
     refdes: String,
     value: String,
@@ -3108,6 +3359,28 @@ struct ViaPart {
     /// Do Not Populate. A DNP series part means this hop does **not** exist on
     /// the built board — the path is schematic topology only.
     dnp: bool,
+    /// Through-model hops only (issue #47): the two pins crossed, as
+    /// "REFDES:PIN", in the order the walk crossed them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pins: Option<[String; 2]>,
+    /// The pair's declared name (an op-amp channel, a choke winding).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pair: Option<String>,
+    /// True when the walk crossed the pair from its second declared pin to
+    /// its first: against the declared signal direction.
+    #[serde(skip_serializing_if = "is_false")]
+    against: bool,
+    /// True for a pair with a `gate`: the path exists only while the gate
+    /// turns it on (a MOSFET source-drain). Not a plain wire.
+    #[serde(skip_serializing_if = "is_false")]
+    conditional: bool,
+    /// The pin that controls a conditional pair, "REFDES:PIN".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gate: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The owning component of a reached endpoint pin (compact identity only).
@@ -3141,6 +3414,10 @@ struct WalkEndpoint {
     /// The net the endpoint pin sits on, for `path_topology`. Not serialized.
     #[serde(skip)]
     net_idx: usize,
+    /// False when reached past a through-model part, which the topology
+    /// graph does not draw yet (issue #47). Not serialized.
+    #[serde(skip)]
+    drawn: bool,
 }
 
 /// A branch that fizzled out instead of reaching a real endpoint: reached
@@ -4716,6 +4993,7 @@ mod subsystem_filter_seam_tests {
             sheet_paths,
             sidecar: Default::default(),
             sidecar_write: Default::default(),
+            through: Default::default(),
         }
     }
 
@@ -5800,6 +6078,7 @@ mod filter_nets_rail_tests {
             sheet_paths: HashSet::new(),
             sidecar: Default::default(),
             sidecar_write: Default::default(),
+            through: Default::default(),
         };
 
         for (code, (name, members)) in nets.iter().enumerate() {
@@ -6051,7 +6330,10 @@ mod component_detail_tests {
     fn get_component_joins_sidecar_in_precedence_order() {
         let v = component(&fixture_with_sidecar(), "U3");
         let sc = &v["sidecar"];
-        assert_eq!(sc["entry"], serde_json::json!({
+        let mut entry = sc["entry"].clone();
+        // The through-model (#47) is checked in `through_tests`.
+        assert!(entry.as_object_mut().unwrap().remove("through").is_some());
+        assert_eq!(entry, serde_json::json!({
             "channels": 4, "family": "TLV900x", "note": "from refdes"
         }));
         let scopes: Vec<&str> = sc["sources"].as_array().unwrap().iter()
@@ -6089,7 +6371,7 @@ mod component_detail_tests {
         assert_eq!(sc["probed"][0]["found"], true);
         assert!(sc["probed"][0]["path"].as_str().unwrap().ends_with("tests/fixture.sidecar.json"));
         let f = &sc["files"][0];
-        assert_eq!(f["entries"], serde_json::json!({"lib_id": 1, "mpn": 4, "refdes": 1}));
+        assert_eq!(f["entries"], serde_json::json!({"lib_id": 1, "mpn": 5, "refdes": 1}));
         assert_eq!(f["unmatched"], serde_json::json!(["mpn.2N7002", "mpn.NOT-IN-DESIGN"]));
     }
 
@@ -6142,6 +6424,172 @@ mod component_detail_tests {
         };
         let err = design.write_sidecar(&edit).unwrap_err();
         assert!(format!("{err:#}").contains("no shared library is set"), "{err:#}");
+    }
+}
+
+/// Issue #47: `walk` and `path_between` cross the through-models the
+/// sidecar declares. The fixture's sidecar models U3 (quad op-amp), Q1
+/// (gate-controlled) and L2 (common-mode choke, issue #44).
+#[cfg(test)]
+mod through_tests {
+    use super::walk_topology_tests::fixture;
+    use serde_json::{json, Value};
+
+    fn with_sidecar() -> super::Design {
+        let mut design = fixture();
+        let net = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.net");
+        design.attach_sidecar(crate::sidecar::Sidecar::load(&net, None).expect("sidecar loads"));
+        design
+    }
+
+    fn path(design: &super::Design, from: &str, to: &str) -> Value {
+        serde_json::from_str(&design.path_between(from, to, false, 50).expect("path")).unwrap()
+    }
+
+    fn walk(design: &super::Design, start: &str, topology: bool) -> Value {
+        serde_json::from_str(&design.walk(start, 6, 50, true, topology, 200).expect("walk")).unwrap()
+    }
+
+    fn via_refdes(v: &Value) -> Vec<&str> {
+        v.as_array().unwrap().iter().map(|p| p["refdes"].as_str().unwrap()).collect()
+    }
+
+    // #44's failure: the choke stops path_between without a through-model,
+    // and is crossed with one; the via names the winding's pins.
+    #[test]
+    fn choke_is_crossed_only_with_a_through_model() {
+        let v = path(&fixture(), "U4:7", "J5:1");
+        assert_eq!(v["connected"], false, "{v}");
+
+        let v = path(&with_sidecar(), "U4:7", "J5:1");
+        assert_eq!(v["connected"], true, "{v}");
+        assert_eq!(v["distance"], 1);
+        assert_eq!(v["via"], json!([{
+            "refdes": "L2", "value": "CMC-FIXTURE", "class": "L", "dnp": false,
+            "pins": ["L2:1", "L2:2"], "pair": "1"
+        }]));
+    }
+
+    // A pair is crossed either way; against its declared direction it says so.
+    #[test]
+    fn pair_crossed_backwards_is_marked_against() {
+        let v = path(&with_sidecar(), "J5:2", "U4:6");
+        assert_eq!(v["connected"], true, "{v}");
+        let hop = &v["via"][0];
+        assert_eq!(hop["pins"], json!(["L2:3", "L2:4"]));
+        assert_eq!(hop["pair"], "2");
+        assert_eq!(hop["against"], true);
+    }
+
+    // Crossing channel B of U3 must not block channel C: the chain
+    // J4 -> U3.B -> R60 -> U3.C -> TP60 is one path.
+    #[test]
+    fn two_channels_of_one_part_on_one_path() {
+        let v = path(&with_sidecar(), "J4:1", "TP60:1");
+        assert_eq!(v["connected"], true, "{v}");
+        assert_eq!(v["distance"], 3);
+        assert_eq!(via_refdes(&v["via"]), ["U3", "R60", "U3"]);
+        assert_eq!(v["via"][0]["pins"], json!(["U3:5", "U3:7"]));
+        assert_eq!(v["via"][2]["pins"], json!(["U3:10", "U3:8"]));
+        // A passive hop carries no pair fields.
+        assert!(v["via"][1].get("pins").is_none(), "{v}");
+    }
+
+    // path_between can end on the far pin of a crossed pair, which walk does
+    // not list as an endpoint.
+    #[test]
+    fn path_ends_on_a_crossed_far_pin() {
+        let v = path(&with_sidecar(), "J4:1", "U3:7");
+        assert_eq!(v["connected"], true, "{v}");
+        assert_eq!(v["distance"], 1);
+        assert_eq!(v["via"][0]["pins"], json!(["U3:5", "U3:7"]));
+    }
+
+    // The input pin of a through part is still an endpoint; the far pins
+    // are not.
+    #[test]
+    fn walk_reports_entry_pins_not_far_pins() {
+        let v = walk(&with_sidecar(), "/BUFIN", false);
+        let pins: Vec<&str> = v["endpoints"].as_array().unwrap().iter()
+            .map(|e| e["pin"].as_str().unwrap()).collect();
+        assert_eq!(pins, ["J4:1", "U3:5", "U3:10", "TP60:1"], "{v}");
+    }
+
+    // A gate-controlled pair is conditional, with its gate named.
+    #[test]
+    fn mosfet_hop_is_conditional() {
+        let v = walk(&with_sidecar(), "EN", false);
+        let gnd = v["rails_reached"].as_array().unwrap().iter()
+            .find(|r| r["net"] == "GND" && r["via"][0]["refdes"] == "Q1")
+            .unwrap_or_else(|| panic!("GND via Q1: {v}"));
+        let hop = &gnd["via"][0];
+        assert_eq!(hop["pins"], json!(["Q1:3", "Q1:2"]));
+        assert_eq!(hop["conditional"], true);
+        assert_eq!(hop["gate"], "Q1:1");
+    }
+
+    // The topology stops at a through part and names it; nothing past it is
+    // drawn yet.
+    #[test]
+    fn topology_stops_at_through_part() {
+        let v = walk(&with_sidecar(), "/BUFIN", true);
+        let t = &v["topology"];
+        assert_eq!(t["through_not_drawn"], json!(["U3"]), "{t}");
+        let parts: Vec<&str> = t["parts"].as_array().unwrap().iter()
+            .map(|p| p["refdes"].as_str().unwrap()).collect();
+        assert!(!parts.contains(&"R60") && !parts.contains(&"TP60"), "{parts:?}");
+        // No through-model: the key is left out.
+        let v = walk(&fixture(), "/BUFIN", true);
+        assert!(v["topology"].get("through_not_drawn").is_none());
+    }
+
+    // A pair naming a pin the part does not have is skipped, and
+    // get_component says why. U3 has no pin 3 in the fixture.
+    #[test]
+    fn missing_pin_is_a_warning() {
+        let v: Value = serde_json::from_str(&with_sidecar().comp_details("U3", 10, 0).unwrap()).unwrap();
+        assert_eq!(v["through_warnings"], json!(["through pair A skipped: no pin 3 on U3"]));
+        let v: Value = serde_json::from_str(&with_sidecar().comp_details("L2", 10, 0).unwrap()).unwrap();
+        assert!(v.get("through_warnings").is_none(), "{v}");
+    }
+
+    // A refdes entry's `through` replaces the MPN one whole; an empty list
+    // turns the model off. A model on a 2-pin passive is ignored.
+    #[test]
+    fn refdes_override_and_passive_model() {
+        let mut design = fixture();
+        let file = crate::sidecar::SidecarFile::parse(&json!({
+            "mpn": {"CMC-FIXTURE": {"through": [{"pins": ["1", "2"]}]},
+                    "1k": {"through": [{"pins": ["1", "2"]}]}},
+            "refdes": {"L2": {"through": []}}
+        }).to_string(), "t.json", crate::sidecar::Origin::Project).unwrap();
+        design.attach_sidecar(crate::sidecar::Sidecar::from_files(vec![file], vec![]));
+        assert_eq!(path(&design, "U4:7", "J5:1")["connected"], false);
+        let v: Value = serde_json::from_str(&design.comp_details("R60", 10, 0).unwrap()).unwrap();
+        assert_eq!(v["through_warnings"][0], "\"through\" ignored: a 2-pin passive is always crossed");
+    }
+
+    // write_sidecar rebuilds the through-models: a choke model written at
+    // run time is crossed by the next path_between.
+    #[test]
+    fn write_sidecar_updates_traversal() {
+        let dir = std::env::temp_dir().join(format!("design-through-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut design = fixture();
+        design.attach_sidecar(crate::sidecar::Sidecar::load(&dir.join("fixture.net"), None).unwrap());
+        assert_eq!(path(&design, "U4:7", "J5:1")["connected"], false);
+        let f = json!({"through": [{"pins": ["1", "2"]}]});
+        let edit = crate::sidecar::Edit {
+            origin: crate::sidecar::Origin::Project,
+            scope: crate::sidecar::Scope::Refdes,
+            key: "L2",
+            fields: f.as_object().unwrap(),
+            delete: false,
+        };
+        design.write_sidecar(&edit).expect("writes");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(path(&design, "U4:7", "J5:1")["connected"], true);
     }
 }
 

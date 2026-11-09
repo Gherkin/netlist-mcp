@@ -441,7 +441,14 @@ impl NetlistServer {
         schematic but not on the built board. include_topology adds a \
         net/part graph, capped at max_topology_parts (default 200) and not by \
         max_endpoints; check topology.truncated. A net whose state is not \
-        expanded was not walked past, so parts beyond it are not listed.")]
+        expanded was not walked past, so parts beyond it are not listed. \
+        A part with a sidecar through-model (`through` pin pairs, e.g. an \
+        op-amp channel or a choke winding) is crossed too, either way: its \
+        `via` entry names the `pins` crossed and the `pair`, `against` when \
+        crossed second pin to first, and `conditional` with its `gate` for a \
+        gate-controlled pair (not a plain wire). Its entry pin is still an \
+        endpoint; the pin the walk comes out on is not. The topology graph \
+        stops at such a part and lists it in through_not_drawn.")]
     fn walk(&self, Parameters(p): Parameters<WalkParams>) -> String {
         let max_depth = p.max_depth.unwrap_or(4);
         let max_endpoints = p.max_endpoints.unwrap_or(50);
@@ -494,7 +501,9 @@ impl NetlistServer {
         a DNP part is not connected on the built board). Expensive; prefer walk \
         for open-ended tracing. include_topology adds the from→to subgraph \
         with the pin and net on each side of every part, including parallel \
-        routes and shunts to a rail; check topology.truncated.")]
+        routes and shunts to a rail; check topology.truncated. Crosses \
+        sidecar through-models as walk does; check `conditional` on each \
+        via entry.")]
     fn path_between(&self, Parameters(p): Parameters<PathBetweenParams>) -> String {
         match self.design.path_between(
             &p.from,
@@ -619,7 +628,10 @@ TRACE (connectivity — the point of this server):
 - walk: THE tool for \"what is actually connected to this pin?\". From a pin or \
   net it passes THROUGH series parts (resistors, inductors, ferrites, caps) to \
   the real endpoints (ICs, connectors), and stops at power/ground rails instead \
-  of enumerating them. Topological, not electrical.
+  of enumerating them. Topological, not electrical. It also crosses a part \
+  whose sidecar entry declares `through` pin pairs (an op-amp channel, a \
+  choke winding, a MOSFET's source-drain); the `via` entry names the pins \
+  crossed and marks a gate-controlled pair `conditional`.
 - draw_walk: the same walk, shown to the user as a drawn schematic. Listed \
   only to clients that support MCP Apps. Use it when a picture of the circuit \
   helps the user.
@@ -640,7 +652,10 @@ ENRICH (the one tool that writes):
 - write_sidecar: set or remove the facts the netlist lacks (through-models, \
   pin roles, notes) for a part kind (lib_id / mpn) or one refdes. It writes \
   a JSON sidecar file, never the netlist; get_component shows the result. \
-  Every other tool only reads.
+  Every other tool only reads. A through-model is the field `through`: a list \
+  of {\"pins\": [\"<in>\", \"<out>\"], \"name\"?: \"A\", \"gate\"?: \"<pin>\"}. \
+  walk and path_between use it at once; get_component's through_warnings \
+  lists pairs naming a pin the part does not have.
 
 DNP: every component identity carries a `dnp` boolean — get_component, \
 get_pin's owning component, filter/find rows, get_net members, neighbors (the \

@@ -142,7 +142,9 @@ struct WalkParams {
     /// Stop at power/ground rails instead of enumerating them (default true).
     #[serde(default)]
     stop_at_power: Option<bool>,
-    /// Return full branch topology rather than just endpoint paths (default false).
+    /// Also return a `topology` graph (default false): the nets reached as
+    /// nodes, and the parts as edges with the pin number and net on each side.
+    /// Use it to draw or reason about the circuit shape (shunts, branches).
     #[serde(default)]
     include_topology: Option<bool>,
 }

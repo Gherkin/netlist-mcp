@@ -29,7 +29,7 @@ fn load_design() -> anyhow::Result<Design> {
 
 use rmcp::{tool, tool_router, tool_handler, ErrorData, RoleServer, ServerHandler, ServiceExt,
            handler::server::wrapper::Parameters, service::RequestContext, transport::stdio,
-           model::{ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams,
+           model::{ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
                    ReadResourceResult, ServerInfo, ServerCapabilities}};
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -506,6 +506,21 @@ impl ServerHandler for NetlistServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_instructions(SERVER_INSTRUCTIONS)
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let supports_ui = context
+            .peer
+            .peer_info()
+            .is_some_and(|info| ui::client_supports_ui(&info.capabilities));
+        Ok(ListToolsResult::with_all_items(ui::visible_tools(
+            Self::tool_router().list_all(),
+            supports_ui,
+        )))
     }
 
     async fn list_resources(

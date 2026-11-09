@@ -89,6 +89,8 @@
   svg .pnum { font-size: 9px; font-family: var(--nl-mono); }
   svg .pname { font-size: 10px; font-family: var(--nl-mono); }
   svg .netname { font-family: var(--nl-mono); font-weight: 600; }
+  /* A halo, so a supply name that crosses the next bus stays readable. */
+  svg .netname, svg .note { paint-order: stroke; stroke: var(--nl-bg); stroke-width: 3px; stroke-linejoin: round; }
   svg .note { font-size: 10px; }
   svg .start .busname, svg .start .ref, svg .startpin { fill: var(--nl-accent); }
   svg .start .box { stroke: var(--nl-accent); stroke-width: 2; }
@@ -348,9 +350,13 @@ function layout(data) {
     const lo = busEnds.length ? busEnds[0].col : 0;
     const hi = busEnds.length ? busEnds[busEnds.length - 1].col : 0;
     const rows = Math.max(busEnds.length, otherEnds.length, 1);
+    // A supply name or "not walked" right of the box runs across the next
+    // bus, so keep those rows free in the next gap too.
+    const labelsRight = !left && otherEnds.some((e) => e.kind === "open" || (e.kind === "rail" && !isGround(e.net)));
     items.push({
       type: "box", part, idx, busEnds, otherEnds, mirror: left,
-      from: left ? -1 : lo, gap: left ? -1 : hi, h: rows + 1,
+      from: left ? -1 : lo, gap: left ? -1 : hi, to: labelsRight ? Math.min(hi + 1, order.length - 1) : undefined,
+      h: rows + 1,
     });
   });
 
@@ -372,15 +378,16 @@ function layout(data) {
   const cur = (g) => cursor.get(g) || 0;
   for (const it of items) {
     let r = 0;
-    for (let g = it.from; g <= it.gap; g++) r = Math.max(r, cur(g));
-    for (let g = it.from; g <= it.gap; g++) cursor.set(g, r + it.h);
+    const to = it.to ?? it.gap;
+    for (let g = it.from; g <= to; g++) r = Math.max(r, cur(g));
+    for (let g = it.from; g <= to; g++) cursor.set(g, r + it.h);
     it.row = r;
   }
   const rowsUsed = Math.max(1, ...[...cursor.values()]);
   const hasLeft = items.some((it) => it.gap === -1);
-  // Room left of the first bus for its boxes and their outer rail labels.
-  // A mirrored box's rail names end at left - 191 and can be ~93px long.
-  const left = hasLeft ? 290 : 40;
+  // Room left of the first bus for its boxes. Labels that stick out past
+  // this are caught by measuring the drawing (see render).
+  const left = hasLeft ? 270 : 40;
   return { order, col, netByName, items, rowsUsed, left, startNet };
 }
 
@@ -540,7 +547,6 @@ function render(data) {
       line(g, x, y0, x + 34, y0);
       el("circle", { class: "sym", cx: x + 38, cy: y0, r: 4 }, g);
       text(g, x + 46, y0 + 4, partLabel(it.part), "ref");
-      maxX = Math.max(maxX, x + 110);
       addAttach(it.end.col, y0);
     } else if (it.type === "bank") {
       const g0 = it.gap;
@@ -609,8 +615,7 @@ function render(data) {
           text(g, otherSideX + out * 5, y + 4, pins.length + " pins", "pname", out < 0 ? "end" : "start");
         }
       });
-      // Room for a rail name after the pin stub: 14 mono chars at 11px.
-      maxX = Math.max(maxX, bx + BOXW + 120);
+      maxX = Math.max(maxX, bx + BOXW + 60);
     }
   }
 
@@ -636,11 +641,14 @@ function render(data) {
     ys.slice(0, -1).forEach((y) => el("circle", { class: "dot", cx: x, cy: y, r: 3 }, dots));
   });
 
-  const width = Math.max(maxX, L.left + 120) + PAD;
-  const height = TOP + L.rowsUsed * ROW + PAD;
-  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-  svg.setAttribute("width", width);
-  svg.setAttribute("height", height);
+  // The planned size, widened below to what was actually drawn.
+  const sizeTo = (x0, y0, x1, y1) => {
+    svg.setAttribute("viewBox", `${x0} ${y0} ${x1 - x0} ${y1 - y0}`);
+    svg.setAttribute("width", x1 - x0);
+    svg.setAttribute("height", y1 - y0);
+    return x1 - x0;
+  };
+  let width = sizeTo(0, 0, Math.max(maxX, L.left + 120) + PAD, TOP + L.rowsUsed * ROW + PAD);
   title(svg, "Walk topology from " + (data.start || ""));
 
   // Header and notes.
@@ -670,6 +678,15 @@ function render(data) {
   const canvas = document.getElementById("canvas");
   canvas.innerHTML = "";
   canvas.appendChild(svg);
+  // Text widths are only known once drawn: grow the box so no label at an
+  // edge is cut off. getBBox is all zeros when nothing is laid out; then
+  // the planned size stays.
+  const bb = svg.getBBox();
+  if (bb.width > 0) {
+    const [, , pw, ph] = svg.getAttribute("viewBox").split(" ").map(Number);
+    width = sizeTo(Math.min(0, bb.x - PAD), Math.min(0, bb.y - PAD),
+      Math.max(pw, bb.x + bb.width + PAD), Math.max(ph, bb.y + bb.height + PAD));
+  }
   // Fit to width unless that would shrink the text below about 60%; then
   // show actual size and let the canvas scroll sideways.
   setFit(width * 0.6 <= (canvas.clientWidth || width));

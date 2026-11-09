@@ -1180,6 +1180,7 @@ impl Design {
             max_depth,
             max_endpoints,
             stop_at_power,
+            include_topology,
         );
 
         // Order endpoints: distance asc, then natural refdes (R2 before R10),
@@ -1214,7 +1215,7 @@ impl Design {
         return Ok(serde_json::to_string_pretty(&envelope).context("error serializing walk")?);
     }
 
-    /// BFS traversal core shared by `walk` (and, later, `path_between`). Alternates
+    /// BFS traversal core shared by `walk` and `path_between`. Alternates
     /// net -> pins -> owning component -> (through a passthrough?) -> other net.
     /// Rails (`RAIL_THRESHOLD` when `stop_at_power`) and large nets (fanout > 40) are
     /// terminal. Cycles are cut by `visited_nets` / `visited_comps`.
@@ -1232,6 +1233,7 @@ impl Design {
         max_depth: u32,
         max_endpoints: u32,
         stop_at_power: bool,
+        record_topology: bool,
     ) -> WalkData {
         let start_net_idx = start_net.0;
         let start_comp_idx = start_comp.map(|c| c.0);
@@ -1246,7 +1248,7 @@ impl Design {
         let mut large_nets: Vec<LargeNet> = Vec::new();
         let mut dead_ends: Vec<DeadEnd> = Vec::new();
         let mut truncated = false;
-        let mut topo = TopoTrace::default();
+        let mut topo = TopoTrace::new(record_topology);
 
         let mut queue: std::collections::VecDeque<(usize, Vec<CompId>, u32)> =
             std::collections::VecDeque::new();
@@ -1362,7 +1364,7 @@ impl Design {
                         .filter(|n| *n != net_idx);
 
                     visited_comps.insert(comp_id.0);
-                    topo.series.push(comp_id.0);
+                    topo.note_series(comp_id.0);
 
                     if other_pin_has_no_net {
                         // Far pin is NC -> dangling, goes nowhere.
@@ -1441,6 +1443,7 @@ impl Design {
                         kind: Self::endpoint_kind(&class),
                         via: self.via_parts(&via),
                         distance: depth,
+                        comp_idx: comp_id.0,
                     });
                 }
             }
@@ -1461,8 +1464,8 @@ impl Design {
     /// the nodes the walk touched (expanded, or stopped at). Parts are the
     /// edges: the start part, every series part traversed (all its pins), and
     /// every reported endpoint part. Start and endpoint parts list only the
-    /// pins that sit on a node net, so a 100-pin IC shows the pins the walk
-    /// actually reached.
+    /// pins that sit on a node net (in any state, rail and depth_limit
+    /// included), so a 100-pin IC shows only its pins on nets in the graph.
     fn build_topology(
         &self,
         topo: &TopoTrace,
@@ -1522,9 +1525,7 @@ impl Design {
             push_part(*c, "series", true);
         }
         for e in endpoints {
-            if let Some(pin_id) = self.pin_map.get(&e.pin) {
-                push_part(self.pin(pin_id).comp.0, "endpoint", false);
-            }
+            push_part(e.comp_idx, "endpoint", false);
         }
 
         Topology { nets, parts }
@@ -1576,7 +1577,7 @@ impl Design {
 
         // max_endpoints is effectively unbounded here: we need to search the
         // whole reachable set for `to`, not stop at the first handful.
-        let data = self.walk_bfs(&from_net_id, Some(&from_comp), 6, 100_000, true);
+        let data = self.walk_bfs(&from_net_id, Some(&from_comp), 6, 100_000, true, false);
 
         if let Some(ep) = data.endpoints.iter().find(|e| e.pin == to_canonical) {
             return Self::path_between_envelope(
@@ -2411,18 +2412,43 @@ impl NetState {
 
 /// Nets (in first-seen order, with state) and series parts (in traversal
 /// order) recorded by `walk_bfs` for `build_topology`.
+/// When `record` is false (plain `walk`, `path_between`) every method is a
+/// no-op, so the default path pays nothing.
 #[derive(Debug, Default)]
 struct TopoTrace {
+    record: bool,
     nets: Vec<(usize, NetState)>,
+    /// net index -> position in `nets`.
+    net_pos: HashMap<usize, usize>,
     series: Vec<usize>,
 }
 
 impl TopoTrace {
+    fn new(record: bool) -> Self {
+        TopoTrace { record, ..Default::default() }
+    }
+
     fn note_net(&mut self, net_idx: usize, state: NetState) {
-        match self.nets.iter_mut().find(|(n, _)| *n == net_idx) {
-            None => self.nets.push((net_idx, state)),
-            Some((_, old)) if !old.popped() && state.popped() => *old = state,
-            Some(_) => {}
+        if !self.record {
+            return;
+        }
+        match self.net_pos.get(&net_idx) {
+            None => {
+                self.net_pos.insert(net_idx, self.nets.len());
+                self.nets.push((net_idx, state));
+            }
+            Some(&i) => {
+                let old = &mut self.nets[i].1;
+                if !old.popped() && state.popped() {
+                    *old = state;
+                }
+            }
+        }
+    }
+
+    fn note_series(&mut self, comp_idx: usize) {
+        if self.record {
+            self.series.push(comp_idx);
         }
     }
 }
@@ -2503,6 +2529,9 @@ struct WalkEndpoint {
     kind: String,
     via: Vec<ViaPart>,
     distance: u32,
+    /// Owning component, for `build_topology`. Not serialized.
+    #[serde(skip)]
+    comp_idx: usize,
 }
 
 /// A branch that fizzled out instead of reaching a real endpoint: reached
@@ -5461,7 +5490,7 @@ mod walk_topology_tests {
     /// back.
     #[test]
     fn a_popped_state_wins_and_is_final() {
-        let mut t = TopoTrace::default();
+        let mut t = TopoTrace::new(true);
         t.note_net(7, NetState::DepthLimit);
         t.note_net(7, NetState::Expanded);
         t.note_net(7, NetState::Dangling);

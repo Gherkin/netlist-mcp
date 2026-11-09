@@ -10,6 +10,7 @@ use design::Design;
 mod parser;
 mod design;
 mod ui;
+mod sidecar;
 
 fn load_file<P: AsRef<Path>>(path: P) -> String {
     let data = fs::read_to_string(path).expect("this file should exist");
@@ -23,7 +24,13 @@ fn load_design() -> anyhow::Result<Design> {
     }
     let data = load_file(&args[1]);
     let netlist = parser::kicad_parser::parse_netlist(&data)?;
-    let design = design::Design::from_netlist(netlist)?;
+    let mut design = design::Design::from_netlist(netlist)?;
+    // Issue #46: optional enrichment files. A missing file is skipped; a
+    // malformed one stops startup, so a typo never silently drops entries.
+    let library = env::var_os(sidecar::LIBRARY_ENV)
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    design.attach_sidecar(sidecar::Sidecar::load(Path::new(&args[1]), library.as_deref())?);
     return Ok(design);
 }
 
@@ -274,7 +281,11 @@ impl NetlistServer {
         property map, and paginated pins (each with name, electrical type, and \
         net). `dnp: true` means the schematic marks the part Do Not Populate — \
         it is in the netlist and on every net it touches, but not on the built \
-        board.")]
+        board. `sidecar` holds facts the netlist lacks, from the enrichment \
+        files (null if none match): `entry` is the merged fields, `sources` \
+        the matching entries, lowest precedence first (lib_id, then MPN — the \
+        MPN property, else value — then refdes; project file over shared \
+        library). Its content is human/agent-written, not from the netlist.")]
     fn get_component(&self, Parameters(p): Parameters<GetComponentParams>) -> String {
         let limit = p.limit.unwrap_or(200);
         let offset = p.offset.unwrap_or(0);
@@ -288,7 +299,9 @@ impl NetlistServer {
         (including how many parts are DNP / excluded from the BOM), a \
         refdes-class histogram, detected power rails (with confidence), \
         connectors, subsystems, and the highest-fanout nets. The zero-knowledge \
-        first call for orienting in an unfamiliar design.")]
+        first call for orienting in an unfamiliar design. `sidecar` lists the \
+        enrichment files looked for (`probed`, with `found`) and, per loaded \
+        file, entry counts and keys that match no component.")]
     fn design_overview(&self) -> String {
         match self.design.design_overview() {
             Ok(out) => out,

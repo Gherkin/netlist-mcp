@@ -1,0 +1,28 @@
+{
+  "lib_id": {
+    "Amplifier:TLV9004": {
+      "channels": 4,
+      "note": "from lib_id"
+    }
+  },
+  "mpn": {
+    "TLV9004": {
+      "note": "from mpn",
+      "family": "TLV900x"
+    },
+    "2N7002-7-F": {
+      "note": "matched by the MPN property"
+    },
+    "2N7002": {
+      "note": "should never match"
+    },
+    "NOT-IN-DESIGN": {
+      "note": "unmatched"
+    }
+  },
+  "refdes": {
+    "U3": {
+      "note": "from refdes"
+    }
+  }
+}

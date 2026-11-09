@@ -515,6 +515,10 @@
 				(description "N-channel MOSFET")
 			)
 			(property
+				(name "MPN")
+				(value "2N7002-7-F")
+			)
+			(property
 				(name "ki_keywords")
 				(value "mosfet nmos transistor")
 			)

@@ -20,9 +20,11 @@ Notes on the format, learned from a real export and from `src/parser/`:
     H2/TP* are in the BOM's exclusion list but populated.
 """
 
+import json
 from pathlib import Path
 
 OUT = Path(__file__).resolve().parent / "fixture.net"
+SIDECAR_OUT = Path(__file__).resolve().parent / "fixture.sidecar.json"
 
 # --- library parts -------------------------------------------------------
 # name -> (lib, part, description, [(num, pin_name, pin_type), ...])
@@ -98,6 +100,30 @@ KEYWORDS = {
 COMPONENTS = {}
 # net name -> [(refdes, pin), ...]
 NETS = {}
+
+
+# refdes -> `MPN` property. Only Q1 has one, and it differs from its value, so
+# the sidecar's MPN key (the MPN property, else value: issue #46) is tested.
+MPN = {"Q1": "2N7002-7-F"}
+
+# The enrichment sidecar next to fixture.net (issue #46), written as
+# fixture.sidecar.json. Covers each scope, the precedence order, the MPN
+# property winning over value, and a key that matches no component.
+SIDECAR = {
+    "lib_id": {
+        "Amplifier:TLV9004": {"channels": 4, "note": "from lib_id"},
+    },
+    "mpn": {
+        "TLV9004": {"note": "from mpn", "family": "TLV900x"},
+        "2N7002-7-F": {"note": "matched by the MPN property"},
+        # Q1's value: must NOT match, since Q1 has an MPN property.
+        "2N7002": {"note": "should never match"},
+        "NOT-IN-DESIGN": {"note": "unmatched"},
+    },
+    "refdes": {
+        "U3": {"note": "from refdes"},
+    },
+}
 
 
 def comp(refdes, part, value, sheet, dnp=False, efb=None):
@@ -313,6 +339,13 @@ def emit_components():
                 f'{IND * 4}(name "dnp")',
                 f"{IND * 3})",
             ]
+        if refdes in MPN:
+            out += [
+                f"{IND * 3}(property",
+                f'{IND * 4}(name "MPN")',
+                f'{IND * 4}(value "{esc(MPN[refdes])}")',
+                f"{IND * 3})",
+            ]
         out += [
             f"{IND * 3}(property",
             f'{IND * 4}(name "ki_keywords")',
@@ -388,6 +421,8 @@ def main():
     lines.append(")")
     OUT.write_text("\n".join(lines) + "\n")
     print(f"wrote {OUT} — {len(COMPONENTS)} components, {len(NETS)} nets")
+    SIDECAR_OUT.write_text(json.dumps(SIDECAR, indent=2) + "\n")
+    print(f"wrote {SIDECAR_OUT}")
 
 
 if __name__ == "__main__":

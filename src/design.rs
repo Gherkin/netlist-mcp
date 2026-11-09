@@ -8,6 +8,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::parser::netlist;
+use crate::sidecar::{Joined, Keys as SidecarKeys, Sidecar, Summary as SidecarSummary};
 
 #[derive(Debug)]
 pub struct Design {
@@ -24,10 +25,27 @@ pub struct Design {
     // `normalize_sheet_path` and closed over ancestors. Read only by
     // `net_hierarchy`, to tell a hierarchy separator in a net name from a
     // slash that is part of a label (issue #16).
-    sheet_paths: HashSet<String>
+    sheet_paths: HashSet<String>,
+    // Read-only enrichment entries (issue #46), joined per component in
+    // `comp_details`. Empty unless `attach_sidecar` is called.
+    sidecar: Sidecar,
 }
 
 impl Design {
+    /// Attach the enrichment sidecar loaded at startup (issue #46).
+    pub fn attach_sidecar(&mut self, sidecar: Sidecar) {
+        self.sidecar = sidecar;
+    }
+
+    /// The keys a component is matched on in the sidecar.
+    fn sidecar_keys<'a>(comp: &'a Component) -> SidecarKeys<'a> {
+        SidecarKeys {
+            refdes: &comp.refdes,
+            lib_id: &comp.lib_id,
+            mpn: comp.mpn_key(),
+        }
+    }
+
     pub fn pin(&self, pin_id: &PinId) -> &Pin {
         &self.pins[pin_id.0 as usize]
     }
@@ -97,6 +115,7 @@ impl Design {
             dnp: comp.dnp,
             exclude_from_bom: comp.exclude_from_bom,
             properties: comp.properties.clone(),
+            sidecar: self.sidecar.join(&Self::sidecar_keys(comp)),
             pin_count,
             offset,
             limit,
@@ -1081,6 +1100,7 @@ impl Design {
             connectors,
             subsystems,
             top_nets_by_fanout,
+            sidecar: self.sidecar.summary(self.components.iter().map(Self::sidecar_keys)),
         };
         return Ok(serde_json::to_string_pretty(&envelope)
             .context("error serializing design_overview")?);
@@ -2091,7 +2111,8 @@ impl Design {
             pin_map: pin_map,
             nets: nets,
             net_map: net_map,
-            sheet_paths
+            sheet_paths,
+            sidecar: Sidecar::default(),
         });
     }
 }
@@ -2294,6 +2315,9 @@ struct ComponentDetail {
     /// Excluded from the BOM. Independent of `dnp`.
     exclude_from_bom: bool,
     properties: HashMap<String, Option<String>>,
+    /// The joined sidecar entry (issue #46), or null when no entry matches.
+    /// Always emitted.
+    sidecar: Option<Joined>,
     pin_count: usize,
     offset: u32,
     limit: u32,
@@ -2640,6 +2664,9 @@ struct OverviewEnvelope {
     connectors: Vec<ConnectorRow>,
     subsystems: Vec<SubsystemSummaryRow>,
     top_nets_by_fanout: Vec<NetFanoutRow>,
+    /// Which sidecar files were looked for and loaded, with entry counts and
+    /// keys that match no component (issue #46).
+    sidecar: SidecarSummary,
 }
 
 /// One ranked find_components hit: the same compact row as filter_components plus
@@ -3450,6 +3477,17 @@ pub struct Component {
     exclude_from_bom: bool,
     properties: HashMap<String, Option<String>>,
     pins: Vec<PinId>
+}
+
+impl Component {
+    /// The MPN the sidecar matches on (issue #46): the `MPN` property when it
+    /// is set and not blank, else `value` (which holds the MPN for most ICs).
+    fn mpn_key(&self) -> &str {
+        match self.properties.get("MPN") {
+            Some(Some(mpn)) if !mpn.trim().is_empty() => mpn.as_str(),
+            _ => self.value.as_str(),
+        }
+    }
 }
 
 /// Best-effort normalization of a passive's raw `value` string into a base-unit
@@ -4604,6 +4642,7 @@ mod subsystem_filter_seam_tests {
             pin_map: HashMap::new(),
             net_map: HashMap::new(),
             sheet_paths,
+            sidecar: crate::sidecar::Sidecar::default(),
         }
     }
 
@@ -5686,6 +5725,7 @@ mod filter_nets_rail_tests {
             pin_map: HashMap::new(),
             net_map: HashMap::new(),
             sheet_paths: HashSet::new(),
+            sidecar: Sidecar::default(),
         };
 
         for (code, (name, members)) in nets.iter().enumerate() {
@@ -5916,6 +5956,67 @@ mod component_detail_tests {
         let json = design.comp_details("H1", 10, 0).expect("H1 exists");
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["lib_id"], "Mechanical:MountingHole");
+    }
+
+    /// The fixture with tests/fixture.sidecar.json attached, loaded the way
+    /// main.rs does: by path, next to fixture.net.
+    fn fixture_with_sidecar() -> super::Design {
+        let mut design = fixture();
+        let net = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.net");
+        design.attach_sidecar(crate::sidecar::Sidecar::load(&net, None).expect("sidecar loads"));
+        design
+    }
+
+    fn component(design: &super::Design, refdes: &str) -> serde_json::Value {
+        serde_json::from_str(&design.comp_details(refdes, 10, 0).expect("exists")).expect("JSON")
+    }
+
+    // #46: lib_id, mpn (value) and refdes entries all match U3 and merge in
+    // that order; a field set by several is taken from the last.
+    #[test]
+    fn get_component_joins_sidecar_in_precedence_order() {
+        let v = component(&fixture_with_sidecar(), "U3");
+        let sc = &v["sidecar"];
+        assert_eq!(sc["entry"], serde_json::json!({
+            "channels": 4, "family": "TLV900x", "note": "from refdes"
+        }));
+        let scopes: Vec<&str> = sc["sources"].as_array().unwrap().iter()
+            .map(|s| s["scope"].as_str().unwrap()).collect();
+        assert_eq!(scopes, ["lib_id", "mpn", "refdes"]);
+        assert_eq!(sc["sources"][1]["key"], "TLV9004");
+        assert_eq!(sc["sources"][0]["origin"], "project");
+    }
+
+    // #46: Q1's MPN property ("2N7002-7-F") is its MPN key, not its value
+    // ("2N7002"), so only the MPN-property entry matches.
+    #[test]
+    fn sidecar_mpn_key_prefers_mpn_property_over_value() {
+        let v = component(&fixture_with_sidecar(), "Q1");
+        assert_eq!(v["sidecar"]["entry"]["note"], "matched by the MPN property");
+        assert_eq!(v["sidecar"]["sources"].as_array().unwrap().len(), 1);
+    }
+
+    // #46: a part no entry matches carries an explicit null; so does every
+    // part when no sidecar is loaded.
+    #[test]
+    fn sidecar_is_null_without_a_match() {
+        assert!(component(&fixture_with_sidecar(), "R1")["sidecar"].is_null());
+        assert!(component(&fixture(), "U3")["sidecar"].is_null());
+    }
+
+    // #46: design_overview reports the probed files and the keys that match
+    // nothing (Q1's value "2N7002" is one, as its MPN property wins).
+    #[test]
+    fn overview_reports_sidecar_files_and_unmatched_keys() {
+        let v: serde_json::Value = serde_json::from_str(
+            &fixture_with_sidecar().design_overview().expect("overview"),
+        ).expect("JSON");
+        let sc = &v["sidecar"];
+        assert_eq!(sc["probed"][0]["found"], true);
+        assert!(sc["probed"][0]["path"].as_str().unwrap().ends_with("tests/fixture.sidecar.json"));
+        let f = &sc["files"][0];
+        assert_eq!(f["entries"], serde_json::json!({"lib_id": 1, "mpn": 4, "refdes": 1}));
+        assert_eq!(f["unmatched"], serde_json::json!(["mpn.2N7002", "mpn.NOT-IN-DESIGN"]));
     }
 }
 

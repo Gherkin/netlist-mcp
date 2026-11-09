@@ -2,6 +2,8 @@
 name = "kicad-netlist-parser"
 version = "0.1.0"
 edition = "2024"
+# std::fs::File::lock, used by write_sidecar (#48), is stable since 1.89.
+rust-version = "1.89"
 
 [dependencies]
 anyhow = "1.0.103"

@@ -8,7 +8,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::parser::netlist;
-use std::sync::{PoisonError, RwLock};
+use std::sync::{Mutex, PoisonError, RwLock};
 
 use crate::sidecar::{
     Edit as SidecarEdit, Joined, Keys as SidecarKeys, Sidecar, Summary as SidecarSummary, Written,
@@ -51,6 +51,10 @@ pub struct Design {
     // because `write_sidecar` (issue #48) reloads it while the design is
     // shared.
     sidecar: RwLock<Sidecar>,
+    // Held for a whole `write_sidecar` (file lock, disk I/O, reload), so two
+    // writes in this server cannot reload out of order. `sidecar` itself is
+    // write-locked only for the swap, so readers never wait on the file lock.
+    sidecar_write: Mutex<()>,
 }
 
 impl Design {
@@ -67,21 +71,22 @@ impl Design {
     }
 
     /// Change one sidecar entry on disk, then reload the sidecar files so
-    /// `get_component` shows the change (issue #48). The write lock is held
+    /// `get_component` shows the change (issue #48). `sidecar_write` is held
     /// across both steps, so two writes in this server cannot reload out of
-    /// order.
+    /// order; readers are blocked only for the final swap.
     pub fn write_sidecar(&self, edit: &SidecarEdit) -> anyhow::Result<String> {
         // Before the path lookup, so "the library cannot hold refdes" is
         // what a refdes-to-library write hears, set library or not.
         edit.check()?;
-        let mut sidecar = self.sidecar.write().unwrap_or_else(PoisonError::into_inner);
-        let path = sidecar.path_for(edit.origin)?.to_path_buf();
+        let _order = self.sidecar_write.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = self.sidecar().path_for(edit.origin)?.to_path_buf();
         let written = crate::sidecar::write_file(&path, edit)?;
         // The write is on disk whatever happens next. If a reload fails (a
         // person broke the other file by hand), keep the old entries and say so.
-        let reload_error = match sidecar.reload() {
+        let reloaded = self.sidecar().reload();
+        let reload_error = match reloaded {
             Ok(fresh) => {
-                *sidecar = fresh;
+                *self.sidecar.write().unwrap_or_else(PoisonError::into_inner) = fresh;
                 None
             }
             Err(e) => Some(format!("{e:#}")),
@@ -2175,6 +2180,7 @@ impl Design {
             net_map: net_map,
             sheet_paths,
             sidecar: Default::default(),
+            sidecar_write: Default::default(),
         });
     }
 }
@@ -4705,6 +4711,7 @@ mod subsystem_filter_seam_tests {
             net_map: HashMap::new(),
             sheet_paths,
             sidecar: Default::default(),
+            sidecar_write: Default::default(),
         }
     }
 
@@ -5788,6 +5795,7 @@ mod filter_nets_rail_tests {
             net_map: HashMap::new(),
             sheet_paths: HashSet::new(),
             sidecar: Default::default(),
+            sidecar_write: Default::default(),
         };
 
         for (code, (name, members)) in nets.iter().enumerate() {

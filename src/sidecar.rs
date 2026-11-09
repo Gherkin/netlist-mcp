@@ -34,6 +34,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
@@ -110,13 +111,7 @@ impl SidecarFile {
         let Value::Object(root) = root else {
             bail!("sidecar {path}: top level must be a JSON object");
         };
-        let mut file = SidecarFile {
-            path: path.to_string(),
-            origin,
-            lib_id: Entries::new(),
-            mpn: Entries::new(),
-            refdes: Entries::new(),
-        };
+        let mut file = SidecarFile::empty(path, origin);
         for (key, table) in root {
             let scope = match key.as_str() {
                 "lib_id" => Scope::LibId,
@@ -189,6 +184,12 @@ impl SidecarFile {
             }
             return Ok(None);
         }
+        if !table.contains_key(edit.key) && edit.fields.values().all(Value::is_null) {
+            bail!(
+                "sidecar {path}: no {}.{:?} entry to remove fields from",
+                edit.scope.table_name(), edit.key
+            );
+        }
         let entry = table.entry(edit.key.to_string()).or_default();
         for (k, v) in edit.fields {
             if v.is_null() {
@@ -226,12 +227,6 @@ impl Edit<'_> {
         let table = self.scope.table_name();
         if self.key.is_empty() {
             bail!("sidecar: the key is empty; an empty key never matches a component");
-        }
-        if self.key.trim() != self.key {
-            bail!(
-                "sidecar: the key {:?} has leading or trailing whitespace; keys match exactly, so it would never match",
-                self.key
-            );
         }
         if self.scope == Scope::Refdes && self.origin == Origin::Library {
             bail!(
@@ -273,12 +268,20 @@ pub struct Written {
 /// symlink is followed: the file it points at is replaced, not the link.
 ///
 /// A missing project file is created; a missing library file is an error,
-/// as at startup (#54). A file that does not parse is an error and is left
-/// unchanged.
+/// as at startup (#54). A symlink to a missing file is an error, so the link
+/// is never replaced by a plain file. A file that does not parse is an error
+/// and is left unchanged.
 pub fn write_file(path: &Path, edit: &Edit) -> anyhow::Result<Written> {
     edit.check()?;
     let shown = path.display().to_string();
-    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = match fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(_) if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) => {
+            bail!("sidecar {shown}: is a symlink to a file that does not exist; create the target first");
+        }
+        Err(_) if edit.origin == Origin::Library => return Err(missing_library(&shown, path)),
+        Err(_) => path.to_path_buf(),
+    };
     let mut lock_name = target.file_name().unwrap_or_default().to_os_string();
     lock_name.push(".lock");
     let lock_path = target.with_file_name(lock_name);
@@ -304,13 +307,25 @@ pub fn write_file(path: &Path, edit: &Edit) -> anyhow::Result<Written> {
     let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(format!(".tmp-{}", std::process::id()));
     let tmp = target.with_file_name(tmp_name);
-    let result = fs::write(&tmp, file.to_json())
-        .and_then(|()| match fs::metadata(&target) {
-            // Keep the original file's permissions.
-            Ok(meta) => fs::set_permissions(&tmp, meta.permissions()),
-            Err(_) => Ok(()),
-        })
-        .and_then(|()| fs::rename(&tmp, &target));
+    let result = (|| -> std::io::Result<()> {
+        let mut out = fs::File::create(&tmp)?;
+        // Keep the original file's permissions. Set before the data goes in,
+        // so a private file is never readable through the temp file.
+        if let Ok(meta) = fs::metadata(&target) {
+            out.set_permissions(meta.permissions())?;
+        }
+        out.write_all(file.to_json().as_bytes())?;
+        // On disk before the rename, so a crash cannot leave the sidecar
+        // renamed but empty.
+        out.sync_all()?;
+        fs::rename(&tmp, &target)?;
+        // Make the rename itself durable.
+        #[cfg(unix)]
+        if let Some(dir) = target.parent() {
+            fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    })();
     if let Err(e) = result {
         let _ = fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("sidecar {shown}: cannot write"));
@@ -323,6 +338,17 @@ pub fn write_file(path: &Path, edit: &Edit) -> anyhow::Result<Written> {
         created_file,
         entry,
     })
+}
+
+/// The error for a library path that names no file (#54), at startup or on
+/// a write. Shows the absolute path tried, quoted, so a cwd mistake or a
+/// blank value is visible in the message.
+fn missing_library(shown: &str, path: &Path) -> anyhow::Error {
+    let tried = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    anyhow::anyhow!(
+        "sidecar {shown}: ${LIBRARY_ENV} names a file that does not exist (looked for \"{}\")",
+        tried.display()
+    )
 }
 
 /// A file the loader looked for, found or not. Reported by `design_overview`
@@ -421,9 +447,7 @@ impl Sidecar {
 
     /// Load the same files again, from disk.
     pub fn reload(&self) -> anyhow::Result<Sidecar> {
-        let project = self.project.as_deref()
-            .context("sidecar: no project file path (the sidecar was not loaded from disk)")?;
-        Self::load_paths(project, self.library.as_deref())
+        Self::load_paths(self.path_for(Origin::Project)?, self.library.as_deref())
     }
 
     /// The project file path for a netlist: same directory and stem,
@@ -459,13 +483,7 @@ impl Sidecar {
                 // (a typo, or a relative path from another cwd) would turn
                 // the library off without a word, so it stops startup.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && origin == Origin::Library => {
-                    // Show the absolute path tried, quoted, so a cwd mistake
-                    // or a blank value is visible in the message.
-                    let tried = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
-                    bail!(
-                        "sidecar {shown}: ${LIBRARY_ENV} names a file that does not exist (looked for \"{}\")",
-                        tried.display()
-                    );
+                    return Err(missing_library(&shown, &path));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     probes.push(Probe { path: shown, origin, found: false });
@@ -842,11 +860,14 @@ mod tests {
         let path = dir.join("board.sidecar.json");
         let f = fields(json!({"n": 1}));
         let none = Map::new();
+        let nulls = fields(json!({"n": null}));
         let cases: [(Edit, &str); 5] = [
             (edit(Origin::Library, Scope::Refdes, "U1", &f), "cannot hold \"refdes\""),
             (edit(Origin::Project, Scope::Mpn, "", &f), "the key is empty"),
-            (edit(Origin::Project, Scope::Mpn, "X ", &f), "whitespace"),
             (edit(Origin::Project, Scope::Mpn, "X", &none), "nothing to write"),
+            // Only nulls, on an entry that does not exist: nothing to remove,
+            // most likely a typo in the key. Same as `delete` on a missing one.
+            (edit(Origin::Project, Scope::Mpn, "X", &nulls), "no mpn.\"X\" entry to remove fields from"),
             (Edit { origin: Origin::Project, scope: Scope::Mpn, key: "X", fields: &f, delete: true },
              "not both"),
         ];
@@ -865,8 +886,11 @@ mod tests {
         let dir = temp_dir("refuse");
         let f = fields(json!({"n": 1}));
         let lib = dir.join("lib.json");
-        assert!(write_file(&lib, &edit(Origin::Library, Scope::Mpn, "X", &f)).is_err());
+        let err = write_file(&lib, &edit(Origin::Library, Scope::Mpn, "X", &f)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(LIBRARY_ENV) && msg.contains("does not exist"), "{msg}");
         assert!(!lib.exists());
+        assert!(!dir.join("lib.json.lock").exists(), "no stray lock file");
         let path = dir.join("board.sidecar.json");
         fs::write(&path, r#"{"mpns": {}}"#).unwrap();
         let err = write_file(&path, &edit(Origin::Project, Scope::Mpn, "X", &f)).unwrap_err();
@@ -888,6 +912,34 @@ mod tests {
         write_file(&link, &edit(Origin::Library, Scope::Mpn, "X", &f)).unwrap();
         assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(read_json(&real), json!({"mpn": {"X": {"n": 1}}}));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // A symlink whose target is missing is refused, not replaced by a plain
+    // file (which would cut the link to the shared target without a word).
+    #[cfg(unix)]
+    #[test]
+    fn write_refuses_dangling_symlink() {
+        let dir = temp_dir("dangling");
+        let link = dir.join("board.sidecar.json");
+        std::os::unix::fs::symlink(dir.join("missing.json"), &link).unwrap();
+        let f = fields(json!({"n": 1}));
+        let err = write_file(&link, &edit(Origin::Project, Scope::Mpn, "X", &f)).unwrap_err();
+        assert!(format!("{err:#}").contains("symlink"), "{err:#}");
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(!dir.join("missing.json").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Keys match exactly, untrimmed, as `join` does: a part whose MPN has a
+    // trailing space can still get an entry.
+    #[test]
+    fn write_keeps_key_whitespace() {
+        let dir = temp_dir("space");
+        let path = dir.join("board.sidecar.json");
+        let f = fields(json!({"n": 1}));
+        write_file(&path, &edit(Origin::Project, Scope::Mpn, "X ", &f)).unwrap();
+        assert_eq!(read_json(&path), json!({"mpn": {"X ": {"n": 1}}}));
         fs::remove_dir_all(&dir).unwrap();
     }
 

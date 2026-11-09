@@ -13,28 +13,36 @@ mod ui;
 mod sidecar;
 
 // Issue #56: a missing or unreadable netlist is a clean startup error that
-// names the path, like the sidecar files (#54), not a panic.
-fn load_file<P: AsRef<Path>>(path: P) -> anyhow::Result<String> {
-    let path = path.as_ref();
+// names the path, like the sidecar files (#54), not a panic. The absolute
+// path is shown, as for the library file (#54), so a cwd
+// mistake is visible in the message.
+fn shown_path(path: &Path) -> String {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).display().to_string()
+}
+
+fn load_netlist(path: &Path) -> anyhow::Result<String> {
     fs::read_to_string(path)
-        .with_context(|| format!("netlist {}: cannot read", path.display()))
+        .with_context(|| format!("netlist {}: cannot read", shown_path(path)))
 }
 
 fn load_design() -> anyhow::Result<Design> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        bail!("no file argument!")
+    let args: Vec<std::ffi::OsString> = env::args_os().collect();
+    if args.len() != 2 {
+        bail!("usage: kicad-netlist-parser <netlist.net>")
     }
-    let data = load_file(&args[1])?;
-    let netlist = parser::kicad_parser::parse_netlist(&data)?;
-    let mut design = design::Design::from_netlist(netlist)?;
+    let path = Path::new(&args[1]);
+    let data = load_netlist(path)?;
+    let netlist = parser::kicad_parser::parse_netlist(&data)
+        .with_context(|| format!("netlist {}: cannot parse", shown_path(path)))?;
+    let mut design = design::Design::from_netlist(netlist)
+        .with_context(|| format!("netlist {}: cannot parse", shown_path(path)))?;
     // Issue #46: optional enrichment files. A missing project file is
     // skipped; a malformed file, or a set but missing library (#54), stops
     // startup, so a typo never silently drops entries.
     let library = env::var_os(sidecar::LIBRARY_ENV)
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from);
-    design.attach_sidecar(sidecar::Sidecar::load(Path::new(&args[1]), library.as_deref())?);
+    design.attach_sidecar(sidecar::Sidecar::load(path, library.as_deref())?);
     return Ok(design);
 }
 
@@ -641,9 +649,20 @@ mod tests {
     #[test]
     fn missing_netlist_is_an_error_naming_the_path() {
         let path = "tests/no-such-netlist.net";
-        let err = load_file(path).expect_err("missing file must be an error");
+        let err = load_netlist(Path::new(path)).expect_err("missing file must be an error");
         let msg = format!("{err:#}");
-        assert!(msg.contains(path), "path missing from error: {msg}");
+        let abs = std::path::absolute(path).unwrap();
+        assert!(msg.contains(&abs.display().to_string()), "absolute path missing from error: {msg}");
+        assert!(msg.contains("cannot read"), "unexpected error: {msg}");
+    }
+
+    /// Issue #56: an unreadable netlist (here a directory) is an error naming
+    /// the path too, not only a missing one.
+    #[test]
+    fn unreadable_netlist_is_an_error_naming_the_path() {
+        let err = load_netlist(Path::new("tests")).expect_err("a directory must be an error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("tests"), "path missing from error: {msg}");
         assert!(msg.contains("cannot read"), "unexpected error: {msg}");
     }
 

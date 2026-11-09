@@ -3189,8 +3189,8 @@ enum Binding {
     Glued { at: usize },
     /// An `@` with a space before it is about the nearest value before it
     /// that it can describe: for "@DC", any quantity ("1.2Ω 2kΩ 200mA
-    /// @DC"); for a frequency, an in-band ohm value no "DCR" labels ("1kΩ
-    /// 1.2Ω DCR 1.5A @100MHz"). Either steps over a tolerance ("600Ω ±25%
+    /// @DC"); for a frequency, an in-band ohm value not marked or labelled DC
+    /// ("1kΩ 1.2Ω DCR 1.5A @100MHz"). Either steps over a tolerance ("600Ω ±25%
     /// @100MHz") or a word ("1.2Ω DCR @DC").
     Spaced,
     /// A bare frequency literal, with no `@` to say what it belongs to, only
@@ -3257,18 +3257,22 @@ fn joins_split_unit(prev: &str, unit: &str) -> bool {
 }
 
 /// True if `tok` is an amp or volt unit, in any case, with or without an SI
-/// prefix: "A", "mA", "ma", "µA", "Amps", "V", "kV", "VDC". The prefix letter
-/// is any one [`si_multiplier`] knows, in either case it accepts, so "NA",
-/// "PA" and "GV" count as units too.
+/// prefix: "A", "mA", "ma", "µA", "Amps", "V", "kV", "VDC", "Vrms",
+/// "mAdc". The prefixes are the ones ratings use, lowercase but for kilo
+/// ("KV") and mega: "NA" and "PA" are words, not nanoamps and picoamps.
 fn is_current_or_voltage_unit(tok: &str) -> bool {
     let is_unit = |word: &str| {
-        matches!(
-            word.to_lowercase().as_str(),
-            "a" | "amp" | "amps" | "v" | "volt" | "volts" | "vdc" | "vac"
-        )
+        let lower = word.to_lowercase();
+        // "A"/"V" with an optional rms, dc or ac suffix: "Arms", "VDC".
+        let letter_unit = lower
+            .strip_prefix('a')
+            .or_else(|| lower.strip_prefix('v'))
+            .is_some_and(|suffix| matches!(suffix, "" | "rms" | "dc" | "ac"));
+        letter_unit || matches!(lower.as_str(), "amp" | "amps" | "volt" | "volts")
     };
     let mut chars = tok.chars();
-    let prefixed = chars.next().is_some_and(|c| si_multiplier(c, 'A').is_some()) && is_unit(chars.as_str());
+    let prefixed = chars.next().is_some_and(|c| matches!(c, 'p' | 'n' | 'u' | 'µ' | 'μ' | 'm' | 'k' | 'K' | 'M'))
+        && is_unit(chars.as_str());
     prefixed || is_unit(tok)
 }
 
@@ -3339,6 +3343,17 @@ fn bead_tokens(tokens: &[(String, bool)]) -> Option<Vec<BeadToken>> {
             continue;
         }
 
+        // A "DCR" label standing after an ohm value ("1.2Ω DCR") says that
+        // value is the DC resistance, the same as an "@DC" stuck to it: it is
+        // no impedance candidate, and a frequency steps over it.
+        if is_dc_mark(tok) {
+            if let Some(prev) = out.last_mut().filter(|prev| prev.index + 1 == index) {
+                if parse_value_token(&prev.base, 'R').is_some() {
+                    prev.dc = true;
+                }
+            }
+        }
+
         out.push(BeadToken { base: tok.to_string(), freq: None, dc: false, index });
     }
     Some(out)
@@ -3366,19 +3381,32 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
     // nearest quantity, whatever its unit: "1.2Ω 2kΩ 200mA @DC" is about the
     // 200mA. A frequency is about the nearest value that could be the
     // impedance, stepping over a current ("1kΩ 1.5A @100MHz"), a DCR under
-    // the band ("1kΩ 120mΩ 2A @100MHz"), and a value a following "DCR"
-    // labels ("1kΩ 1.2Ω DCR @100MHz"): each rates the 1kΩ. A bare package
-    // code is in band, so it is not stepped over ("1kΩ 0603 @100MHz" lands
-    // on the 0603).
+    // the band ("1kΩ 120mΩ 2A @100MHz"), and a value marked or labelled DC
+    // ("1kΩ 1.2Ω DCR @100MHz"): each rates the 1kΩ. A bare package code is
+    // in band, so it is not stepped over ("1kΩ 0603 @100MHz" lands on the
+    // 0603) — unless the mark already stepped over a quantity to reach it
+    // and an ohm-marked value stands before it: "220Ω 0402 2A 50mΩ
+    // @100MHz" rates the 220Ω, since the mark plainly skipped the ratings
+    // written after the impedance. Only digits count as a bare number: the
+    // 2.2k of "1kΩ 2.2k 1.5A @100MHz" could be the impedance.
     let nearest = |out: &[BeadToken]| match mark {
         Mark::Dc => out.iter().rposition(|tok| is_quantity(&tok.base)),
         Mark::Other => None,
-        Mark::Frequency(_) => (0..out.len()).rev().find(|&i| {
-            let labelled_dc = out.get(i + 1).is_some_and(|next| {
-                next.index == out[i].index + 1 && is_dc_mark(&next.base)
-            });
-            bead_ohms(&out[i].base).is_some() && !labelled_dc
-        }),
+        Mark::Frequency(_) => {
+            let mut stepped = false;
+            (0..out.len()).rev().find(|&i| {
+                let tok = &out[i];
+                if bead_ohms(&tok.base).is_none() || tok.dc {
+                    stepped |= is_quantity(&tok.base);
+                    return false;
+                }
+                let bare_after_ohms = is_bare_number(&tok.base)
+                    && out[..i]
+                        .iter()
+                        .any(|t| is_ohm_marked_token(&t.base) && bead_ohms(&t.base).is_some());
+                !(stepped && bare_after_ohms)
+            })
+        }
     };
     // What a mark glued to a token is about without looking further: for
     // "@DC", any quantity; for a frequency, an in-band ohm value, as
@@ -3389,6 +3417,11 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
         Mark::Other => false,
         Mark::Frequency(_) => bead_ohms(&tok.base).is_some(),
     };
+    // A frequency after a current ("2A@1MHz", "2A @1MHz") rates the ohms
+    // before it, unless they already carry a frequency: then it is the
+    // current's own rating point ("600Ω@100MHz 2A@1MHz"), not a second
+    // impedance. Glued or spaced, the reading is the same.
+    let past_quantity = |out: &[BeadToken]| nearest(out).filter(|&p| out[p].freq.is_none());
     let pos = match binding {
         // Stuck to "200mA", an "@DC" is about the 200mA, so it cannot reach
         // back and strike out the 2kΩ of "1.2Ω 2kΩ 200mA@DC". Stuck to
@@ -3400,16 +3433,14 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
         // on by [`bead_split`].
         Binding::Glued { at } => match out.last() {
             Some(tok) if tok.index + 1 == at && describes(tok) => Some(out.len() - 1),
-            // A frequency glued to a current rates the ohms before it, unless
-            // they already carry a frequency: then it is the current's own
-            // rating point ("600Ω@100MHz 2A@1MHz"), not a second impedance.
-            Some(tok) if tok.index + 1 == at && is_quantity(&tok.base) => {
-                nearest(out).filter(|&p| out[p].freq.is_none())
-            }
+            Some(tok) if tok.index + 1 == at && is_quantity(&tok.base) => past_quantity(out),
             Some(tok) if tok.index + 1 == at => nearest(out),
             _ => None,
         },
-        Binding::Spaced => nearest(out),
+        Binding::Spaced => match out.last() {
+            Some(tok) if !describes(tok) && is_quantity(&tok.base) => past_quantity(out),
+            _ => nearest(out),
+        },
         Binding::OhmMarked => out
             .iter()
             .rposition(|tok| bead_ohms(&tok.base).is_some() && is_ohm_marked_token(&tok.base)),
@@ -4188,9 +4219,36 @@ mod value_norm_tests {
         // DCR, or took the rating's frequency as a second impedance point.
         let v = normalize_value("1.2Ω 2kΩ 200mA@DC", "FB");
         assert!(v.is_none(), "{v:?}");
-        for raw in ["600Ω@100MHz 1.5A@DC", "600Ω@100MHz 2A@1MHz"] {
+        for raw in ["600Ω@100MHz 1.5A@DC", "600Ω@100MHz 2A@1MHz", "600Ω@100MHz 2A @1MHz"] {
             let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
             assert_eq!(v.canonical, "600Ω@100MHz", "{raw}");
+        }
+    }
+
+    #[test]
+    fn review_27_round_8_decisions() {
+        for (raw, want) in [
+            // A frequency that stepped over ratings also steps over a bare
+            // package code behind an ohm-marked value...
+            ("220Ω 0402 2A 50mΩ @100MHz", Some("220Ω@100MHz")),
+            // ...but not one it reached without stepping over anything.
+            ("1kΩ 0603 @100MHz", None),
+            // "NA" and "PA" are words, not nanoamps and picoamps.
+            ("600 NA", Some("600Ω")),
+            ("600 PA", Some("600Ω")),
+            ("1k 500 nA", Some("1kΩ")),
+            // A and V take an rms, dc or ac suffix, any case.
+            ("1k 25 Vrms", Some("1kΩ")),
+            ("1k 500 mAdc", Some("1kΩ")),
+            ("1k 2 Arms", Some("1kΩ")),
+            ("1k 25 vac", Some("1kΩ")),
+            // "DCR" labels the value before it as DC, wherever the frequency is.
+            ("1.2Ω DCR 1kΩ", Some("1kΩ")),
+            ("1kΩ 1.2Ω DCR @100MHz", Some("1kΩ@100MHz")),
+            ("1kΩ@100MHz 1.2Ω DCR", Some("1kΩ@100MHz")),
+        ] {
+            let got = normalize_value(raw, "FB").map(|v| v.canonical);
+            assert_eq!(got.as_deref(), want, "{raw}");
         }
     }
 
@@ -4269,7 +4327,6 @@ mod value_norm_tests {
             ("1k 25 VDC", Some("1kΩ")),
             ("1k 25 Vdc", Some("1kΩ")),
             ("1k 25 KV", Some("1kΩ")),
-            ("1k 2 UA", Some("1kΩ")),
             ("1k 120 milliohm", Some("1kΩ")),
             ("600 1.5 Amp", Some("600Ω")),
         ] {

@@ -149,6 +149,9 @@ struct WalkParams {
     /// Also return a `topology` graph (default false): the nets reached as
     /// nodes, and the parts as edges with the pin number and net on each side.
     /// Use it to draw or reason about the circuit shape (shunts, branches).
+    /// A two-pin start or endpoint part also lists its pin on a net that is
+    /// not a node; that pin's `off_drawing` says why: "cut" by
+    /// `max_topology_parts`, or "outside" the walk.
     #[serde(default)]
     include_topology: Option<bool>,
     /// Max parts in `topology` (default 200, minimum 1; 0 is read as 1),
@@ -199,7 +202,8 @@ struct PathBetweenParams {
     /// parts on any route (parallel routes included), the passive branches
     /// from a route net down to a rail (shunts), and the other ICs and
     /// connectors on a route net. Branches that reach neither `to` nor a
-    /// rail are left out.
+    /// rail are left out. As in `walk`, a pin with `off_drawing` is on a net
+    /// that is not a node ("outside" means outside the subgraph).
     #[serde(default)]
     include_topology: Option<bool>,
     /// Max parts in `topology` (default 200, minimum 2: the `from` and `to`

@@ -245,7 +245,9 @@ function netOfPin(topo, handle) {
 // is not lit).
 function normalize(data) {
   if (data.from === undefined) {
-    return { ...data, path: false, to_net: null, marks: [data.start], mark_nets: [data.start_net] };
+    // A walk from a net marks no pin.
+    const marks = String(data.start || "").includes(":") ? [String(data.start)] : [];
+    return { ...data, path: false, to_net: null, marks, mark_nets: [data.start_net] };
   }
   const startNet = netOfPin(data.topology, data.from);
   const toNet = netOfPin(data.topology, data.to);
@@ -575,7 +577,7 @@ function render(data) {
   const body = el("g", {}, svg);
   const dots = el("g", {}, svg);
   // Pins to highlight: the walk's start pin, or path_between's from and to.
-  const marked = new Set(data.marks.filter((m) => String(m || "").includes(":")).map(String));
+  const marked = new Set(data.marks.map(String));
   const markedRefs = new Set([...marked].map((m) => m.split(":")[0]));
   const markedNets = new Set(data.mark_nets.filter((n) => n != null));
   const lead = data.path ? OPEN_LEAD.path : OPEN_LEAD.walk;
@@ -661,12 +663,12 @@ function render(data) {
         line(g, busSideX, y, tip, y);
         line(wires, tip, y, busX(e.col), y);
         addAttach(e.col, y);
-        const isStart = marked.has(part.refdes + ":" + e.pin.pin);
-        text(g, busSideX + out * 4, y - 4, e.pin.pin, "pnum" + (isStart ? " startpin" : ""), out < 0 ? "end" : "start");
+        const isMarked = marked.has(part.refdes + ":" + e.pin.pin);
+        text(g, busSideX + out * 4, y - 4, e.pin.pin, "pnum" + (isMarked ? " startpin" : ""), out < 0 ? "end" : "start");
         if (e.pin.name && e.pin.name !== "~" && e.pin.name !== e.pin.pin) {
-          text(g, busSideX - out * 5, y + 4, clip(e.pin.name, 13), "pname" + (isStart ? " startpin" : ""), out < 0 ? "start" : "end");
+          text(g, busSideX - out * 5, y + 4, clip(e.pin.name, 13), "pname" + (isMarked ? " startpin" : ""), out < 0 ? "start" : "end");
         }
-        if (isStart) el("circle", { class: "dot startpin", cx: tip, cy: y, r: 3 }, dots);
+        markPin(part, e.pin, tip, y);
       });
       it.otherEnds.forEach((e, k) => {
         const y = rowY(it.row + 1 + k);
@@ -674,14 +676,15 @@ function render(data) {
         line(g, otherSideX, y, tip, y);
         terminal(g, tip, y, e, out < 0 ? "right" : "left", lead);
         const pins = e.pins || [e.pin];
-        const isStart = pins.some((p) => marked.has(part.refdes + ":" + p.pin));
+        const isMarked = pins.some((p) => marked.has(part.refdes + ":" + p.pin));
         const num = text(g, otherSideX - out * 4, y - 4, clip(pins.map((p) => p.pin).join(","), 14),
-          "pnum" + (isStart ? " startpin" : ""), out < 0 ? "start" : "end");
-        if (isStart) el("circle", { class: "dot startpin", cx: tip, cy: y, r: 3 }, dots);
+          "pnum" + (isMarked ? " startpin" : ""), out < 0 ? "start" : "end");
+        // A marked pin has its own row, so pins[0] is that pin.
+        if (isMarked) markPin(part, pins[0], tip, y);
         if (pins.length > 1) title(num, "pins " + pins.map((p) => p.pin).join(", ") + " on " + e.net);
         const names = [...new Set(pins.map((p) => p.name).filter((n) => n && n !== "~"))];
         if (names.length === 1 && names[0] !== pins[0].pin) {
-          text(g, otherSideX + out * 5, y + 4, clip(names[0], 13), "pname" + (isStart ? " startpin" : ""),
+          text(g, otherSideX + out * 5, y + 4, clip(names[0], 13), "pname" + (isMarked ? " startpin" : ""),
             out < 0 ? "end" : "start");
         } else if (pins.length > 1) {
           text(g, otherSideX + out * 5, y + 4, pins.length + " pins", "pname", out < 0 ? "end" : "start");

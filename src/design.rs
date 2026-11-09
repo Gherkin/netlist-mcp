@@ -3032,7 +3032,6 @@ const BEAD_OHMS: std::ops::RangeInclusive<f64> = 1.0..=10_000.0;
 /// way it does for an R or a C.
 fn normalize_bead_value(value: &str) -> Option<ValueNorm> {
     let split = bead_split(value);
-    let tokens: Vec<&str> = split.iter().map(|(tok, _)| *tok).collect();
 
     // Every token that could be read as a bead impedance, paired with the
     // frequency it was quoted at. Ratings in other units ("1.5A", "25V")
@@ -3095,7 +3094,8 @@ fn normalize_bead_value(value: &str) -> Option<ValueNorm> {
                         return None;
                     }
                     let start = candidates.first().map_or(0, |(tok, _)| tok.index);
-                    let norm = normalize_simple_value(&tokens[start..].join(" "), "Ω", 'R')?;
+                    let rest: Vec<&str> = split[start..].iter().map(|(tok, _)| tok.as_str()).collect();
+                    let norm = normalize_simple_value(&rest.join(" "), "Ω", 'R')?;
                     return BEAD_OHMS.contains(&norm.magnitude).then_some(norm);
                 }
                 // 3. Two in-band resistances, both marked as such.
@@ -3126,8 +3126,8 @@ fn bead_ohms(tok: &str) -> Option<f64> {
 
 /// One whitespace token of a bead's value string, as [`bead_tokens`] read it.
 struct BeadToken {
-    /// The token itself; `@` marks are separate tokens by this point. Owned,
-    /// since [`glue_split_unit`] may join a unit back onto its number.
+    /// The token itself; `@` marks are separate tokens by this point, and a
+    /// unit split off its number is joined back on ([`bead_split`]).
     base: String,
     /// The frequency the value was quoted at, canonicalized.
     freq: Option<String>,
@@ -3196,21 +3196,52 @@ enum Binding {
 /// token carries whether an `@` was stuck to the token before it
 /// ("1kΩ@100MHz", "1kΩ@ 100MHz") rather than spaced off it ("1kΩ @100MHz"),
 /// which decides its [`Binding`]. The flag is always false for other tokens.
-fn bead_split(value: &str) -> Vec<(&str, bool)> {
-    let mut out = Vec::new();
+///
+/// A unit split off its number is joined back on here ("1 kΩ", "1 k ohm",
+/// "600 ohm"), before anything binds or counts: otherwise every reading
+/// sees a bare "1" and a "kΩ" with no number, and "1.2Ω 1 kΩ 100MHz" reads
+/// the DCR as the impedance.
+fn bead_split(value: &str) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = Vec::new();
     for raw in value.split_whitespace() {
         let mut after_value = false;
         for (k, part) in raw.split('@').enumerate() {
             if k > 0 {
-                out.push(("@", after_value));
+                out.push(("@".to_string(), after_value));
             }
             after_value = !part.is_empty();
-            if after_value {
-                out.push((part, false));
+            if !after_value {
+                continue;
+            }
+            match out.last_mut() {
+                Some((prev, _)) if k == 0 && joins_split_unit(prev, part) => prev.push_str(part),
+                _ => out.push((part.to_string(), false)),
             }
         }
     }
     out
+}
+
+/// True if `unit` is the rest of the value `prev` starts. A bare number takes
+/// any word of letters ("500 mA" is 500mA, a current, not a bare 500 that
+/// could be ohms); one that already took part of an ohm unit ("1k" before
+/// "ohm") takes more only while the whole is still an ohm unit, so the K of
+/// "4.7 ohm K" stays a tolerance code.
+fn joins_split_unit(prev: &str, unit: &str) -> bool {
+    let number_len = prev.len() - prev.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.').len();
+    if number_len == 0 || !is_bare_number(&prev[..number_len]) {
+        return false;
+    }
+    if number_len == prev.len() && unit.chars().all(char::is_alphabetic) {
+        return true;
+    }
+    let joined = format!("{}{unit}", &prev[number_len..]);
+    strip_long_unit_word(&joined, 'R').is_empty() || parse_unit_only_token(&joined, 'R', true).is_some()
+}
+
+/// True if `tok` is digits and decimal points only: a number with no unit.
+fn is_bare_number(tok: &str) -> bool {
+    !tok.is_empty() && tok.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
 /// Split a bead's value into (value token, frequency) pairs, tolerating the
@@ -3226,21 +3257,21 @@ fn bead_split(value: &str) -> Vec<(&str, bool)> {
 /// Takes the value already split on whitespace, since the caller needs the
 /// tokens too. `None` is the [`attach_mark`] verdict: one value quoted at two
 /// different frequencies is a spec table, not a rating.
-fn bead_tokens(tokens: &[(&str, bool)]) -> Option<Vec<BeadToken>> {
+fn bead_tokens(tokens: &[(String, bool)]) -> Option<Vec<BeadToken>> {
     let mut out: Vec<BeadToken> = Vec::new();
     let mut i = 0;
 
     while i < tokens.len() {
         let index = i;
-        let (tok, glued) = tokens[i];
+        let (tok, glued) = (tokens[i].0.as_str(), tokens[i].1);
         i += 1;
 
         if tok == "@" {
             let Some((mark, _)) = tokens.get(i) else { continue };
             i += 1;
-            let mut mark = (*mark).to_string();
+            let mut mark = mark.clone();
             // "@ 100 MHz": the unit spilled into the token after the number.
-            let bare_number = mark.chars().all(|c| c.is_ascii_digit() || c == '.');
+            let bare_number = is_bare_number(&mark);
             if let Some((unit, _)) = tokens.get(i).filter(|(t, _)| bare_number && is_frequency_unit(t)) {
                 mark.push_str(trim_frequency(unit));
                 i += 1;
@@ -3283,8 +3314,9 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
     let pos = match binding {
         // Stuck to "200mA", an "@DC" is about the 200mA, so it cannot reach
         // back and strike out the 2kΩ of "1.2Ω 2kΩ 200mA@DC". Stuck to a
-        // bare unit ("1 kΩ@100MHz"), it is about the number the unit
-        // belongs to.
+        // word with no number ("1.2Ω DCR@DC"), it is about the value the
+        // word labels. A unit split off its number ("1 kΩ@100MHz") is
+        // already joined back on by [`bead_split`].
         Binding::Glued { at } => out
             .last()
             .filter(|tok| tok.index + 1 == at)
@@ -3298,9 +3330,6 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
             .rposition(|tok| bead_ohms(&tok.base).is_some() && is_ohm_marked_token(&tok.base)),
     };
     let Some(pos) = pos else { return Some(()) };
-    if !matches!(binding, Binding::OhmMarked) {
-        glue_split_unit(out, pos);
-    }
     match mark {
         // A frequency on a value that is no plausible impedance says nothing
         // about the bead: that value is not a candidate to begin with.
@@ -3329,20 +3358,6 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
         Mark::Dc | Mark::Other => {}
     }
     Some(())
-}
-
-/// "1 kΩ@100MHz": the `@` landed on the "1" that the "kΩ" belongs to, so the
-/// number alone is not the value. Join the unit back onto it, or the mark
-/// lands on a 1Ω that is 1000 times too small.
-fn glue_split_unit(out: &mut Vec<BeadToken>, pos: usize) {
-    let Some(next) = out.get(pos + 1) else { return };
-    let bare = out[pos].base.chars().all(|c| c.is_ascii_digit() || c == '.');
-    let unit = strip_long_unit_word(&next.base, 'R').is_empty()
-        || parse_unit_only_token(&next.base, 'R', true).is_some();
-    if bare && unit {
-        let unit = out.remove(pos + 1).base;
-        out[pos].base.push_str(&unit);
-    }
 }
 
 /// True if an `@` mark says the value was measured at DC: "DC", "DCR", or
@@ -4121,6 +4136,22 @@ mod value_norm_tests {
         ] {
             let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
             assert_eq!(v.canonical, want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_split_unit_is_one_value_before_anything_binds() {
+        // Joined in the tokenizer, so a bare frequency and the candidate
+        // count see "1kΩ", not a "1" and a "kΩ".
+        for (raw, want) in [
+            ("1 k ohm@100MHz", Some("1kΩ@100MHz")),
+            ("1.2Ω 1 kΩ 100MHz", Some("1kΩ@100MHz")),
+            ("1.5Ω 1 kΩ", None),
+            ("600 ohm @ 100 MHz", Some("600Ω@100MHz")),
+            ("1k @ 100 M", Some("1kΩ@100MHz")),
+        ] {
+            let got = normalize_value(raw, "FB").map(|v| v.canonical);
+            assert_eq!(got.as_deref(), want, "{raw}");
         }
     }
 

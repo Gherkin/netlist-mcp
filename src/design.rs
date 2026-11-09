@@ -3181,8 +3181,9 @@ impl Mark {
 /// Which token a mark binds to.
 enum Binding {
     /// An `@` written stuck to a value it can describe is about that value:
-    /// "@DC" on any quantity ("200mA@DC"), a frequency on any ohm value.
-    /// Stuck to anything else, it binds as [`Binding::Spaced`] does. `at` is
+    /// "@DC" on any quantity ("200mA@DC"), a frequency on an in-band ohm
+    /// value — the same test a spaced one binds with, so "1kΩ 120mΩ@100MHz"
+    /// reads like "1kΩ 120mΩ @100MHz". Stuck to anything else, it binds as [`Binding::Spaced`] does. `at` is
     /// the `@`'s own index, to check the token before it really is the one it
     /// was stuck to.
     Glued { at: usize },
@@ -3247,7 +3248,7 @@ fn joins_split_unit(prev: &str, unit: &str) -> bool {
     let word = unit.starts_with(char::is_alphabetic);
     if number_len == prev.len()
         && word
-        && (is_frequency_unit(unit) || is_current_or_voltage_unit(unit) || is_prefixed_ohm_word(unit))
+        && (is_frequency_unit(unit) || is_current_or_voltage_unit(unit) || is_ohm_word(unit))
     {
         return true;
     }
@@ -3257,7 +3258,8 @@ fn joins_split_unit(prev: &str, unit: &str) -> bool {
 
 /// True if `tok` is an amp or volt unit, in any case, with or without an SI
 /// prefix: "A", "mA", "ma", "µA", "Amps", "V", "kV", "VDC". The prefix letter
-/// is read by [`si_multiplier`], so the two cannot disagree on which exist.
+/// is any one [`si_multiplier`] knows, in either case it accepts, so "NA",
+/// "PA" and "GV" count as units too.
 fn is_current_or_voltage_unit(tok: &str) -> bool {
     let is_unit = |word: &str| {
         matches!(
@@ -3270,12 +3272,12 @@ fn is_current_or_voltage_unit(tok: &str) -> bool {
     prefixed || is_unit(tok)
 }
 
-/// True if `tok` is an ohm word with the prefix spelled out ("milliohm",
-/// "kilohms"). The joined value does not parse, which is the point: a DCR
-/// written that way is no impedance candidate.
-fn is_prefixed_ohm_word(tok: &str) -> bool {
-    let lower = tok.to_lowercase();
-    lower.ends_with("ohm") || lower.ends_with("ohms")
+/// True if `tok` ends in an ohm word, any case: "ohm", "ohms", or one with
+/// the prefix spelled out ("milliohm", "kilohms"). A spelled-out prefix
+/// makes the joined value unparseable, which is the point: a DCR written
+/// that way is no impedance candidate.
+fn is_ohm_word(tok: &str) -> bool {
+    strip_long_unit_word(tok, 'R').len() != tok.len()
 }
 
 /// True if `tok` is a quantity an `@` can be about: it has a number in it
@@ -3370,7 +3372,8 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
     // on the 0603).
     let nearest = |out: &[BeadToken]| match mark {
         Mark::Dc => out.iter().rposition(|tok| is_quantity(&tok.base)),
-        _ => (0..out.len()).rev().find(|&i| {
+        Mark::Other => None,
+        Mark::Frequency(_) => (0..out.len()).rev().find(|&i| {
             let labelled_dc = out.get(i + 1).is_some_and(|next| {
                 next.index == out[i].index + 1 && is_dc_mark(&next.base)
             });
@@ -3378,10 +3381,13 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
         }),
     };
     // What a mark glued to a token is about without looking further: for
-    // "@DC", any quantity; for a frequency, any ohm value.
+    // "@DC", any quantity; for a frequency, an in-band ohm value, as
+    // `nearest` uses. A glued frequency on an out-of-band DCR then steps
+    // over it as a spaced one does.
     let describes = |tok: &BeadToken| match mark {
         Mark::Dc => is_quantity(&tok.base),
-        _ => parse_value_token(&tok.base, 'R').is_some(),
+        Mark::Other => false,
+        Mark::Frequency(_) => bead_ohms(&tok.base).is_some(),
     };
     let pos = match binding {
         // Stuck to "200mA", an "@DC" is about the 200mA, so it cannot reach
@@ -4324,6 +4330,10 @@ mod value_norm_tests {
             // Glued to a tolerance, it binds as a spaced one does.
             ("600Ω ±25%@100MHz", "600Ω@100MHz"),
             ("1kΩ 1.2Ω DCR@DC", "1kΩ"),
+            // Glued to an out-of-band DCR, a frequency steps over it as a
+            // spaced one does.
+            ("1kΩ 120mΩ@100MHz", "1kΩ@100MHz"),
+            ("1kΩ 120mΩ @100MHz", "1kΩ@100MHz"),
         ] {
             let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
             assert_eq!(v.canonical, want, "{raw}");

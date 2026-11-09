@@ -608,3 +608,28 @@ async fn main() -> anyhow::Result<()> {
     service.waiting().await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The real tool list, not a hand-built one: both drawing tools carry the
+    /// UI meta, so they are shown only to clients that support MCP Apps.
+    #[test]
+    fn real_drawing_tools_are_hidden_from_text_clients() {
+        let names = |ui: bool| {
+            ui::visible_tools(NetlistServer::tool_router().list_all(), ui)
+                .into_iter()
+                .map(|t| t.name.to_string())
+                .collect::<Vec<_>>()
+        };
+        let (with_ui, without_ui) = (names(true), names(false));
+        for t in ["draw_walk", "draw_path_between"] {
+            assert!(with_ui.iter().any(|n| n == t), "{t} missing for UI clients");
+            assert!(!without_ui.iter().any(|n| n == t), "{t} shown to text clients");
+        }
+        for t in ["walk", "path_between"] {
+            assert!(without_ui.iter().any(|n| n == t), "{t} missing for text clients");
+        }
+    }
+}

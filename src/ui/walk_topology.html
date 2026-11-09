@@ -153,7 +153,7 @@ window.addEventListener("message", (ev) => {
     case "ui/notifications/tool-input": onToolInput(m.params); break;
     case "ui/notifications/tool-result": onToolResult(m.params); break;
     case "ui/notifications/tool-cancelled":
-      showMessage("The tool call was cancelled" +(m.params && m.params.reason ? ": " + m.params.reason : "."));
+      showMessage("The tool call was cancelled" + (m.params && m.params.reason ? ": " + m.params.reason : "."));
       break;
     case "ui/notifications/host-context-changed": applyHostContext(m.params); break;
   }
@@ -239,16 +239,20 @@ function netOfPin(topo, handle) {
 }
 
 // A path_between result has `from`/`to` where a walk has `start`/`start_net`.
-// Give both one shape: `start`, `start_net`, and `marks`, the pins to
-// highlight.
+// Give both one shape: `start`, `start_net`, `marks`, the pins to
+// highlight, and `mark_nets`, the nets whose bus is highlighted.
 function normalize(data) {
-  if (data.from === undefined) return { ...data, path: false, marks: [data.start] };
+  if (data.from === undefined) {
+    return { ...data, path: false, marks: [data.start], mark_nets: [data.start_net] };
+  }
+  const startNet = netOfPin(data.topology, data.from);
   return {
     ...data,
     path: true,
     start: data.from,
-    start_net: netOfPin(data.topology, data.from),
+    start_net: startNet,
     marks: [data.from, data.to],
+    mark_nets: [startNet, netOfPin(data.topology, data.to)],
   };
 }
 
@@ -490,10 +494,10 @@ function terminal(g, x, y, end, dir) {
     const dx = dir === "right" ? 1 : dir === "left" ? -1 : 0;
     const dy = dir === "down" ? 1 : dir === "up" ? -1 : 0;
     line(g, x, y, x + 12 * dx, y + 12 * dy, "w open");
-    const t = text(g, x + 16 * dx + (dy ? 6 : 0), y + 16 * dy + 4, end.same ? "same net" : "not walked", "note",
+    const t = text(g, x + 16 * dx + (dy ? 6 : 0), y + 16 * dy + 4, end.same ? "same net" : openLead.label, "note",
       dx < 0 ? "end" : "start");
     title(t, end.same ? "both pins are on the same net" :
-      "this pin is on a net the walk did not reach" + (end.pin && end.pin.net ? " (" + end.pin.net + ")" : ""));
+      openLead.why + (end.pin && end.pin.net ? " (" + end.pin.net + ")" : ""));
   }
 }
 
@@ -555,6 +559,10 @@ function render(data) {
   // Pins to highlight: the walk's start pin, or path_between's from and to.
   const marked = new Set((data.marks || []).filter((m) => String(m || "").includes(":")).map(String));
   const markedRefs = new Set([...marked].map((m) => m.split(":")[0]));
+  const markedNets = new Set((data.mark_nets || [data.start_net]).filter((n) => n != null));
+  openLead = data.path
+    ? { label: "off path", why: "this pin is on a net outside the from→to subgraph" }
+    : { label: "not walked", why: "this pin is on a net the walk did not reach" };
 
   const partGroup = (part) => {
     const cls = [part.dnp ? "dnp" : "", markedRefs.has(part.refdes) || part.role === "start" ? "start" : ""].join(" ").trim();
@@ -641,8 +649,10 @@ function render(data) {
         line(g, otherSideX, y, tip, y);
         terminal(g, tip, y, e, out < 0 ? "right" : "left");
         const pins = e.pins || [e.pin];
-        const num = text(g, otherSideX - out * 4, y - 4, clip(pins.map((p) => p.pin).join(","), 14), "pnum",
-          out < 0 ? "start" : "end");
+        const isMark = pins.some((p) => marked.has(part.refdes + ":" + p.pin));
+        const num = text(g, otherSideX - out * 4, y - 4, clip(pins.map((p) => p.pin).join(","), 14),
+          "pnum" + (isMark ? " startpin" : ""), out < 0 ? "start" : "end");
+        if (isMark) el("circle", { class: "dot startpin", cx: tip, cy: y, r: 3 }, dots);
         if (pins.length > 1) title(num, "pins " + pins.map((p) => p.pin).join(", ") + " on " + e.net);
         const names = [...new Set(pins.map((p) => p.name).filter((n) => n && n !== "~"))];
         if (names.length === 1 && names[0] !== pins[0].pin) {
@@ -662,7 +672,7 @@ function render(data) {
     const ys = (attach.get(i) || []).slice().sort((a, b) => a - b);
     const yTop = TOP - 22;
     const yBot = ys.length ? ys[ys.length - 1] : yTop + 16;
-    const g = el("g", { class: name === L.startNet ? "start" : undefined }, wires);
+    const g = el("g", { class: markedNets.has(name) ? "start" : undefined }, wires);
     line(g, x, yTop, x, yBot, "bus");
     const t = text(g, x, TOP - 46, clip(name, 26), "netname busname", "middle");
     title(t, name + " — fanout " + n.fanout + ", " + n.state);
@@ -705,7 +715,7 @@ function render(data) {
   if (data.truncated) note("The walk hit its depth or endpoint limit. The endpoint limit cuts only the endpoint " +
     "list in the result, not the drawing. Nets marked \"depth limit\" were not walked past.");
   if (data.path && data.note) note(data.note);
-  if (!topo.parts.length) note("No parts on the walked nets.");
+  if (!topo.parts.length) note("No parts to draw.");
 
   document.getElementById("header").hidden = false;
   document.getElementById("footer").hidden = false;
@@ -722,6 +732,9 @@ function render(data) {
 
 // The drawing on screen and its planned right and bottom edges.
 let drawing = null;
+// Label and tooltip for a pin left out of the drawing; render sets it per
+// result type.
+let openLead = { label: "not walked", why: "this pin is on a net the walk did not reach" };
 function sizeTo(svg, x0, y0, x1, y1) {
   svg.setAttribute("viewBox", `${x0} ${y0} ${x1 - x0} ${y1 - y0}`);
   svg.setAttribute("width", x1 - x0);

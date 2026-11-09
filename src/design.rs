@@ -2285,7 +2285,8 @@ struct ComponentDetail {
     keywords: Option<String>,
     footprint: Option<String>,
     sheet: Option<String>,
-    /// The symbol's library id, "lib:part" (e.g. "Device:R").
+    /// The symbol's library id, "lib:part" (e.g. "Device:R"). Raw: KiCad
+    /// escape tokens like `{slash}` are kept (#51).
     lib_id: String,
     /// Do Not Populate: the part is on the schematic but deliberately not
     /// fitted. Always emitted, never null — see `presence_flag`.

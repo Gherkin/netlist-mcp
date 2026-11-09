@@ -652,12 +652,13 @@ mod lib_id_tests {
     use super::parse_netlist;
 
     /// #51: `lib_id` keeps KiCad's escape tokens, while `value` is decoded.
-    /// Decoding `{colon}` would make "Lib:A:B" and split it at the wrong `:`.
+    /// Raw, neither name holds a `:`; decoded, "A:B:C" could be lib "A" or
+    /// lib "A:B".
     #[test]
     fn lib_id_keeps_escape_tokens() {
         let src = r#"(export
             (components
-                (comp (ref "U1") (value "A/B")
+                (comp (ref "U1") (value "A{slash}B")
                     (libsource (lib "My{slash}Lib") (part "A{slash}B{colon}C"))))
             (libparts
                 (libpart (lib "My{slash}Lib") (part "A{slash}B{colon}C")))

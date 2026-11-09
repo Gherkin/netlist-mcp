@@ -1137,17 +1137,19 @@ impl Design {
     /// (ICs, connectors, transistors, ...), stopping at power rails and huge nets
     /// which are reported but never enumerated. Topological, not electrical.
     ///
-    /// `include_topology` is accepted for API stability but ignored here — output
-    /// is a flat endpoint list, not a branch tree.
+    /// `include_topology` adds a `topology` object: the nets the walk touched
+    /// as nodes and the parts as edges, each part with the pin number and net
+    /// of every side (see `build_topology`). Without it the output is the flat
+    /// endpoint list only, unchanged.
     ///
-    /// The BFS core lives in `walk_bfs`; a future `path_between` reuses it.
+    /// The BFS core lives in `walk_bfs`, shared with `path_between`.
     pub fn walk(
         &self,
         start: &str,
         max_depth: u32,
         max_endpoints: u32,
         stop_at_power: bool,
-        _include_topology: bool,
+        include_topology: bool,
     ) -> anyhow::Result<String> {
         // Resolve the start: "REFDES:PIN" is a pin (start_comp excluded from
         // endpoints), otherwise a net name.
@@ -1196,6 +1198,9 @@ impl Design {
                 })
         });
 
+        let topology = include_topology
+            .then(|| self.build_topology(&data.topo, &data.endpoints, start_comp.as_ref()));
+
         let envelope = WalkEnvelope {
             start: start.to_string(),
             start_net: start_net_name,
@@ -1204,6 +1209,7 @@ impl Design {
             large_nets: data.large_nets,
             dead_ends: data.dead_ends,
             truncated: data.truncated,
+            topology,
         };
         return Ok(serde_json::to_string_pretty(&envelope).context("error serializing walk")?);
     }
@@ -1240,6 +1246,7 @@ impl Design {
         let mut large_nets: Vec<LargeNet> = Vec::new();
         let mut dead_ends: Vec<DeadEnd> = Vec::new();
         let mut truncated = false;
+        let mut topo = TopoTrace::default();
 
         let mut queue: std::collections::VecDeque<(usize, Vec<CompId>, u32)> =
             std::collections::VecDeque::new();
@@ -1257,6 +1264,7 @@ impl Design {
                 if stop_at_power {
                     let (score, _evidence) = self.rail_score(net);
                     if score >= RAIL_THRESHOLD {
+                        topo.note_net(net_idx, NetState::Rail);
                         rails_reached.push(RailReached {
                             net: net.name.clone(),
                             score: (score * 100.0).round() / 100.0,
@@ -1266,6 +1274,7 @@ impl Design {
                     }
                 }
                 if net.pins.len() > 40 {
+                    topo.note_net(net_idx, NetState::LargeNet);
                     large_nets.push(LargeNet {
                         net: net.name.clone(),
                         fanout: net.pins.len(),
@@ -1322,6 +1331,7 @@ impl Design {
                     });
                 }
             }
+            topo.note_net(net_idx, NetState::Expanded);
 
             for pin_id in &net.pins {
                 let pin = self.pin(pin_id);
@@ -1352,6 +1362,7 @@ impl Design {
                         .filter(|n| *n != net_idx);
 
                     visited_comps.insert(comp_id.0);
+                    topo.series.push(comp_id.0);
 
                     if other_pin_has_no_net {
                         // Far pin is NC -> dangling, goes nowhere.
@@ -1378,6 +1389,7 @@ impl Design {
                     if other_net.pins.len() == 1 {
                         // Far pin's net has fanout 1 (only that pin) ->
                         // dangling, goes nowhere.
+                        topo.note_net(other_net_idx, NetState::Dangling);
                         let mut via_here = via.clone();
                         via_here.push(CompId(comp_id.0));
                         if dead_end_seen.insert(other_net.name.clone())
@@ -1399,6 +1411,7 @@ impl Design {
                         queue.push_back((other_net_idx, next_via, depth + 1));
                     } else {
                         // Depth-limited branch.
+                        topo.note_net(other_net_idx, NetState::DepthLimit);
                         truncated = true;
                     }
                 } else {
@@ -1440,7 +1453,81 @@ impl Design {
             dead_ends,
             truncated,
             reached_net_count: visited_nets.len(),
+            topo,
         }
+    }
+
+    /// Build the `walk` topology graph from what `walk_bfs` recorded. Nets are
+    /// the nodes the walk touched (expanded, or stopped at). Parts are the
+    /// edges: the start part, every series part traversed (all its pins), and
+    /// every reported endpoint part. Start and endpoint parts list only the
+    /// pins that sit on a node net, so a 100-pin IC shows the pins the walk
+    /// actually reached.
+    fn build_topology(
+        &self,
+        topo: &TopoTrace,
+        endpoints: &[WalkEndpoint],
+        start_comp: Option<&CompId>,
+    ) -> Topology {
+        let node_nets: HashSet<usize> = topo.nets.iter().map(|(n, _)| *n).collect();
+
+        let nets = topo
+            .nets
+            .iter()
+            .map(|(idx, state)| {
+                let net = self.net(&NetId(*idx));
+                let (score, _) = self.rail_score(net);
+                TopoNet {
+                    name: net.name.clone(),
+                    fanout: net.pins.len(),
+                    rail: score >= RAIL_THRESHOLD,
+                    state: state.as_str(),
+                }
+            })
+            .collect();
+
+        let mut parts: Vec<TopoPart> = Vec::new();
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut push_part = |comp_idx: usize, role: &'static str, all_pins: bool| {
+            if !seen.insert(comp_idx) {
+                return;
+            }
+            let comp = self.component(&CompId(comp_idx));
+            let mut pins: Vec<TopoPin> = comp
+                .pins
+                .iter()
+                .map(|p| self.pin(p))
+                .filter(|p| all_pins || p.net.as_ref().is_some_and(|n| node_nets.contains(&n.0)))
+                .map(|p| TopoPin {
+                    pin: p.number.clone(),
+                    name: p.name.clone(),
+                    net: p.net.as_ref().map(|n| self.net(n).name.clone()),
+                })
+                .collect();
+            pins.sort_by(|a, b| Self::pin_sort_key(&a.pin).cmp(&Self::pin_sort_key(&b.pin)));
+            parts.push(TopoPart {
+                refdes: comp.refdes.clone(),
+                value: comp.value.clone(),
+                class: Self::refdes_class(&comp.refdes),
+                dnp: comp.dnp,
+                role,
+                pins,
+            });
+        };
+
+        if let Some(c) = start_comp {
+            push_part(c.0, "start", false);
+        }
+        for c in &topo.series {
+            push_part(*c, "series", true);
+        }
+        for e in endpoints {
+            if let Some(pin_id) = self.pin_map.get(&e.pin) {
+                push_part(self.pin(pin_id).comp.0, "endpoint", false);
+            }
+        }
+
+        Topology { nets, parts }
     }
 
     /// Report whether two pins are connected through the signal/passthrough
@@ -2284,6 +2371,100 @@ struct WalkData {
     /// `path_between`'s negative-result diagnosis. Does not affect walk/BFS
     /// behavior.
     reached_net_count: usize,
+    /// What `build_topology` needs, recorded during the BFS.
+    topo: TopoTrace,
+}
+
+/// How a net in the walk topology was handled by the BFS.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum NetState {
+    /// Popped and its pins walked.
+    Expanded,
+    /// Popped and stopped at: a power/ground rail (`stop_at_power`).
+    Rail,
+    /// Popped and stopped at: fanout > 40.
+    LargeNet,
+    /// The far net of a series part at `max_depth`; never popped.
+    DepthLimit,
+    /// The far net of a series part, with fanout 1; never popped.
+    Dangling,
+}
+
+impl NetState {
+    fn as_str(self) -> &'static str {
+        match self {
+            NetState::Expanded => "expanded",
+            NetState::Rail => "rail",
+            NetState::LargeNet => "large_net",
+            NetState::DepthLimit => "depth_limit",
+            NetState::Dangling => "dangling",
+        }
+    }
+
+    /// Whether the BFS actually popped the net. A popped state is final; a
+    /// non-popped one is replaced if the net is popped later from another
+    /// branch.
+    fn popped(self) -> bool {
+        matches!(self, NetState::Expanded | NetState::Rail | NetState::LargeNet)
+    }
+}
+
+/// Nets (in first-seen order, with state) and series parts (in traversal
+/// order) recorded by `walk_bfs` for `build_topology`.
+#[derive(Debug, Default)]
+struct TopoTrace {
+    nets: Vec<(usize, NetState)>,
+    series: Vec<usize>,
+}
+
+impl TopoTrace {
+    fn note_net(&mut self, net_idx: usize, state: NetState) {
+        match self.nets.iter_mut().find(|(n, _)| *n == net_idx) {
+            None => self.nets.push((net_idx, state)),
+            Some((_, old)) if !old.popped() && state.popped() => *old = state,
+            Some(_) => {}
+        }
+    }
+}
+
+/// The `walk` topology graph (`include_topology`): nets are nodes, parts are
+/// edges that list the net on each of their pins.
+#[derive(Debug, Serialize)]
+struct Topology {
+    nets: Vec<TopoNet>,
+    parts: Vec<TopoPart>,
+}
+
+#[derive(Debug, Serialize)]
+struct TopoNet {
+    name: String,
+    fanout: usize,
+    /// Rail score at or above the rail threshold, whatever `state` is.
+    rail: bool,
+    /// "expanded", "rail", "large_net", "depth_limit" or "dangling".
+    state: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct TopoPart {
+    refdes: String,
+    value: String,
+    class: String,
+    dnp: bool,
+    /// "start" (the part owning the start pin), "series" (a traversed
+    /// passthrough) or "endpoint" (a reported endpoint).
+    role: &'static str,
+    /// Series parts list every pin; start and endpoint parts only the pins on
+    /// a net in `nets`.
+    pins: Vec<TopoPin>,
+}
+
+#[derive(Debug, Serialize)]
+struct TopoPin {
+    pin: String,
+    name: Option<String>,
+    /// Null for an unconnected pin.
+    net: Option<String>,
 }
 
 /// One series part traversed on the way to an endpoint or terminal net.
@@ -2369,6 +2550,8 @@ struct WalkEnvelope {
     large_nets: Vec<LargeNet>,
     dead_ends: Vec<DeadEnd>,
     truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topology: Option<Topology>,
 }
 
 /// The `path_between` output envelope. `via` is empty for a direct same-net
@@ -5165,5 +5348,125 @@ mod filter_nets_rail_tests {
         let json = design.filter_nets(None, Some("Sensor1"), true, 50, 0).expect("filter_nets");
         assert_eq!(rows(&json)[0]["rail_score"], 0.0);
         assert!(!json.contains("rail_note"), "{json}");
+    }
+}
+
+#[cfg(test)]
+mod walk_topology_tests {
+    use super::*;
+
+    fn fixture() -> Design {
+        let data = include_str!("../tests/fixture.net").to_string();
+        let netlist = crate::parser::kicad_parser::parse_netlist(&data).expect("fixture parses");
+        Design::from_netlist(netlist).expect("fixture builds")
+    }
+
+    fn walk(design: &Design, start: &str, max_depth: u32, topology: bool) -> serde_json::Value {
+        let json = design.walk(start, max_depth, 50, true, topology).expect("walk");
+        serde_json::from_str(&json).expect("valid JSON")
+    }
+
+    /// (name, state) for every topology net, in order.
+    fn nets(v: &serde_json::Value) -> Vec<(String, String)> {
+        v["topology"]["nets"]
+            .as_array()
+            .expect("nets")
+            .iter()
+            .map(|n| (n["name"].as_str().unwrap().into(), n["state"].as_str().unwrap().into()))
+            .collect()
+    }
+
+    fn part<'a>(v: &'a serde_json::Value, refdes: &str) -> Option<&'a serde_json::Value> {
+        v["topology"]["parts"].as_array()?.iter().find(|p| p["refdes"] == refdes)
+    }
+
+    /// (pin, net) for one part.
+    fn pins(p: &serde_json::Value) -> Vec<(String, Option<String>)> {
+        p["pins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| (x["pin"].as_str().unwrap().into(), x["net"].as_str().map(String::from)))
+            .collect()
+    }
+
+    fn pn(pin: &str, net: &str) -> (String, Option<String>) {
+        (pin.into(), Some(net.into()))
+    }
+
+    #[test]
+    fn without_the_flag_there_is_no_topology_key() {
+        let v = walk(&fixture(), "/SENSIN1", 4, false);
+        assert!(v.get("topology").is_none(), "{v}");
+    }
+
+    /// The case from #28: an RC to ground. `rails_reached` reports GND once,
+    /// via R21; the graph keeps C11 and the net on each of its pins.
+    #[test]
+    fn the_graph_keeps_the_shunt_cap_and_its_ground_side() {
+        let v = walk(&fixture(), "/SENSIN1", 4, true);
+        assert_eq!(
+            nets(&v),
+            [
+                ("/SENSIN1".into(), "expanded".into()),
+                ("/SENSMID1".into(), "expanded".into()),
+                ("GND".into(), "rail".into()),
+            ]
+        );
+        assert_eq!(v["topology"]["nets"][2]["rail"], true);
+
+        let r11 = part(&v, "R11").expect("R11");
+        assert_eq!(r11["role"], "series");
+        assert_eq!(pins(r11), [pn("1", "/SENSIN1"), pn("2", "/SENSMID1")]);
+        let c11 = part(&v, "C11").expect("C11");
+        assert_eq!(c11["role"], "series");
+        assert_eq!(pins(c11), [pn("1", "/SENSMID1"), pn("2", "GND")]);
+        assert_eq!(pins(part(&v, "R21").expect("R21")), [pn("1", "/SENSMID1"), pn("2", "GND")]);
+
+        assert_eq!(part(&v, "J2").expect("J2")["role"], "endpoint");
+        assert_eq!(part(&v, "TP11").expect("TP11")["role"], "endpoint");
+    }
+
+    /// The start part is an edge too, but shows only the pins the walk reached:
+    /// J2's pins 2 and 3 sit on other sensor channels.
+    #[test]
+    fn a_start_part_lists_only_pins_on_reached_nets() {
+        let v = walk(&fixture(), "J2:1", 4, true);
+        let parts = v["topology"]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["refdes"], "J2");
+        assert_eq!(parts[0]["role"], "start");
+        assert_eq!(pins(&parts[0]), [pn("1", "/SENSIN1")]);
+        assert_eq!(parts.iter().filter(|p| p["refdes"] == "J2").count(), 1);
+    }
+
+    /// At the depth limit the far net is still a node, so the series part
+    /// that hit the limit has both ends; nothing beyond it is listed.
+    #[test]
+    fn a_depth_limited_net_is_a_leaf_node() {
+        let v = walk(&fixture(), "/SENSIN1", 0, true);
+        assert_eq!(
+            nets(&v),
+            [
+                ("/SENSIN1".into(), "expanded".into()),
+                ("/SENSMID1".into(), "depth_limit".into()),
+            ]
+        );
+        assert_eq!(pins(part(&v, "R11").expect("R11")), [pn("1", "/SENSIN1"), pn("2", "/SENSMID1")]);
+        assert!(part(&v, "C11").is_none(), "{v}");
+        assert!(part(&v, "TP11").is_none(), "{v}");
+    }
+
+    /// A net marked at the depth limit from one branch and popped from a
+    /// shorter one ends up with the popped state; a popped state never goes
+    /// back.
+    #[test]
+    fn a_popped_state_wins_and_is_final() {
+        let mut t = TopoTrace::default();
+        t.note_net(7, NetState::DepthLimit);
+        t.note_net(7, NetState::Expanded);
+        t.note_net(7, NetState::Dangling);
+        t.note_net(8, NetState::Rail);
+        t.note_net(8, NetState::DepthLimit);
+        assert_eq!(t.nets, [(7, NetState::Expanded), (8, NetState::Rail)]);
     }
 }

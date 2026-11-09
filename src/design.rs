@@ -3183,9 +3183,9 @@ enum Binding {
     /// An `@` written stuck to a value it can describe is about that value:
     /// "@DC" on any quantity ("200mA@DC"), a frequency on an in-band ohm
     /// value — the same test a spaced one binds with, so "1kΩ 120mΩ@100MHz"
-    /// reads like "1kΩ 120mΩ @100MHz". Stuck to anything else, it binds as [`Binding::Spaced`] does. `at` is
-    /// the `@`'s own index, to check the token before it really is the one it
-    /// was stuck to.
+    /// reads like "1kΩ 120mΩ @100MHz". Stuck to anything else, it binds as
+    /// [`Binding::Spaced`] does. `at` is the `@`'s own index, to check the
+    /// token before it really is the one it was stuck to.
     Glued { at: usize },
     /// An `@` with a space before it is about the nearest value before it
     /// that it can describe: for "@DC", any quantity ("1.2Ω 2kΩ 200mA
@@ -3345,8 +3345,10 @@ fn bead_tokens(tokens: &[(String, bool)]) -> Option<Vec<BeadToken>> {
 
         // A "DCR" label standing after an ohm value ("1.2Ω DCR") says that
         // value is the DC resistance, the same as an "@DC" stuck to it: it is
-        // no impedance candidate, and a frequency steps over it.
-        if is_dc_mark(tok) {
+        // no impedance candidate, and a frequency steps over it. Only the bare
+        // word labels: "DCR=0.3Ω" or "DCR/2A" carries its own value, and a
+        // lone "DC" ("600Ω DC") is not a resistance label.
+        if tok.eq_ignore_ascii_case("dcr") {
             if let Some(prev) = out.last_mut().filter(|prev| prev.index + 1 == index) {
                 if parse_value_token(&prev.base, 'R').is_some() {
                     prev.dc = true;
@@ -3400,10 +3402,11 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
                     stepped |= is_quantity(&tok.base);
                     return false;
                 }
+                // A value struck as DC is no impedance, so it does not count.
                 let bare_after_ohms = is_bare_number(&tok.base)
                     && out[..i]
                         .iter()
-                        .any(|t| is_ohm_marked_token(&t.base) && bead_ohms(&t.base).is_some());
+                        .any(|t| !t.dc && is_ohm_marked_token(&t.base) && bead_ohms(&t.base).is_some());
                 !(stepped && bare_after_ohms)
             })
         }
@@ -3422,6 +3425,10 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
     // current's own rating point ("600Ω@100MHz 2A@1MHz"), not a second
     // impedance. Glued or spaced, the reading is the same.
     let past_quantity = |out: &[BeadToken]| nearest(out).filter(|&p| out[p].freq.is_none());
+    let spaced = |out: &[BeadToken]| match out.last() {
+        Some(tok) if !describes(tok) && is_quantity(&tok.base) => past_quantity(out),
+        _ => nearest(out),
+    };
     let pos = match binding {
         // Stuck to "200mA", an "@DC" is about the 200mA, so it cannot reach
         // back and strike out the 2kΩ of "1.2Ω 2kΩ 200mA@DC". Stuck to
@@ -3433,17 +3440,15 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
         // on by [`bead_split`].
         Binding::Glued { at } => match out.last() {
             Some(tok) if tok.index + 1 == at && describes(tok) => Some(out.len() - 1),
-            Some(tok) if tok.index + 1 == at && is_quantity(&tok.base) => past_quantity(out),
-            Some(tok) if tok.index + 1 == at => nearest(out),
+            Some(tok) if tok.index + 1 == at => spaced(out),
             _ => None,
         },
-        Binding::Spaced => match out.last() {
-            Some(tok) if !describes(tok) && is_quantity(&tok.base) => past_quantity(out),
-            _ => nearest(out),
-        },
+        Binding::Spaced => spaced(out),
+        // Steps over a value struck as DC, as `nearest` does, so "1kΩ 1.2Ω
+        // DCR 100MHz" reads like "1kΩ 1.2Ω DCR @100MHz".
         Binding::OhmMarked => out
             .iter()
-            .rposition(|tok| bead_ohms(&tok.base).is_some() && is_ohm_marked_token(&tok.base)),
+            .rposition(|tok| !tok.dc && bead_ohms(&tok.base).is_some() && is_ohm_marked_token(&tok.base)),
     };
     let Some(pos) = pos else { return Some(()) };
     match mark {
@@ -4246,6 +4251,19 @@ mod value_norm_tests {
             ("1.2Ω DCR 1kΩ", Some("1kΩ")),
             ("1kΩ 1.2Ω DCR @100MHz", Some("1kΩ@100MHz")),
             ("1kΩ@100MHz 1.2Ω DCR", Some("1kΩ@100MHz")),
+            // A bare frequency steps over a labelled DCR as an "@" one does.
+            ("1kΩ 1.2Ω DCR 100MHz", Some("1kΩ@100MHz")),
+            ("1kΩ 1.2Ω DCR 2A 100MHz", Some("1kΩ@100MHz")),
+            // Only the bare word labels. A label with its own value, or a
+            // lone "DC", leaves the value before it alone.
+            ("1kΩ DCR=0.3Ω", Some("1kΩ")),
+            ("600Ω DCR:0.3Ω", Some("600Ω")),
+            ("1kΩ DCR/2A", Some("1kΩ")),
+            ("600Ω DC", Some("600Ω")),
+            ("600 DC 2A", Some("600Ω")),
+            // A struck DCR is no ohm value for a package code to stand behind.
+            ("1.2Ω DCR 0603 2A @100MHz", None),
+            ("1.2Ω@DC 0603 1A @100MHz", None),
         ] {
             let got = normalize_value(raw, "FB").map(|v| v.canonical);
             assert_eq!(got.as_deref(), want, "{raw}");

@@ -8,7 +8,27 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::parser::netlist;
-use crate::sidecar::{Joined, Keys as SidecarKeys, Sidecar, Summary as SidecarSummary};
+use std::sync::{Mutex, PoisonError, RwLock};
+
+use crate::sidecar::{
+    Edit as SidecarEdit, Joined, Keys as SidecarKeys, Sidecar, Summary as SidecarSummary, Written,
+};
+
+/// `write_sidecar`'s result (issue #48).
+#[derive(Serialize)]
+struct SidecarWriteResult<'a> {
+    #[serde(flatten)]
+    written: Written,
+    /// The components in this design whose key in this scope equals the
+    /// written key, capped at 50. Zero is often a typo — or, for a library
+    /// entry, a part this board does not use.
+    matched_components: Vec<&'a str>,
+    matched_count: usize,
+    /// Set when the file was written but reloading the sidecar files
+    /// failed; `get_component` then still shows the entries from before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reload_error: Option<String>,
+}
 
 #[derive(Debug)]
 pub struct Design {
@@ -26,23 +46,74 @@ pub struct Design {
     // `net_hierarchy`, to tell a hierarchy separator in a net name from a
     // slash that is part of a label (issue #16).
     sheet_paths: HashSet<String>,
-    // Read-only enrichment entries (issue #46), joined per component in
-    // `comp_details`. Empty unless `attach_sidecar` is called.
-    sidecar: Sidecar,
+    // Enrichment entries (issue #46), joined per component in
+    // `comp_details`. Empty unless `attach_sidecar` is called. Behind a lock
+    // because `write_sidecar` (issue #48) reloads it while the design is
+    // shared.
+    sidecar: RwLock<Sidecar>,
+    // Held for a whole `write_sidecar` (file lock, disk I/O, reload), so two
+    // writes in this server cannot reload out of order. `sidecar` itself is
+    // write-locked only for the swap, so readers never wait on the file lock.
+    sidecar_write: Mutex<()>,
 }
 
 impl Design {
     /// Attach the enrichment sidecar loaded at startup (issue #46).
     pub fn attach_sidecar(&mut self, sidecar: Sidecar) {
-        self.sidecar = sidecar;
+        self.sidecar = RwLock::new(sidecar);
     }
 
-    /// The keys a component is matched on in the sidecar.
+    /// The sidecar for reading. A writer that panicked left the old,
+    /// complete value in place (it is only ever replaced whole), so a
+    /// poisoned lock is still safe to read.
+    fn sidecar(&self) -> std::sync::RwLockReadGuard<'_, Sidecar> {
+        self.sidecar.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Change one sidecar entry on disk, then reload the sidecar files so
+    /// `get_component` shows the change (issue #48). `sidecar_write` is held
+    /// across both steps, so two writes in this server cannot reload out of
+    /// order; readers are blocked only for the final swap.
+    pub fn write_sidecar(&self, edit: &SidecarEdit) -> anyhow::Result<String> {
+        // Keys are trimmed on both sides; see `sidecar_keys`.
+        let edit = &SidecarEdit { key: edit.key.trim(), ..*edit };
+        // Before the path lookup, so "the library cannot hold refdes" is
+        // what a refdes-to-library write hears, set library or not.
+        edit.check()?;
+        let _order = self.sidecar_write.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = self.sidecar().path_for(edit.origin)?.to_path_buf();
+        let written = crate::sidecar::write_file(&path, edit)?;
+        // The write is on disk whatever happens next. If a reload fails (a
+        // person broke the other file by hand), keep the old entries and say so.
+        let reloaded = self.sidecar().reload();
+        let reload_error = match reloaded {
+            Ok(fresh) => {
+                *self.sidecar.write().unwrap_or_else(PoisonError::into_inner) = fresh;
+                None
+            }
+            Err(e) => Some(format!("{e:#}")),
+        };
+        let matched: Vec<&str> = self.components.iter()
+            .filter(|c| Self::sidecar_keys(c).get(edit.scope) == edit.key)
+            .map(|c| c.refdes.as_str())
+            .collect();
+        let out = SidecarWriteResult {
+            written,
+            matched_count: matched.len(),
+            matched_components: matched.into_iter().take(50).collect(),
+            reload_error,
+        };
+        Ok(serde_json::to_string_pretty(&out).context("error serializing write_sidecar")?)
+    }
+
+    /// The keys a component is matched on in the sidecar. Trimmed, as the
+    /// key `write_sidecar` stores is, so an MPN with a stray space (KiCad
+    /// keeps it) still matches.
     fn sidecar_keys<'a>(comp: &'a Component) -> SidecarKeys<'a> {
         SidecarKeys {
-            refdes: &comp.refdes,
-            lib_id: &comp.lib_id,
-            mpn: comp.mpn_key(),
+            refdes: comp.refdes.trim(),
+            lib_id: comp.lib_id.trim(),
+            mpn: comp.mpn_key().trim(),
         }
     }
 
@@ -115,7 +186,7 @@ impl Design {
             dnp: comp.dnp,
             exclude_from_bom: comp.exclude_from_bom,
             properties: comp.properties.clone(),
-            sidecar: self.sidecar.join(&Self::sidecar_keys(comp)),
+            sidecar: self.sidecar().join(&Self::sidecar_keys(comp)),
             pin_count,
             offset,
             limit,
@@ -1100,7 +1171,7 @@ impl Design {
             connectors,
             subsystems,
             top_nets_by_fanout,
-            sidecar: self.sidecar.summary(self.components.iter().map(Self::sidecar_keys)),
+            sidecar: self.sidecar().summary(self.components.iter().map(Self::sidecar_keys)),
         };
         return Ok(serde_json::to_string_pretty(&envelope)
             .context("error serializing design_overview")?);
@@ -2112,7 +2183,8 @@ impl Design {
             nets: nets,
             net_map: net_map,
             sheet_paths,
-            sidecar: Sidecar::default(),
+            sidecar: Default::default(),
+            sidecar_write: Default::default(),
         });
     }
 }
@@ -4642,7 +4714,8 @@ mod subsystem_filter_seam_tests {
             pin_map: HashMap::new(),
             net_map: HashMap::new(),
             sheet_paths,
-            sidecar: crate::sidecar::Sidecar::default(),
+            sidecar: Default::default(),
+            sidecar_write: Default::default(),
         }
     }
 
@@ -5725,7 +5798,8 @@ mod filter_nets_rail_tests {
             pin_map: HashMap::new(),
             net_map: HashMap::new(),
             sheet_paths: HashSet::new(),
-            sidecar: Sidecar::default(),
+            sidecar: Default::default(),
+            sidecar_write: Default::default(),
         };
 
         for (code, (name, members)) in nets.iter().enumerate() {
@@ -6017,6 +6091,57 @@ mod component_detail_tests {
         let f = &sc["files"][0];
         assert_eq!(f["entries"], serde_json::json!({"lib_id": 1, "mpn": 4, "refdes": 1}));
         assert_eq!(f["unmatched"], serde_json::json!(["mpn.2N7002", "mpn.NOT-IN-DESIGN"]));
+    }
+
+    // #48: a write lands on disk and get_component shows it straight away,
+    // with the components the key matches reported back.
+    #[test]
+    fn write_sidecar_shows_in_get_component() {
+        let dir = std::env::temp_dir().join(format!("design-write-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.sidecar.json");
+        std::fs::copy(&src, dir.join("fixture.sidecar.json")).unwrap();
+        let mut design = fixture();
+        design.attach_sidecar(crate::sidecar::Sidecar::load(&dir.join("fixture.net"), None).expect("loads"));
+
+        let f = serde_json::json!({"channels": 2, "note": null});
+        let edit = crate::sidecar::Edit {
+            origin: crate::sidecar::Origin::Project,
+            scope: crate::sidecar::Scope::LibId,
+            key: "Amplifier:TLV9004",
+            fields: f.as_object().unwrap(),
+            delete: false,
+        };
+        let out: serde_json::Value =
+            serde_json::from_str(&design.write_sidecar(&edit).expect("writes")).unwrap();
+        let disk = std::fs::read_to_string(dir.join("fixture.sidecar.json")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(out["entry"], serde_json::json!({"channels": 2}));
+        assert_eq!(out["matched_components"], serde_json::json!(["U3"]));
+        assert_eq!(out["matched_count"], 1);
+        assert!(out.get("reload_error").is_none(), "{out}");
+        assert!(disk.contains("\"channels\": 2"), "{disk}");
+        let v = component(&design, "U3");
+        assert_eq!(v["sidecar"]["entry"]["channels"], 2);
+    }
+
+    // #48: a write to the library with no $NETLIST_MCP_LIBRARY set is an
+    // error, and nothing changes.
+    #[test]
+    fn write_sidecar_to_unset_library_is_an_error() {
+        let design = fixture_with_sidecar();
+        let f = serde_json::json!({"n": 1});
+        let edit = crate::sidecar::Edit {
+            origin: crate::sidecar::Origin::Library,
+            scope: crate::sidecar::Scope::Mpn,
+            key: "TLV9004",
+            fields: f.as_object().unwrap(),
+            delete: false,
+        };
+        let err = design.write_sidecar(&edit).unwrap_err();
+        assert!(format!("{err:#}").contains("no shared library is set"), "{err:#}");
     }
 }
 

@@ -261,6 +261,33 @@ struct AuditParams {
     limit: Option<u32>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct WriteSidecarParams {
+    /// Which table the entry is keyed in: "lib_id" (the symbol's library id,
+    /// exactly as get_component's `lib_id` shows it — reusable across
+    /// boards), "mpn" (the `MPN` property, else `value` — reusable across
+    /// boards), or "refdes" (one part on this board only).
+    scope: sidecar::Scope,
+    /// The key, matched exactly (case and all) against components, after
+    /// trimming leading and trailing whitespace on both sides.
+    key: String,
+    /// Top-level fields to set on the entry. A field given as null is
+    /// removed; fields not named are kept. An entry left with no fields is
+    /// removed. Values can be any JSON.
+    #[serde(default)]
+    fields: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Remove the whole entry instead (default false). Do not give
+    /// `fields` with it. Removing an entry that does not exist is an error.
+    #[serde(default)]
+    delete: Option<bool>,
+    /// The file to write: "project" (default; `<netlist stem>.sidecar.json`
+    /// next to the netlist, created if missing) or "library" (the shared
+    /// file named by $NETLIST_MCP_LIBRARY; must be set at startup). A
+    /// "refdes" entry can only go in the project file.
+    #[serde(default)]
+    file: Option<sidecar::Origin>,
+}
+
 #[derive(Clone)]
 struct NetlistServer {
     design: std::sync::Arc<Design>,
@@ -522,6 +549,35 @@ impl NetlistServer {
             Err(e) => format!("error: {e:#}"),
         }
     }
+
+    #[tool(description = "Write one enrichment sidecar entry: the facts the \
+        netlist lacks that get_component shows under `sidecar`. The only \
+        tool that changes anything; it writes a JSON file on disk, never the \
+        netlist or the schematic. Key an entry by `lib_id` or `mpn` to cover \
+        every part of that kind (and, in the shared library, every board), or \
+        by `refdes` for one part on this board; refdes beats mpn beats \
+        lib_id when they set the same field. `fields` are merged into the \
+        entry per top-level field (null removes one); `delete` drops the \
+        whole entry. The file is re-read from disk under a lock before the \
+        change, so edits made elsewhere since startup are kept. Returns the \
+        entry as now stored in that file and the components the key matches \
+        in this design (`matched_count` 0 is often a typo). get_component \
+        shows the change at once; edits another process makes show after \
+        this server's next write or a restart.")]
+    fn write_sidecar(&self, Parameters(p): Parameters<WriteSidecarParams>) -> String {
+        let fields = p.fields.unwrap_or_default();
+        let edit = sidecar::Edit {
+            origin: p.file.unwrap_or(sidecar::Origin::Project),
+            scope: p.scope,
+            key: &p.key,
+            fields: &fields,
+            delete: p.delete.unwrap_or(false),
+        };
+        match self.design.write_sidecar(&edit) {
+            Ok(out) => out,
+            Err(e) => format!("error: {e:#}"),
+        }
+    }
 }
 
 const SERVER_INSTRUCTIONS: &str = "\
@@ -579,6 +635,12 @@ REVIEW (factual patterns, not verdicts):
   power_in nets, undriven input nets, single-IC-pin nets, and stub nets. It \
   reports observed states, never asserts a bug; you judge relevance. get_net's \
   `role` field carries the same classification for a single net.
+
+ENRICH (the one tool that writes):
+- write_sidecar: set or remove the facts the netlist lacks (through-models, \
+  pin roles, notes) for a part kind (lib_id / mpn) or one refdes. It writes \
+  a JSON sidecar file, never the netlist; get_component shows the result. \
+  Every other tool only reads.
 
 DNP: every component identity carries a `dnp` boolean — get_component, \
 get_pin's owning component, filter/find rows, get_net members, neighbors (the \

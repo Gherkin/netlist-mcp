@@ -240,7 +240,8 @@ function netOfPin(topo, handle) {
 
 // A path_between result has `from`/`to` where a walk has `start`/`start_net`.
 // Give both one shape: `start`, `start_net`, `marks`, the pins to
-// highlight, and `mark_nets`, the nets whose bus is highlighted.
+// highlight, and `mark_nets`, the nets whose bus is highlighted when the net
+// is drawn as a bus (a rail end is drawn as rail symbols, so it is not lit).
 function normalize(data) {
   if (data.from === undefined) {
     return { ...data, path: false, marks: [data.start], mark_nets: [data.start_net] };
@@ -387,7 +388,7 @@ function layout(data) {
     const lo = busEnds.length ? busEnds[0].col : 0;
     const hi = busEnds.length ? busEnds[busEnds.length - 1].col : 0;
     const rows = Math.max(busEnds.length, otherEnds.length, 1);
-    // A rail name or "not walked" right of the box runs across the next
+    // A rail name or an open-lead label right of the box runs across the next
     // bus, so keep those rows free in the next gap too.
     const labelsRight = !left && otherEnds.some((e) => e.kind === "open" || (e.kind === "rail" && railHasLabel(e.net)));
     items.push({
@@ -473,8 +474,16 @@ function railGlyph(g, x, y, name, dir) {
   title(g, String(name));
 }
 
-// Draw the far end of a lead: rail symbol, no-connect, or open (not walked).
-function terminal(g, x, y, end, dir) {
+// Label and tooltip for an open lead: a pin on a net the drawing does not
+// show. Which one applies depends on the result type.
+const OPEN_LEAD = {
+  walk: { label: "not walked", why: "this pin is on a net the walk did not reach" },
+  path: { label: "off path", why: "this pin is on a net outside the from→to subgraph" },
+};
+
+// Draw the far end of a lead: rail symbol, no-connect, or open (an
+// OPEN_LEAD entry, passed as `lead`).
+function terminal(g, x, y, end, dir, lead) {
   if (end.kind === "rail") {
     if (dir === "up" || dir === "down") {
       railGlyph(g, x, y, end.net, dir);
@@ -494,10 +503,10 @@ function terminal(g, x, y, end, dir) {
     const dx = dir === "right" ? 1 : dir === "left" ? -1 : 0;
     const dy = dir === "down" ? 1 : dir === "up" ? -1 : 0;
     line(g, x, y, x + 12 * dx, y + 12 * dy, "w open");
-    const t = text(g, x + 16 * dx + (dy ? 6 : 0), y + 16 * dy + 4, end.same ? "same net" : openLead.label, "note",
+    const t = text(g, x + 16 * dx + (dy ? 6 : 0), y + 16 * dy + 4, end.same ? "same net" : lead.label, "note",
       dx < 0 ? "end" : "start");
     title(t, end.same ? "both pins are on the same net" :
-      openLead.why + (end.pin && end.pin.net ? " (" + end.pin.net + ")" : ""));
+      lead.why + (end.pin && end.pin.net ? " (" + end.pin.net + ")" : ""));
   }
 }
 
@@ -557,12 +566,10 @@ function render(data) {
   const body = el("g", {}, svg);
   const dots = el("g", {}, svg);
   // Pins to highlight: the walk's start pin, or path_between's from and to.
-  const marked = new Set((data.marks || []).filter((m) => String(m || "").includes(":")).map(String));
+  const marked = new Set(data.marks.filter((m) => String(m || "").includes(":")).map(String));
   const markedRefs = new Set([...marked].map((m) => m.split(":")[0]));
-  const markedNets = new Set((data.mark_nets || [data.start_net]).filter((n) => n != null));
-  openLead = data.path
-    ? { label: "off path", why: "this pin is on a net outside the from→to subgraph" }
-    : { label: "not walked", why: "this pin is on a net the walk did not reach" };
+  const markedNets = new Set(data.mark_nets.filter((n) => n != null));
+  const lead = data.path ? OPEN_LEAD.path : OPEN_LEAD.walk;
 
   const partGroup = (part) => {
     const cls = [part.dnp ? "dnp" : "", markedRefs.has(part.refdes) || part.role === "start" ? "start" : ""].join(" ").trim();
@@ -604,14 +611,14 @@ function render(data) {
       it.shunts.forEach((sh, k) => {
         const x = xs[k];
         const g = partGroup(sh.part);
-        if (it.free) terminal(g, x, y0, sh.top, "up");
+        if (it.free) terminal(g, x, y0, sh.top, "up", lead);
         const s = el("g", { transform: `translate(${x},${y0 + 6}) rotate(90)` }, g);
         line(g, x, y0, x, y0 + 6);
         // An endpoint diode lists only its pins on walked nets, so the bottom
         // pin can be missing: then orient by the pin on the bus.
         symbol(s, sh.part.class, sh.bot.pin ? isCathode(sh.bot.pin) : !isCathode(sh.top.pin));
         const yb = y0 + 6 + SYMLEN;
-        terminal(g, x, yb, sh.bot, "down");
+        terminal(g, x, yb, sh.bot, "down", lead);
         text(g, x + 14, y0 + 26, partLabel(sh.part), "ref");
         text(g, x + 14, y0 + 39, clip(sh.part.value, 9), "val");
         maxX = Math.max(maxX, x + 70);
@@ -647,16 +654,17 @@ function render(data) {
         const y = rowY(it.row + 1 + k);
         const tip = otherSideX - out * 16;
         line(g, otherSideX, y, tip, y);
-        terminal(g, tip, y, e, out < 0 ? "right" : "left");
+        terminal(g, tip, y, e, out < 0 ? "right" : "left", lead);
         const pins = e.pins || [e.pin];
-        const isMark = pins.some((p) => marked.has(part.refdes + ":" + p.pin));
+        const isStart = pins.some((p) => marked.has(part.refdes + ":" + p.pin));
         const num = text(g, otherSideX - out * 4, y - 4, clip(pins.map((p) => p.pin).join(","), 14),
-          "pnum" + (isMark ? " startpin" : ""), out < 0 ? "start" : "end");
-        if (isMark) el("circle", { class: "dot startpin", cx: tip, cy: y, r: 3 }, dots);
+          "pnum" + (isStart ? " startpin" : ""), out < 0 ? "start" : "end");
+        if (isStart) el("circle", { class: "dot startpin", cx: tip, cy: y, r: 3 }, dots);
         if (pins.length > 1) title(num, "pins " + pins.map((p) => p.pin).join(", ") + " on " + e.net);
         const names = [...new Set(pins.map((p) => p.name).filter((n) => n && n !== "~"))];
         if (names.length === 1 && names[0] !== pins[0].pin) {
-          text(g, otherSideX + out * 5, y + 4, clip(names[0], 13), "pname", out < 0 ? "end" : "start");
+          text(g, otherSideX + out * 5, y + 4, clip(names[0], 13), "pname" + (isStart ? " startpin" : ""),
+            out < 0 ? "end" : "start");
         } else if (pins.length > 1) {
           text(g, otherSideX + out * 5, y + 4, pins.length + " pins", "pname", out < 0 ? "end" : "start");
         }
@@ -732,9 +740,6 @@ function render(data) {
 
 // The drawing on screen and its planned right and bottom edges.
 let drawing = null;
-// Label and tooltip for a pin left out of the drawing; render sets it per
-// result type.
-let openLead = { label: "not walked", why: "this pin is on a net the walk did not reach" };
 function sizeTo(svg, x0, y0, x1, y1) {
   svg.setAttribute("viewBox", `${x0} ${y0} ${x1 - x0} ${y1 - y0}`);
   svg.setAttribute("width", x1 - x0);

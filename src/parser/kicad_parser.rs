@@ -388,7 +388,7 @@ fn parse_component(node: &NetListNode, base_tree: &NetListNode) -> anyhow::Resul
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    ensure!(lib_part.len() == 1, "more than one libpart {} with lib {} found!", comp_lib_part, comp_lib);
+    ensure!(lib_part.len() == 1, "expected one libpart {} with lib {}, found {}", comp_lib_part, comp_lib, lib_part.len());
 
     let lib_pins = lib_part.into_iter().next().unwrap()
         .get_child(&Token::sym("pin"))

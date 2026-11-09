@@ -5905,18 +5905,8 @@ mod filter_nets_rail_tests {
 }
 
 #[cfg(test)]
-mod walk_topology_tests {
-    use super::*;
-
-    fn fixture() -> Design {
-        let data = include_str!("../tests/fixture.net").to_string();
-        let netlist = crate::parser::kicad_parser::parse_netlist(&data).expect("fixture parses");
-        Design::from_netlist(netlist).expect("fixture builds")
-    }
-
-    fn walk(design: &Design, start: &str, max_depth: u32, topology: bool) -> serde_json::Value {
-        capped(design, start, max_depth, topology, 200)
-    }
+mod component_detail_tests {
+    use super::walk_topology_tests::fixture;
 
     // #45: the libsource lib:part is kept and returned by get_component.
     #[test]
@@ -5925,6 +5915,21 @@ mod walk_topology_tests {
         let json = design.comp_details("H1", 10, 0).expect("H1 exists");
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(v["lib_id"], "Mechanical:MountingHole");
+    }
+}
+
+#[cfg(test)]
+mod walk_topology_tests {
+    use super::*;
+
+    pub(super) fn fixture() -> Design {
+        let data = include_str!("../tests/fixture.net").to_string();
+        let netlist = crate::parser::kicad_parser::parse_netlist(&data).expect("fixture parses");
+        Design::from_netlist(netlist).expect("fixture builds")
+    }
+
+    fn walk(design: &Design, start: &str, max_depth: u32, topology: bool) -> serde_json::Value {
+        capped(design, start, max_depth, topology, 200)
     }
 
     fn capped(

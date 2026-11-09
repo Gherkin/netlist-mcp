@@ -245,7 +245,13 @@ impl Sidecar {
                 // (a typo, or a relative path from another cwd) would turn
                 // the library off without a word, so it stops startup.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && origin == Origin::Library => {
-                    bail!("sidecar {shown}: ${LIBRARY_ENV} names a file that does not exist");
+                    // Show the absolute path tried, quoted, so a cwd mistake
+                    // or a blank value is visible in the message.
+                    let tried = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+                    bail!(
+                        "sidecar {shown}: ${LIBRARY_ENV} names a file that does not exist (looked for \"{}\")",
+                        tried.display()
+                    );
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     probes.push(Probe { path: shown, origin, found: false });
@@ -479,5 +485,26 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains(&lib.display().to_string()), "{msg}");
         assert!(msg.contains("does not exist"), "{msg}");
+        assert!(msg.contains(LIBRARY_ENV), "{msg}");
+        let abs = std::path::absolute(&lib).unwrap();
+        assert!(msg.contains(&format!("\"{}\"", abs.display())), "{msg}");
+    }
+
+    // join() precedence needs library files before project files; load()
+    // must probe in that order.
+    #[test]
+    fn load_reads_library_before_project() {
+        let dir = std::env::temp_dir().join(format!("sidecar-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = dir.join("lib.json");
+        std::fs::write(&lib, r#"{"mpn": {"X": {"n": 1}}}"#).unwrap();
+        std::fs::write(dir.join("board.sidecar.json"), r#"{"mpn": {"X": {"n": 2}}}"#).unwrap();
+        let s = Sidecar::load(&dir.join("board.net"), Some(&lib));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let s = s.expect("ok");
+        let order: Vec<(Origin, bool)> = s.probes.iter().map(|p| (p.origin, p.found)).collect();
+        assert_eq!(order, vec![(Origin::Library, true), (Origin::Project, true)]);
+        let j = s.join(&keys("U1", "", "X")).expect("matches");
+        assert_eq!(j.entry["n"], json!(2));
     }
 }

@@ -9,6 +9,7 @@ use design::Design;
 
 mod parser;
 mod design;
+mod ui;
 
 fn load_file<P: AsRef<Path>>(path: P) -> String {
     let data = fs::read_to_string(path).expect("this file should exist");
@@ -26,9 +27,10 @@ fn load_design() -> anyhow::Result<Design> {
     return Ok(design);
 }
 
-use rmcp::{tool, tool_router, tool_handler, ServerHandler, ServiceExt,
-           handler::server::wrapper::Parameters, transport::stdio,
-           model::{ServerInfo, ServerCapabilities}};
+use rmcp::{tool, tool_router, tool_handler, ErrorData, RoleServer, ServerHandler, ServiceExt,
+           handler::server::wrapper::Parameters, service::RequestContext, transport::stdio,
+           model::{ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams,
+                   ReadResourceResult, ServerInfo, ServerCapabilities}};
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct GetNetParams {
@@ -154,6 +156,28 @@ struct WalkParams {
     /// Nets only the cut parts reach are left out too. `topology.truncated`
     /// and the `omitted_parts`/`omitted_nets` counts report the cut; a net's
     /// own `omitted_parts` counts the cut parts on it (left out when 0).
+    #[serde(default)]
+    max_topology_parts: Option<u32>,
+}
+
+/// `walk` parameters for `draw_walk`, minus `include_topology`: the drawing
+/// needs the topology, so it is always on.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DrawWalkParams {
+    /// Start point: a pin "REFDES:PIN" or a net name.
+    start: String,
+    /// Max passthrough hops before a branch is cut (default 4).
+    #[serde(default)]
+    max_depth: Option<u32>,
+    /// Max endpoints listed in the text result (default 50). Does not cap the
+    /// drawing.
+    #[serde(default)]
+    max_endpoints: Option<u32>,
+    /// Stop at power/ground rails instead of enumerating them (default true).
+    #[serde(default)]
+    stop_at_power: Option<bool>,
+    /// Max parts drawn (default 200, minimum 1; 0 is read as 1), nearest to
+    /// the start first. The drawing says when parts were cut.
     #[serde(default)]
     max_topology_parts: Option<u32>,
 }
@@ -344,6 +368,28 @@ impl NetlistServer {
         }
     }
 
+    #[tool(description = "Draw a walk as a schematic for the human in the \
+        chat. Same walk and same JSON result as `walk` with include_topology \
+        on; in clients that support MCP Apps the result is also shown as a \
+        drawing (R, C, L, FB, D as symbols, ICs and connectors as boxes, \
+        rails as ground/supply symbols, DNP parts dashed). Use it when \
+        showing the circuit helps the user; use `walk` for your own tracing. \
+        In clients without MCP Apps it is just `walk` with the topology.",
+        meta = ui::draw_walk_tool_meta())]
+    fn draw_walk(&self, Parameters(p): Parameters<DrawWalkParams>) -> String {
+        match self.design.walk(
+            &p.start,
+            p.max_depth.unwrap_or(4),
+            p.max_endpoints.unwrap_or(50),
+            p.stop_at_power.unwrap_or(true),
+            true,
+            p.max_topology_parts.unwrap_or(200),
+        ) {
+            Ok(out) => out,
+            Err(e) => format!("error: {e:#}"),
+        }
+    }
+
     #[tool(description = "List the components one hop away from a component — \
         those sharing any net with it. Cheap orientation before a full walk.")]
     fn neighbors(&self, Parameters(p): Parameters<NeighborsParams>) -> String {
@@ -428,6 +474,8 @@ TRACE (connectivity — the point of this server):
   net it passes THROUGH series parts (resistors, inductors, ferrites, caps) to \
   the real endpoints (ICs, connectors), and stops at power/ground rails instead \
   of enumerating them. Topological, not electrical.
+- draw_walk: the same walk, shown to the user as a drawn schematic in clients \
+  that support MCP Apps. Use it when a picture of the circuit helps the user.
 - neighbors: the parts one hop away, grouped by shared net (rails appear as one \
   capped group). Cheap orientation before a walk.
 - path_between: whether two pins are connected through series parts (not across \
@@ -458,8 +506,26 @@ scores and confidences are hints, not guarantees.";
 #[tool_handler]
 impl ServerHandler for NetlistServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_instructions(SERVER_INSTRUCTIONS)
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(ListResourcesResult::with_all_items(ui::resources()))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        ui::read(&request.uri).ok_or_else(|| {
+            ErrorData::resource_not_found(format!("no resource '{}'", request.uri), None)
+        })
     }
 }
 

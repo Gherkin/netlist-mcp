@@ -3,7 +3,7 @@ use std::path::Path;
 use std::fs;
 use std::sync::Arc;
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 
 use design::Design;
 
@@ -12,9 +12,12 @@ mod design;
 mod ui;
 mod sidecar;
 
-fn load_file<P: AsRef<Path>>(path: P) -> String {
-    let data = fs::read_to_string(path).expect("this file should exist");
-    return data
+// Issue #56: a missing or unreadable netlist is a clean startup error that
+// names the path, like the sidecar files (#54), not a panic.
+fn load_file<P: AsRef<Path>>(path: P) -> anyhow::Result<String> {
+    let path = path.as_ref();
+    fs::read_to_string(path)
+        .with_context(|| format!("netlist {}: cannot read", path.display()))
 }
 
 fn load_design() -> anyhow::Result<Design> {
@@ -22,7 +25,7 @@ fn load_design() -> anyhow::Result<Design> {
     if args.len() < 2 {
         bail!("no file argument!")
     }
-    let data = load_file(&args[1]);
+    let data = load_file(&args[1])?;
     let netlist = parser::kicad_parser::parse_netlist(&data)?;
     let mut design = design::Design::from_netlist(netlist)?;
     // Issue #46: optional enrichment files. A missing project file is
@@ -633,6 +636,16 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #56: a missing netlist is an error naming the path, not a panic.
+    #[test]
+    fn missing_netlist_is_an_error_naming_the_path() {
+        let path = "tests/no-such-netlist.net";
+        let err = load_file(path).expect_err("missing file must be an error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(path), "path missing from error: {msg}");
+        assert!(msg.contains("cannot read"), "unexpected error: {msg}");
+    }
 
     /// The real tool list, not a hand-built one: both drawing tools carry the
     /// UI meta, so they are shown only to clients that support MCP Apps.

@@ -3068,6 +3068,9 @@ fn normalize_bead_value(value: &str) -> Option<ValueNorm> {
             }) {
                 return None;
             }
+            if is_four_digit_number(&first.0.base) {
+                return None;
+            }
             (first.1, first.0.freq.clone())
         }
         // No frequency quoted anywhere, so the ohm mark is all there is to go
@@ -3094,9 +3097,14 @@ fn normalize_bead_value(value: &str) -> Option<ValueNorm> {
                 //    starts from the top, unless the top is a package code.
                 //    Once a value was struck as a DC quantity, the survivor
                 //    says nothing of itself: "1.2Ω DCR 600" and "1.2Ω DCR
-                //    1206" look the same, and one is a package code.
+                //    1206" look the same, and one is a package code. A bare
+                //    four-digit number ("1206", "2512") may be one too, so
+                //    it is no reading on its own.
                 [] => {
                     if struck_dc {
+                        return None;
+                    }
+                    if candidates.first().is_some_and(|(tok, _)| is_four_digit_number(&tok.base)) {
                         return None;
                     }
                     if candidates.is_empty() && split.first().is_some_and(|(tok, _)| is_package_code(tok)) {
@@ -3141,6 +3149,14 @@ fn bead_ohms(tok: &str) -> Option<f64> {
 /// A decimal ("0.5") is a value.
 fn is_package_code(tok: &str) -> bool {
     is_bare_number(tok) && tok.starts_with('0') && tok[1..].starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// True if `tok` is four digits and nothing else ("1206", "2512", "1000"):
+/// it may be a package code, so a reading that rests on it alone is `null`.
+/// Unlike [`is_package_code`] it still counts as a candidate, so it still
+/// makes a string ambiguous ("1kΩ 1206 @100MHz" stays `null`).
+fn is_four_digit_number(tok: &str) -> bool {
+    tok.len() == 4 && tok.chars().all(|c| c.is_ascii_digit())
 }
 
 /// One whitespace token of a bead's value string, as [`bead_tokens`] read it.
@@ -3475,10 +3491,16 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
         },
         Binding::Spaced => spaced(out),
         // Steps over a value struck as DC, as `nearest` does, so "1kΩ 1.2Ω
-        // DCR 100MHz" reads like "1kΩ 1.2Ω DCR @100MHz".
-        Binding::OhmMarked => out
-            .iter()
-            .rposition(|tok| !tok.dc && bead_ohms(&tok.base).is_some() && is_ohm_marked_token(&tok.base)),
+        // DCR 100MHz" reads like "1kΩ 1.2Ω DCR @100MHz". With two in-band
+        // ohm values before it ("1kΩ 1.5Ω 100MHz"), adjacency is all there
+        // is to choose by, and it points at the DCR as often as not: `null`.
+        Binding::OhmMarked => {
+            let ohms = |tok: &BeadToken| !tok.dc && bead_ohms(&tok.base).is_some() && is_ohm_marked_token(&tok.base);
+            if out.iter().filter(|tok| ohms(tok)).count() > 1 {
+                return None;
+            }
+            out.iter().rposition(ohms)
+        }
     };
     let Some(pos) = pos else { return Some(()) };
     match mark {
@@ -3487,12 +3509,14 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
         Mark::Frequency(_) if bead_ohms(&out[pos].base).is_none() => {}
         // A bare number took the frequency, but an in-band value that says
         // it is ohms comes first: a package code or MPN fragment may have
-        // caught the mark. Do not guess which is the impedance.
+        // caught the mark. Do not guess which is the impedance. The same
+        // after a value struck as DC: "1.2Ω DCR 600 @100MHz" and "1.2Ω DCR
+        // 1206 @100MHz" look alike, and one is a package code.
         Mark::Frequency(_)
             if !is_ohm_marked_token(&out[pos].base)
                 && out[..pos]
                     .iter()
-                    .any(|tok| !tok.dc && is_ohm_marked_token(&tok.base) && bead_ohms(&tok.base).is_some()) =>
+                    .any(|tok| tok.dc || (is_ohm_marked_token(&tok.base) && bead_ohms(&tok.base).is_some())) =>
         {
             return None
         }
@@ -4307,9 +4331,9 @@ mod value_norm_tests {
             ("1.2Ω@DC 0603", None),
             ("1.2Ω DCR 600", None),
             ("1.2Ω DCR 1kΩ", Some("1kΩ")),
-            // ...but a bare number the frequency names still does.
-            ("1.2Ω DCR 600 @100MHz", Some("600Ω@100MHz")),
-            ("1.2Ω DCR 600@100MHz", Some("600Ω@100MHz")),
+            // ...nor one a frequency names (corpus rows 160-162, 169).
+            ("1.2Ω DCR 600 @100MHz", None),
+            ("1.2Ω DCR 600@100MHz", None),
             // A DCR label binds to the ohm value beside it, and with one on
             // each side, to the smaller.
             ("600R DCR 0.3R", Some("600Ω")),
@@ -4435,7 +4459,10 @@ mod value_norm_tests {
         // count see "1kΩ", not a "1" and a "kΩ".
         for (raw, want) in [
             ("1 k ohm@100MHz", Some("1kΩ@100MHz")),
-            ("1.2Ω 1 kΩ 100MHz", Some("1kΩ@100MHz")),
+            ("1 kΩ 100MHz", Some("1kΩ@100MHz")),
+            // Two ohm values before a bare frequency: `null` (corpus row 84),
+            // but not the 1.2Ω, as an unjoined "1" and "kΩ" would give.
+            ("1.2Ω 1 kΩ 100MHz", None),
             ("1.5Ω 1 kΩ", None),
             ("600 ohm @ 100 MHz", Some("600Ω@100MHz")),
             ("1k @ 100 M", Some("1kΩ@100MHz")),

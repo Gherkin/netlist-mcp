@@ -3475,6 +3475,16 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
         Some(tok) if !describes(tok) && is_quantity(&tok.base) => past_quantity(out),
         _ => nearest(out),
     };
+    // A frequency that has to look for its value, with two in-band ohm
+    // values before it ("1kΩ 1.5Ω @100MHz"): the nearest is the DCR as often
+    // as the impedance, so `null`, as for a bare frequency below. A mark
+    // glued straight onto one of them says which it is.
+    let two_ohms = matches!(mark, Mark::Frequency(_))
+        && out
+            .iter()
+            .filter(|tok| !tok.dc && bead_ohms(&tok.base).is_some() && is_ohm_marked_token(&tok.base))
+            .count()
+            > 1;
     let pos = match binding {
         // Stuck to "200mA", an "@DC" is about the 200mA, so it cannot reach
         // back and strike out the 2kΩ of "1.2Ω 2kΩ 200mA@DC". Stuck to
@@ -3486,10 +3496,20 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
         // on by [`bead_split`].
         Binding::Glued { at } => match out.last() {
             Some(tok) if tok.index + 1 == at && describes(tok) => Some(out.len() - 1),
-            Some(tok) if tok.index + 1 == at => spaced(out),
+            Some(tok) if tok.index + 1 == at => {
+                if two_ohms {
+                    return None;
+                }
+                spaced(out)
+            }
             _ => None,
         },
-        Binding::Spaced => spaced(out),
+        Binding::Spaced => {
+            if two_ohms {
+                return None;
+            }
+            spaced(out)
+        }
         // Steps over a value struck as DC, as `nearest` does, so "1kΩ 1.2Ω
         // DCR 100MHz" reads like "1kΩ 1.2Ω DCR @100MHz". With two in-band
         // values before it ("1kΩ 1.5Ω 100MHz", "1.2Ω 600 100MHz"), marked
@@ -4408,7 +4428,8 @@ mod value_norm_tests {
             ("1kΩ 1.5A ±25% @100MHz", Some("1kΩ@100MHz")),
             ("1kΩ (0603) @100MHz", Some("1kΩ@100MHz")),
             ("1kΩ 1.5A, @100MHz", Some("1kΩ@100MHz")),
-            ("1.2Ω 600Ω 2A @100MHz", Some("600Ω@100MHz")),
+            // Two in-band ohm values before the mark: `null` (corpus row 82).
+            ("1.2Ω 600Ω 2A @100MHz", None),
             ("1kΩ 2A typ@100MHz", Some("1kΩ@100MHz")),
         ] {
             let got = normalize_value(raw, "FB").map(|v| v.canonical);

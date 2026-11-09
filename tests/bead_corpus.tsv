@@ -79,7 +79,7 @@ BLM18PG121SN1D	null
 600R 0603	600Ω
 1.5Ω 600@100MHz	null
 2A 1.2Ω 600@100MHz	null
-1.2Ω 600Ω 2A @100MHz	600Ω@100MHz
+1.2Ω 600Ω 2A @100MHz	null
 1.2Ω 1 kΩ 100MHz	null
 1kΩ 1.5Ω 100MHz	null
 1kΩ 120mΩ 100MHz	1kΩ@100MHz
@@ -181,13 +181,13 @@ BLM18PG121SN1D	null
 1.2Ω DC/2A 1kΩ	null
 600Ω DC	600Ω
 600 DC 2A	600Ω
-1kΩ 1.5Ω 0603 @100MHz	1.5Ω@100MHz
-220Ω 1.5Ω 0603 @100MHz	1.5Ω@100MHz
+1kΩ 1.5Ω 0603 @100MHz	null
+220Ω 1.5Ω 0603 @100MHz	null
 1.2Ω 0603 @100MHz	1.2Ω@100MHz
 2A 1.2Ω 0603 @100MHz	1.2Ω@100MHz
-1kΩ 1.5Ω 2A @100MHz	1.5Ω@100MHz
-1kΩ 1.5Ω @100MHz	1.5Ω@100MHz
-1kΩ 0603 1.5Ω @100MHz	1.5Ω@100MHz
+1kΩ 1.5Ω 2A @100MHz	null
+1kΩ 1.5Ω @100MHz	null
+1kΩ 0603 1.5Ω @100MHz	null
 1kΩ 1.5Ω@100MHz	1.5Ω@100MHz
 1kΩ 1.5Ω 2A 100MHz	null
 1.2Ω 600 100MHz	null

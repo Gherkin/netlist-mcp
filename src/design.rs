@@ -1805,7 +1805,8 @@ impl Design {
     /// pruned to the from→to subgraph by `path_subgraph`. It keeps the series
     /// parts on some route from `from_net` to `to_net`, the passive branches
     /// from a route net down to a rail (shunts), and every other endpoint
-    /// part with a pin on a route net; branches that reach neither `to` nor
+    /// part with a pin on a route or shunt net, so the part an RC filter
+    /// feeds is drawn with it; branches that reach neither `to` nor
     /// a rail are left out. A passive end part counts as an edge for the
     /// route test, but keeps its start or endpoint role in the graph.
     ///
@@ -1870,7 +1871,7 @@ impl Design {
             .endpoints
             .iter()
             .filter(|e| e.comp_idx != from_comp && e.comp_idx != to_comp)
-            .filter(|e| route_nets.contains(&e.net_idx))
+            .filter(|e| kept_nets.contains(&e.net_idx))
             .map(|e| (e.comp_idx, e.distance))
             .collect();
         others.sort_by_cached_key(|&(c, d)| {
@@ -6210,29 +6211,39 @@ mod walk_topology_tests {
     }
 
     /// Issue #39, the fixture case: J3:1 to U3:1 over R50 and R51 in
-    /// parallel, with C50 to GND and TP51 on the route net. R52 and TP50 lead
-    /// nowhere and are pruned.
+    /// parallel, with C50 to GND and TP51 on the route net. R53 and C51 are
+    /// an RC shunt to GND; TP52 on its middle net /PATHC is kept too. R52
+    /// and TP50 lead nowhere and are pruned.
     #[test]
     fn path_topology_keeps_both_routes_and_the_shunt() {
         let d = fixture();
         let v = path(&d, "J3:1", "U3:1", true, 200);
         assert_eq!(v["connected"], true);
-        assert_eq!(refdes(&v), ["J3", "U3", "R50", "R51", "C50", "TP51"], "{v}");
+        assert_eq!(
+            refdes(&v),
+            ["J3", "U3", "R50", "R51", "C50", "R53", "C51", "TP51", "TP52"],
+            "{v}"
+        );
         let roles: Vec<&str> = v["topology"]["parts"]
             .as_array()
             .unwrap()
             .iter()
             .map(|p| p["role"].as_str().unwrap())
             .collect();
-        assert_eq!(roles, ["start", "endpoint", "series", "series", "series", "endpoint"]);
+        assert_eq!(
+            roles,
+            ["start", "endpoint", "series", "series", "series", "series", "series", "endpoint", "endpoint"]
+        );
         assert_eq!(
             nets(&v),
             [
                 ("/PATHA".into(), "expanded".into()),
                 ("/PATHB".into(), "expanded".into()),
                 ("GND".into(), "rail".into()),
+                ("/PATHC".into(), "expanded".into()),
             ]
         );
+        assert_eq!(pins(part(&v, "TP52").unwrap()), [pn("1", "/PATHC")]);
         assert_eq!(pins(part(&v, "R51").unwrap()), [pn("1", "/PATHA"), pn("2", "/PATHB")]);
         assert_eq!(pins(part(&v, "C50").unwrap()), [pn("1", "/PATHB"), pn("2", "GND")]);
         // End parts list only their pins on kept nets.
@@ -6258,11 +6269,12 @@ mod walk_topology_tests {
             let v = path(&d, "J3:1", "U3:1", true, cap);
             assert_eq!(refdes(&v), ["J3", "U3"], "cap {cap}");
             assert_eq!(v["topology"]["truncated"], true);
-            assert_eq!(v["topology"]["omitted_parts"], 4);
-            // Only the two end nets are left; GND came in through C50 alone.
+            assert_eq!(v["topology"]["omitted_parts"], 7);
+            // Only the two end nets are left; GND and /PATHC came in through
+            // the shunts alone.
             let listed: Vec<String> = nets(&v).into_iter().map(|(n, _)| n).collect();
             assert_eq!(listed, ["/PATHA", "/PATHB"], "cap {cap}");
-            assert_eq!(v["topology"]["omitted_nets"], 1);
+            assert_eq!(v["topology"]["omitted_nets"], 2);
         }
         let v = path(&d, "J3:1", "U3:1", true, 4);
         assert_eq!(refdes(&v), ["J3", "U3", "R50", "R51"]);
@@ -6272,12 +6284,12 @@ mod walk_topology_tests {
     #[test]
     fn path_topology_edge_cases() {
         let d = fixture();
-        // TP51:1 and U3:1 share /PATHB: no route parts, but the shunt is
-        // kept. R50 and R51 lead to /PATHA, which reaches neither `to` nor a
-        // rail, so they and J3 are left out.
+        // TP51:1 and U3:1 share /PATHB: no route parts, but the shunts and
+        // TP52 are kept. R50 and R51 lead to /PATHA, which reaches neither
+        // `to` nor a rail, so they and J3 are left out.
         let v = path(&d, "TP51:1", "U3:1", true, 200);
         assert_eq!(v["distance"], 0);
-        assert_eq!(refdes(&v), ["TP51", "U3", "C50"], "{v}");
+        assert_eq!(refdes(&v), ["TP51", "U3", "C50", "R53", "C51", "TP52"], "{v}");
 
         // Only via GND: the route runs over C50 into the rail.
         let v = path(&d, "J3:1", "U2:2", true, 200);

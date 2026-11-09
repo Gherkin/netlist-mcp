@@ -83,6 +83,14 @@ impl SidecarFile {
         }
     }
 
+    fn table_mut(&mut self, scope: Scope) -> &mut Entries {
+        match scope {
+            Scope::LibId => &mut self.lib_id,
+            Scope::Mpn => &mut self.mpn,
+            Scope::Refdes => &mut self.refdes,
+        }
+    }
+
     /// Parse one file's text. Rejects an unknown top-level key (a typo would
     /// otherwise drop a whole table without a word), an entry that is not an
     /// object, and `refdes` entries in the library.
@@ -123,11 +131,7 @@ impl SidecarFile {
                 };
                 entries.insert(k, entry);
             }
-            match scope {
-                Scope::LibId => file.lib_id = entries,
-                Scope::Mpn => file.mpn = entries,
-                Scope::Refdes => file.refdes = entries,
-            }
+            *file.table_mut(scope) = entries;
         }
         Ok(file)
     }
@@ -154,6 +158,16 @@ pub struct Keys<'a> {
     pub refdes: &'a str,
     pub lib_id: &'a str,
     pub mpn: &'a str,
+}
+
+impl<'a> Keys<'a> {
+    fn get(&self, scope: Scope) -> &'a str {
+        match scope {
+            Scope::LibId => self.lib_id,
+            Scope::Mpn => self.mpn,
+            Scope::Refdes => self.refdes,
+        }
+    }
 }
 
 /// One entry that matched, in the order it was merged.
@@ -241,11 +255,7 @@ impl Sidecar {
         let mut entry = Map::new();
         let mut sources = Vec::new();
         for scope in Scope::ALL {
-            let key = match scope {
-                Scope::LibId => keys.lib_id,
-                Scope::Mpn => keys.mpn,
-                Scope::Refdes => keys.refdes,
-            };
+            let key = keys.get(scope);
             if key.is_empty() {
                 continue;
             }
@@ -267,13 +277,17 @@ impl Sidecar {
     }
 
     /// Per-file entry counts and the keys that match no component. `all`
-    /// lists every component's keys.
+    /// lists every component's keys. An empty key is never present, since
+    /// `join` never matches on one.
     pub fn summary<'a>(&self, all: impl Iterator<Item = Keys<'a>>) -> Summary {
         let mut present: [HashSet<&str>; 3] = Default::default();
         for k in all {
-            present[0].insert(k.lib_id);
-            present[1].insert(k.mpn);
-            present[2].insert(k.refdes);
+            for (i, scope) in Scope::ALL.into_iter().enumerate() {
+                let key = k.get(scope);
+                if !key.is_empty() {
+                    present[i].insert(key);
+                }
+            }
         }
         let files = self.files.iter().map(|file| {
             let mut entries = BTreeMap::new();
@@ -413,6 +427,16 @@ mod tests {
         assert_eq!(f.entries.get("lib_id"), None);
         assert_eq!(f.unmatched, vec!["mpn.NOPE", "refdes.U99"]);
         assert_eq!(f.unmatched_count, 2);
+    }
+
+    // An entry keyed "" can never join, so it is unmatched even when some
+    // component has an empty key in that scope.
+    #[test]
+    fn summary_reports_empty_key_as_unmatched() {
+        let proj = file(json!({"lib_id": {"": {}}}), Origin::Project);
+        let s = Sidecar::from_files(vec![proj], vec![]);
+        let sum = s.summary(std::iter::once(keys("U1", "", "X")));
+        assert_eq!(sum.files[0].unmatched, vec!["lib_id."]);
     }
 
     #[test]

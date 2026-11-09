@@ -284,8 +284,9 @@ impl NetlistServer {
         board. `sidecar` holds facts the netlist lacks, from the enrichment \
         files (null if none match): `entry` is the merged fields, `sources` \
         the matching entries, lowest precedence first (lib_id, then MPN — the \
-        MPN property, else value — then refdes; project file over shared \
-        library). Its content is human/agent-written, not from the netlist.")]
+        MPN property, else value — then refdes; within each of these the \
+        project file beats the shared library, so a library MPN entry still \
+        beats a project lib_id entry). Its content is human/agent-written, not from the netlist.")]
     fn get_component(&self, Parameters(p): Parameters<GetComponentParams>) -> String {
         let limit = p.limit.unwrap_or(200);
         let offset = p.offset.unwrap_or(0);

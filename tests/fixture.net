@@ -626,6 +626,9 @@
 					(name "A")
 					(pins
 						(pin
+							(num "1")
+						)
+						(pin
 							(num "4")
 						)
 						(pin
@@ -1090,6 +1093,326 @@
 						)
 						(pin
 							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "J3")
+			(value "Path_Header")
+			(footprint "Fixture:CONN2")
+			(description "2-pin header")
+			(libsource
+				(lib "Connector")
+				(part "Conn_01x02")
+				(description "2-pin header")
+			)
+			(property
+				(name "ki_keywords")
+				(value "connector header")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R50")
+			(value "100R")
+			(footprint "Fixture:R")
+			(description "Resistor")
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R51")
+			(value "100R")
+			(footprint "Fixture:R")
+			(description "Resistor")
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R52")
+			(value "1k")
+			(footprint "Fixture:R")
+			(description "Resistor")
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "C50")
+			(value "100n")
+			(footprint "Fixture:C")
+			(description "Unpolarized capacitor")
+			(libsource
+				(lib "Device")
+				(part "C")
+				(description "Unpolarized capacitor")
+			)
+			(property
+				(name "ki_keywords")
+				(value "cap capacitor")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "TP50")
+			(value "TestPoint")
+			(footprint "Fixture:TP")
+			(description "Test point")
+			(libsource
+				(lib "Connector")
+				(part "TestPoint")
+				(description "Test point")
+			)
+			(property
+				(name "exclude_from_bom")
+			)
+			(property
+				(name "ki_keywords")
+				(value "test point")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "TP51")
+			(value "TestPoint")
+			(footprint "Fixture:TP")
+			(description "Test point")
+			(libsource
+				(lib "Connector")
+				(part "TestPoint")
+				(description "Test point")
+			)
+			(property
+				(name "exclude_from_bom")
+			)
+			(property
+				(name "ki_keywords")
+				(value "test point")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "R53")
+			(value "1k")
+			(footprint "Fixture:R")
+			(description "Resistor")
+			(libsource
+				(lib "Device")
+				(part "R")
+				(description "Resistor")
+			)
+			(property
+				(name "ki_keywords")
+				(value "R res resistor")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "C51")
+			(value "1n")
+			(footprint "Fixture:C")
+			(description "Unpolarized capacitor")
+			(libsource
+				(lib "Device")
+				(part "C")
+				(description "Unpolarized capacitor")
+			)
+			(property
+				(name "ki_keywords")
+				(value "cap capacitor")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
+						)
+						(pin
+							(num "2")
+						)
+					)
+				)
+			)
+		)
+		(comp
+			(ref "TP52")
+			(value "TestPoint")
+			(footprint "Fixture:TP")
+			(description "Test point")
+			(libsource
+				(lib "Connector")
+				(part "TestPoint")
+				(description "Test point")
+			)
+			(property
+				(name "exclude_from_bom")
+			)
+			(property
+				(name "ki_keywords")
+				(value "test point")
+			)
+			(sheetpath
+				(names "/Sensor1/")
+				(tstamps "/Sensor1/")
+			)
+			(units
+				(unit
+					(name "A")
+					(pins
+						(pin
+							(num "1")
 						)
 					)
 				)
@@ -2209,6 +2532,101 @@
 		)
 		(net
 			(code "15")
+			(name "/PATHA")
+			(class "Default")
+			(node
+				(ref "J3")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "R50")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "R51")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "R52")
+				(pin "1")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "16")
+			(name "/PATHB")
+			(class "Default")
+			(node
+				(ref "R50")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "R51")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "C50")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "TP51")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "U3")
+				(pin "1")
+				(pintype "output")
+			)
+			(node
+				(ref "R53")
+				(pin "1")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "17")
+			(name "/PATHC")
+			(class "Default")
+			(node
+				(ref "R53")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "C51")
+				(pin "1")
+				(pintype "passive")
+			)
+			(node
+				(ref "TP52")
+				(pin "1")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "18")
+			(name "/PATHSTUB")
+			(class "Default")
+			(node
+				(ref "R52")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "TP50")
+				(pin "1")
+				(pintype "passive")
+			)
+		)
+		(net
+			(code "19")
 			(name "/SENSIN1")
 			(class "Default")
 			(node
@@ -2223,7 +2641,7 @@
 			)
 		)
 		(net
-			(code "16")
+			(code "20")
 			(name "/SENSIN2")
 			(class "Default")
 			(node
@@ -2238,7 +2656,7 @@
 			)
 		)
 		(net
-			(code "17")
+			(code "21")
 			(name "/SENSIN3")
 			(class "Default")
 			(node
@@ -2253,7 +2671,7 @@
 			)
 		)
 		(net
-			(code "18")
+			(code "22")
 			(name "/SENSMID1")
 			(class "Default")
 			(node
@@ -2278,7 +2696,7 @@
 			)
 		)
 		(net
-			(code "19")
+			(code "23")
 			(name "/SENSMID2")
 			(class "Default")
 			(node
@@ -2303,7 +2721,7 @@
 			)
 		)
 		(net
-			(code "20")
+			(code "24")
 			(name "/SENSMID3")
 			(class "Default")
 			(node
@@ -2323,7 +2741,7 @@
 			)
 		)
 		(net
-			(code "21")
+			(code "25")
 			(name "/SENSOUT")
 			(class "Default")
 			(node
@@ -2338,7 +2756,7 @@
 			)
 		)
 		(net
-			(code "22")
+			(code "26")
 			(name "/SENSREF")
 			(class "Default")
 			(node
@@ -2353,7 +2771,7 @@
 			)
 		)
 		(net
-			(code "23")
+			(code "27")
 			(name "EN")
 			(class "Default")
 			(node
@@ -2373,7 +2791,7 @@
 			)
 		)
 		(net
-			(code "24")
+			(code "28")
 			(name "FLAG")
 			(class "Default")
 			(node
@@ -2388,7 +2806,7 @@
 			)
 		)
 		(net
-			(code "25")
+			(code "29")
 			(name "GATE")
 			(class "Default")
 			(node
@@ -2403,7 +2821,7 @@
 			)
 		)
 		(net
-			(code "26")
+			(code "30")
 			(name "GND")
 			(class "Default")
 			(node
@@ -2551,9 +2969,24 @@
 				(pin "1")
 				(pintype "passive")
 			)
+			(node
+				(ref "J3")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "C50")
+				(pin "2")
+				(pintype "passive")
+			)
+			(node
+				(ref "C51")
+				(pin "2")
+				(pintype "passive")
+			)
 		)
 		(net
-			(code "27")
+			(code "31")
 			(name "Net-(R41-Pad2)")
 			(class "Default")
 			(node
@@ -2563,7 +2996,7 @@
 			)
 		)
 		(net
-			(code "28")
+			(code "32")
 			(name "PG")
 			(class "Default")
 			(node
@@ -2578,7 +3011,7 @@
 			)
 		)
 		(net
-			(code "29")
+			(code "33")
 			(name "VIN")
 			(class "Default")
 			(node
@@ -2603,7 +3036,7 @@
 			)
 		)
 		(net
-			(code "30")
+			(code "34")
 			(name "VIN_F")
 			(class "Default")
 			(node

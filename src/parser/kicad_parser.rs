@@ -526,15 +526,22 @@ fn parse_net(node: &NetListNode, comps: &mut Vec::<netlist::Component>) -> anyho
 
 }
 
+/// The next token, or an error if the input ended. An empty file, or one cut
+/// off while KiCad is still writing it, ends before every `(` is closed (#58).
+fn peek(syms: &[Token]) -> anyhow::Result<&Token> {
+    syms.first()
+        .context("unexpected end of netlist: an s-expression is not closed (empty or truncated file?)")
+}
+
 fn structurize(syms: &mut &[Token]) -> anyhow::Result<NetListNode> {
-    let Token::LParen = syms[0] else { 
+    let Token::LParen = peek(syms)? else {
         bail!("no left paranthesis in structurize, misaligned")
     };
 
     *syms = &syms[1..];
 
     let key;
-    match syms[0].clone() {
+    match peek(syms)?.clone() {
         Token::LParen => {
             bail!("two left paranthesis after each other in structurize!");
         }
@@ -550,7 +557,7 @@ fn structurize(syms: &mut &[Token]) -> anyhow::Result<NetListNode> {
     let mut val: Vec<NetListNode> = Vec::new();
     val.push(key);
     loop {
-        let elem = match syms[0].clone() {
+        let elem = match peek(syms)?.clone() {
             Token::LParen => structurize(syms)?,
             Token::RParen => {
                 *syms = &syms[1..];
@@ -668,5 +675,33 @@ mod lib_id_tests {
         assert_eq!(comp.lib_id, "My{slash}Lib:A{slash}B{colon}C");
         assert_eq!(comp.lib_id.split_once(':'), Some(("My{slash}Lib", "A{slash}B{colon}C")));
         assert_eq!(comp.value, "A/B");
+    }
+}
+
+#[cfg(test)]
+mod truncated_input_tests {
+    use super::parse_netlist;
+
+    fn err(src: &str) -> String {
+        format!("{:#}", parse_netlist(&src.to_string()).expect_err("must not parse"))
+    }
+
+    /// #58: these inputs used to panic on an out-of-bounds index.
+    #[test]
+    fn empty_file_is_an_error() {
+        assert!(err("").contains("unexpected end of netlist"));
+        assert!(err("  \n").contains("unexpected end of netlist"));
+    }
+
+    #[test]
+    fn open_paren_only_is_an_error() {
+        assert!(err("(").contains("unexpected end of netlist"));
+    }
+
+    #[test]
+    fn truncated_file_is_an_error() {
+        assert!(err(r#"(export (version "E")"#).contains("unexpected end of netlist"));
+        assert!(err(r#"(export (version "E") (components (comp (ref "R1")"#)
+            .contains("unexpected end of netlist"));
     }
 }

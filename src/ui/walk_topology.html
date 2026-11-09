@@ -239,21 +239,24 @@ function netOfPin(topo, handle) {
 }
 
 // A path_between result has `from`/`to` where a walk has `start`/`start_net`.
-// Give both one shape: `start`, `start_net`, `marks`, the pins to
-// highlight, and `mark_nets`, the nets whose bus is highlighted when the net
-// is drawn as a bus (a rail end is drawn as rail symbols, so it is not lit).
+// Give both one shape: `start`, `start_net`, `to_net` (path only), `marks`,
+// the pins to highlight, and `mark_nets`, the nets whose bus is highlighted
+// when the net is drawn as a bus (a rail end is drawn as rail symbols, so it
+// is not lit).
 function normalize(data) {
   if (data.from === undefined) {
-    return { ...data, path: false, marks: [data.start], mark_nets: [data.start_net] };
+    return { ...data, path: false, to_net: null, marks: [data.start], mark_nets: [data.start_net] };
   }
   const startNet = netOfPin(data.topology, data.from);
+  const toNet = netOfPin(data.topology, data.to);
   return {
     ...data,
     path: true,
     start: data.from,
     start_net: startNet,
+    to_net: toNet,
     marks: [data.from, data.to],
-    mark_nets: [startNet, netOfPin(data.topology, data.to)],
+    mark_nets: [startNet, toNet],
   };
 }
 
@@ -314,6 +317,7 @@ function layout(data) {
   const netByName = new Map(nets.map((n) => [n.name, n]));
   const startNet = data.start_net;
   const isBus = (n) => n.state !== "rail" || n.name === startNet;
+  const marks = new Set(data.marks.map(String));
 
   // Bus order: BFS over parts from the start net, then any left over.
   const partsOnNet = new Map();
@@ -371,18 +375,20 @@ function layout(data) {
     }
     const busEnds = ends.filter((e) => e.kind === "bus").sort((x, y) => x.col - y.col);
     // Pins on the same rail share one row ("1,4,7 → GND"): connectors often
-    // have dozens of ground pins.
+    // have dozens of ground pins. A marked pin gets its own row, so the mark
+    // points at that pin alone.
     const otherEnds = [];
     const byRail = new Map();
     for (const e of ends) {
       if (e.kind === "bus") continue;
       if (e.kind !== "rail") { otherEnds.push(e); continue; }
-      if (!byRail.has(e.net)) {
+      const key = marks.has(part.refdes + ":" + e.pin.pin) ? e.net + "\n" + e.pin.pin : e.net;
+      if (!byRail.has(key)) {
         const row = { ...e, pins: [] };
-        byRail.set(e.net, row);
+        byRail.set(key, row);
         otherEnds.push(row);
       }
-      byRail.get(e.net).pins.push(e.pin);
+      byRail.get(key).pins.push(e.pin);
     }
     const left = busEnds.length > 0 && busEnds.every((e) => e.col === 0);
     const lo = busEnds.length ? busEnds[0].col : 0;
@@ -475,15 +481,18 @@ function railGlyph(g, x, y, name, dir) {
 }
 
 // Label and tooltip for an open lead: a pin on a net the drawing does not
-// show. Which one applies depends on the result type.
+// show. The server's `off_drawing` says why: "cut" by max_topology_parts, or
+// "outside" the walk or path, whose wording depends on the result type.
 const OPEN_LEAD = {
   walk: { label: "not walked", why: "this pin is on a net the walk did not reach" },
   path: { label: "off path", why: "this pin is on a net outside the from→to subgraph" },
+  cut: { label: "cut", why: "max_topology_parts left this pin's net out of the drawing" },
 };
 
-// Draw the far end of a lead: rail symbol, no-connect, or open (an
-// OPEN_LEAD entry, passed as `lead`).
+// Draw the far end of a lead: rail symbol, no-connect, or open. `lead` is
+// the OPEN_LEAD entry for an "outside" pin of this result type.
 function terminal(g, x, y, end, dir, lead) {
+  if (end.pin && end.pin.off_drawing === "cut") lead = OPEN_LEAD.cut;
   if (end.kind === "rail") {
     if (dir === "up" || dir === "down") {
       railGlyph(g, x, y, end.net, dir);
@@ -570,6 +579,10 @@ function render(data) {
   const markedRefs = new Set([...marked].map((m) => m.split(":")[0]));
   const markedNets = new Set(data.mark_nets.filter((n) => n != null));
   const lead = data.path ? OPEN_LEAD.path : OPEN_LEAD.walk;
+  // A dot on a symbol's lead end when that pin is a marked one.
+  const markPin = (part, pin, x, y) => {
+    if (pin && marked.has(part.refdes + ":" + pin.pin)) el("circle", { class: "dot startpin", cx: x, cy: y, r: 3 }, dots);
+  };
 
   const partGroup = (part) => {
     const cls = [part.dnp ? "dnp" : "", markedRefs.has(part.refdes) || part.role === "start" ? "start" : ""].join(" ").trim();
@@ -590,6 +603,8 @@ function render(data) {
       symbol(s, it.part.class, isCathode(it.right.pin));
       text(g, sx + SYMLEN / 2, y0 - 12, partLabel(it.part), "ref", "end");
       text(g, sx + SYMLEN / 2 + 4, y0 - 12, clip(it.part.value, 12), "val");
+      markPin(it.part, it.left.pin, sx, y0);
+      markPin(it.part, it.right.pin, sx + SYMLEN, y0);
       addAttach(it.left.col, y0);
       addAttach(it.right.col, y0);
     } else if (it.type === "tp") {
@@ -598,6 +613,7 @@ function render(data) {
       line(g, x, y0, x + 34, y0);
       el("circle", { class: "sym", cx: x + 38, cy: y0, r: 4 }, g);
       text(g, x + 46, y0 + 4, partLabel(it.part), "ref");
+      markPin(it.part, it.end.pin, x + 34, y0);
       addAttach(it.end.col, y0);
     } else if (it.type === "bank") {
       const g0 = it.gap;
@@ -614,11 +630,13 @@ function render(data) {
         if (it.free) terminal(g, x, y0, sh.top, "up", lead);
         const s = el("g", { transform: `translate(${x},${y0 + 6}) rotate(90)` }, g);
         line(g, x, y0, x, y0 + 6);
-        // An endpoint diode lists only its pins on walked nets, so the bottom
-        // pin can be missing: then orient by the pin on the bus.
+        // A diode with more than two pins lists only its pins on drawn nets,
+        // so the bottom pin can be missing: then orient by the pin on the bus.
         symbol(s, sh.part.class, sh.bot.pin ? isCathode(sh.bot.pin) : !isCathode(sh.top.pin));
         const yb = y0 + 6 + SYMLEN;
         terminal(g, x, yb, sh.bot, "down", lead);
+        markPin(sh.part, sh.top.pin, x, y0 + 6);
+        markPin(sh.part, sh.bot.pin, x, yb);
         text(g, x + 14, y0 + 26, partLabel(sh.part), "ref");
         text(g, x + 14, y0 + 39, clip(sh.part.value, 9), "val");
         maxX = Math.max(maxX, x + 70);
@@ -685,6 +703,9 @@ function render(data) {
     const t = text(g, x, TOP - 46, clip(name, 26), "netname busname", "middle");
     title(t, name + " — fanout " + n.fanout + ", " + n.state);
     const notes = [];
+    // Both end nets share the accent, so a path says which end is which.
+    if (data.path && name === data.start_net) notes.push("from");
+    if (data.path && name === data.to_net) notes.push("to");
     if (n.state === "large_net") notes.push("large net, not walked");
     else if (n.state === "depth_limit") notes.push("depth limit");
     else if (n.state === "dangling") notes.push("dangling");

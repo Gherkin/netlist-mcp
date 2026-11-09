@@ -1,6 +1,7 @@
-//! MCP Apps UI (issue #32): the `ui://` HTML resource that draws a walk
-//! topology as a schematic, and the tool metadata that links `draw_walk` to
-//! it. Hosts without MCP Apps support ignore both and show the tool's JSON
+//! MCP Apps UI (issues #32, #42): the `ui://` HTML resource that draws a
+//! walk or path_between topology as a schematic, and the tool metadata that
+//! links `draw_walk` and `draw_path_between` to it. Both results carry the
+//! same `topology` shape, so one page draws both. Hosts without MCP Apps support ignore both and show the tool's JSON
 //! text, so nothing here changes what a text-only client sees.
 //!
 //! Spec: modelcontextprotocol/ext-apps, specification/2026-01-26/apps.mdx.
@@ -47,10 +48,10 @@ fn meta(value: serde_json::Value) -> Meta {
     }
 }
 
-/// `_meta` for the `draw_walk` tool. Sets both the current nested key and the
-/// deprecated flat `ui/resourceUri`, as the reference SDK does, so hosts on
-/// either form find the resource.
-pub fn draw_walk_tool_meta() -> Meta {
+/// `_meta` for the drawing tools (`draw_walk`, `draw_path_between`). Sets
+/// both the current nested key and the deprecated flat `ui/resourceUri`, as
+/// the reference SDK does, so hosts on either form find the resource.
+pub fn draw_tool_meta() -> Meta {
     meta(json!({
         "ui": { "resourceUri": WALK_TOPOLOGY_URI },
         "ui/resourceUri": WALK_TOPOLOGY_URI,
@@ -68,9 +69,9 @@ pub fn resources() -> Vec<Resource> {
     vec![Resource::new(WALK_TOPOLOGY_URI, "walk_topology")
         .with_title("Walk topology schematic")
         .with_description(
-            "Draws a draw_walk result as a schematic: R, C, L, FB and D as \
-             symbols, ICs and connectors as boxes, rails as ground/supply \
-             symbols, DNP parts dashed.",
+            "Draws a draw_walk or draw_path_between result as a schematic: \
+             R, C, L, FB and D as symbols, ICs and connectors as boxes, \
+             rails as ground/supply symbols, DNP parts dashed.",
         )
         .with_mime_type(MCP_APP_MIME)
         .with_size(WALK_TOPOLOGY_HTML.len() as u64)]
@@ -91,7 +92,7 @@ mod tests {
 
     #[test]
     fn tool_meta_links_the_resource_under_both_keys() {
-        let m = serde_json::to_value(draw_walk_tool_meta()).unwrap();
+        let m = serde_json::to_value(draw_tool_meta()).unwrap();
         assert_eq!(m["ui"]["resourceUri"], WALK_TOPOLOGY_URI);
         assert_eq!(m["ui/resourceUri"], WALK_TOPOLOGY_URI);
     }
@@ -150,16 +151,27 @@ mod tests {
     }
 
     #[test]
-    fn draw_walk_is_listed_only_to_ui_clients() {
+    fn drawing_tools_are_listed_only_to_ui_clients() {
         let schema = std::sync::Arc::new(serde_json::Map::new());
         let tools = || {
-            let mut draw = Tool::new("draw_walk", "d", schema.clone());
-            draw.meta = Some(draw_walk_tool_meta());
-            vec![Tool::new("walk", "w", schema.clone()), draw]
+            let draw = |name: &'static str| {
+                let mut t = Tool::new(name, "d", schema.clone());
+                t.meta = Some(draw_tool_meta());
+                t
+            };
+            vec![
+                Tool::new("walk", "w", schema.clone()),
+                draw("draw_walk"),
+                Tool::new("path_between", "p", schema.clone()),
+                draw("draw_path_between"),
+            ]
         };
         let names = |ts: Vec<Tool>| ts.into_iter().map(|t| t.name.to_string()).collect::<Vec<_>>();
-        assert_eq!(names(visible_tools(tools(), true)), ["walk", "draw_walk"]);
-        assert_eq!(names(visible_tools(tools(), false)), ["walk"]);
+        assert_eq!(
+            names(visible_tools(tools(), true)),
+            ["walk", "draw_walk", "path_between", "draw_path_between"]
+        );
+        assert_eq!(names(visible_tools(tools(), false)), ["walk", "path_between"]);
     }
 
     #[test]

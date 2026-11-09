@@ -1545,7 +1545,9 @@ impl Design {
     /// order (`walk_part_order`, `path_topology`). Nets are the nodes; parts
     /// are the edges. A "series" part lists all its pins; any other part
     /// lists only the pins on a kept net (in any state, rail and depth_limit
-    /// included), so a 100-pin IC shows only its pins in the graph. A part
+    /// included), so a 100-pin IC shows only its pins in the graph. A
+    /// two-pin part other than a test point lists both pins, and a pin off
+    /// the kept nets says why in `off_drawing`. A part
     /// listed twice keeps its first place and role.
     ///
     /// At most `max_parts` parts are kept (issue #34), from the front of
@@ -1572,16 +1574,23 @@ impl Design {
 
         // Nets on a kept series part, plus the fixed nets. Other parts add no
         // nets: their pins are filtered to this set below.
-        let mut kept_nets: HashSet<usize> = fixed_nets.iter().copied().collect();
-        for &(c, role) in &order {
-            if role == "series" {
-                for p in &self.component(&CompId(c)).pins {
-                    if let Some(n) = &self.pin(p).net {
-                        kept_nets.insert(n.0);
+        let series_nets = |parts: &[(usize, &'static str)]| -> HashSet<usize> {
+            let mut out: HashSet<usize> = fixed_nets.iter().copied().collect();
+            for &(c, role) in parts {
+                if role == "series" {
+                    for p in &self.component(&CompId(c)).pins {
+                        if let Some(n) = &self.pin(p).net {
+                            out.insert(n.0);
+                        }
                     }
                 }
             }
-        }
+            out
+        };
+        let kept_nets = series_nets(&order);
+        // The nets only the cut parts would add: a pin on one of these that
+        // is not drawn was cut by `max_parts`.
+        let cut_nets = series_nets(&cut);
         // `kept_nets` is a subset of `nets`: `walk_bfs` notes every net it
         // pops and every far-side net of a series part it traverses, and
         // `path_topology` keeps every net of the parts it keeps.
@@ -1622,8 +1631,12 @@ impl Design {
 
         let mut parts: Vec<TopoPart> = Vec::new();
         for (comp_idx, role) in order {
-            let all_pins = role == "series";
             let comp = self.component(&CompId(comp_idx));
+            // A two-pin part keeps the pin whose net is not drawn, with the
+            // reason, so the page can draw that lead (a symbol's second lead,
+            // or a box pin). A test point is drawn with one lead only.
+            let all_pins = role == "series"
+                || (comp.pins.len() == 2 && Self::refdes_class(&comp.refdes) != "TP");
             let mut pins: Vec<TopoPin> = comp
                 .pins
                 .iter()
@@ -1633,6 +1646,12 @@ impl Design {
                     pin: p.number.clone(),
                     name: p.name.clone(),
                     net: p.net.as_ref().map(|n| self.net(n).name.clone()),
+                    off_drawing: match &p.net {
+                        Some(n) if !kept_nets.contains(&n.0) => {
+                            Some(if cut_nets.contains(&n.0) { "cut" } else { "outside" })
+                        }
+                        _ => None,
+                    },
                 })
                 .collect();
             pins.sort_by(|a, b| Self::pin_sort_key(&a.pin).cmp(&Self::pin_sort_key(&b.pin)));
@@ -2958,8 +2977,8 @@ struct TopoPart {
     /// passthrough) or "endpoint" (an endpoint part the walk reached, listed
     /// in `endpoints` or not).
     role: &'static str,
-    /// Series parts list every pin; start and endpoint parts only the pins on
-    /// a net in `nets`.
+    /// Series parts and two-pin parts list every pin; other start and
+    /// endpoint parts only the pins on a net in `nets`.
     pins: Vec<TopoPin>,
 }
 
@@ -2969,6 +2988,11 @@ struct TopoPin {
     name: Option<String>,
     /// Null for an unconnected pin.
     net: Option<String>,
+    /// Set when `net` is not in `nets` (only on a two-pin start or endpoint
+    /// part that is not a test point): "cut" when `max_topology_parts` left the net out, "outside"
+    /// when the net is beyond the walk or outside the from→to subgraph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    off_drawing: Option<&'static str>,
 }
 
 /// One series part traversed on the way to an endpoint or terminal net.
@@ -6008,6 +6032,7 @@ mod walk_topology_tests {
             let full = walk(&d, start, 4, true);
             let n_parts = refdes(&full).len();
             let n_nets = nets(&full).len();
+            let full_nets: HashSet<String> = nets(&full).into_iter().map(|(n, _)| n).collect();
             for cap in 1..=n_parts as u32 + 1 {
                 let v = capped(&d, start, 4, true, cap);
                 let ctx = format!("{start} cap {cap}");
@@ -6015,10 +6040,18 @@ mod walk_topology_tests {
                 let parts = v["topology"]["parts"].as_array().unwrap();
                 let mut used: HashSet<String> = HashSet::new();
                 for p in parts {
-                    for (_, net) in pins(p) {
-                        if let Some(net) = net {
-                            assert!(listed.contains(&net), "{ctx}: pin on unlisted {net}");
-                            used.insert(net);
+                    for pin in p["pins"].as_array().unwrap() {
+                        let Some(net) = pin["net"].as_str() else { continue };
+                        let off = pin.get("off_drawing").and_then(|o| o.as_str());
+                        // A pin on an unlisted net must say why, and only then:
+                        // "cut" exactly when the uncapped graph lists the net.
+                        assert_eq!(off.is_some(), !listed.contains(net), "{ctx}: {pin}");
+                        if let Some(off) = off {
+                            let want = if full_nets.contains(net) { "cut" } else { "outside" };
+                            assert_eq!(off, want, "{ctx}: {pin}");
+                        }
+                        if off.is_none() {
+                            used.insert(net.to_string());
                         }
                     }
                 }
@@ -6316,7 +6349,21 @@ mod walk_topology_tests {
         assert_eq!(v["distance"], 0, "{v}");
         assert_eq!(refdes(&v), ["J3", "U2"], "{v}");
         assert_eq!(nets(&v), [("GND".into(), "rail".into())]);
-        assert_eq!(pins(part(&v, "J3").unwrap()), [pn("2", "GND")]);
+        // J3 has two pins, so it keeps pin 1, whose net is outside the
+        // subgraph, and says so.
+        let j3 = part(&v, "J3").unwrap();
+        assert_eq!(pins(j3), [pn("1", "/PATHA"), pn("2", "GND")]);
+        assert_eq!(j3["pins"][0]["off_drawing"], "outside", "{v}");
+        assert!(j3["pins"][1].get("off_drawing").is_none(), "{v}");
+
+        // The cap cuts C50, the only part that keeps GND in the drawing, so
+        // C51's GND leg is "cut", not "outside" (PR #43 review).
+        let v = path(&d, "C51:1", "J3:1", true, 4);
+        let c51 = part(&v, "C51").unwrap();
+        assert_eq!(pins(c51), [pn("1", "/PATHC"), pn("2", "GND")]);
+        assert_eq!(c51["pins"][1]["off_drawing"], "cut", "{v}");
+        let v = path(&d, "C51:1", "J3:1", true, 200);
+        assert!(part(&v, "C51").unwrap()["pins"][1].get("off_drawing").is_none(), "{v}");
 
         // Not connected: no topology.
         let v = path(&d, "J3:1", "U2:7", true, 200);

@@ -313,7 +313,9 @@ impl NetlistServer {
     #[tool(description = "Walk the connectivity from a pin or net through 2-pin \
         passthrough parts (series resistors, inductors, ferrites, caps) to the \
         real opaque endpoints (ICs, connectors). Power/ground rails terminate \
-        the walk and are reported, never enumerated. Returns endpoints with the \
+        the walk and are reported, never enumerated: rails_reached has one \
+        entry per series part that reaches a rail, so shunt parts (filter \
+        caps, pull-downs) each show. Returns endpoints with the \
         parts traversed to reach each. Topological, not electrical. The primary \
         'what is actually connected to this?' tool. Every traversed part and \
         endpoint carries a `dnp` flag — a hop through a DNP part exists on the \

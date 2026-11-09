@@ -1266,8 +1266,28 @@ impl Design {
             std::collections::VecDeque::new();
         queue.push_back((start_net_idx, Vec::new(), 0));
 
+        // Rails already stopped at, with their rounded score. A rail is never
+        // expanded, so a later arrival over a different series part would be
+        // cut by `visited_nets` and lost (issue #31). Each such arrival gets
+        // its own `rails_reached` entry instead.
+        let mut rail_scores: HashMap<usize, f32> = HashMap::new();
+
         while let Some((net_idx, via, depth)) = queue.pop_front() {
             if !visited_nets.insert(net_idx) {
+                if let Some(&score) = rail_scores.get(&net_idx) {
+                    // A repeat arrival. Each part is traversed once, so the
+                    // via chain is new. Only repeats count against the cap:
+                    // the first arrival at every rail is always kept.
+                    if rails_reached.len() >= max_endpoints as usize {
+                        truncated = true;
+                    } else {
+                        rails_reached.push(RailReached {
+                            net: self.net(&NetId(net_idx)).name.clone(),
+                            score,
+                            via: self.via_parts(&via),
+                        });
+                    }
+                }
                 continue;
             }
             let net = self.net(&NetId(net_idx));
@@ -1279,9 +1299,11 @@ impl Design {
                     let (score, _evidence) = self.rail_score(net);
                     if score >= RAIL_THRESHOLD {
                         topo.note_net(net_idx, NetState::Rail);
+                        let score = (score * 100.0).round() / 100.0;
+                        rail_scores.insert(net_idx, score);
                         rails_reached.push(RailReached {
                             net: net.name.clone(),
-                            score: (score * 100.0).round() / 100.0,
+                            score,
                             via: self.via_parts(&via),
                         });
                         continue;
@@ -1773,7 +1795,15 @@ impl Design {
                 count: data.endpoints.len(),
                 sample,
             },
-            from_rails: data.rails_reached.iter().map(|r| r.net.clone()).collect(),
+            // One name per rail: `rails_reached` has an entry per arrival.
+            from_rails: {
+                let mut seen = std::collections::HashSet::new();
+                data.rails_reached
+                    .iter()
+                    .filter(|r| seen.insert(r.net.as_str()))
+                    .map(|r| r.net.clone())
+                    .collect()
+            },
         }
     }
 
@@ -2677,7 +2707,12 @@ struct DeadEnd {
     reason: String,
 }
 
-/// A power/ground rail the walk stopped at (reported, never enumerated).
+/// One arrival at a power/ground rail the walk stopped at (reported, never
+/// enumerated). A rail reached over several series parts has one entry per
+/// arrival, in BFS order (nearest first), so shunt parts to the rail — filter
+/// caps, pull-downs, TVS — each show up (issue #31). Repeat arrivals count
+/// against `max_endpoints` and set `truncated` when cut; the first arrival
+/// at each rail is always listed.
 #[derive(Debug, Serialize)]
 struct RailReached {
     net: String,
@@ -5716,14 +5751,61 @@ mod walk_topology_tests {
         (pin.into(), Some(net.into()))
     }
 
+    /// (rail, via refdes chain) for every `rails_reached` entry.
+    fn rail_arrivals(v: &serde_json::Value) -> Vec<(String, Vec<String>)> {
+        v["rails_reached"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let via = r["via"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["refdes"].as_str().unwrap().to_string())
+                    .collect();
+                (r["net"].as_str().unwrap().to_string(), via)
+            })
+            .collect()
+    }
+
+    /// Issue #31: GND is reached over R21 and over C11. Both arrivals are
+    /// listed, so the shunt cap is visible without `include_topology`.
+    #[test]
+    fn every_arrival_at_a_rail_is_listed() {
+        let v = walk(&fixture(), "/SENSIN1", 4, false);
+        assert_eq!(
+            rail_arrivals(&v),
+            [
+                ("GND".to_string(), vec!["R11".to_string(), "R21".to_string()]),
+                ("GND".to_string(), vec!["R11".to_string(), "C11".to_string()]),
+            ]
+        );
+        assert_eq!(v["rails_reached"][0]["score"], v["rails_reached"][1]["score"]);
+        assert_eq!(v["truncated"], false);
+    }
+
+    /// Repeat arrivals count against `max_endpoints`; the first arrival at a
+    /// rail is kept, and the cut sets `truncated`.
+    #[test]
+    fn max_endpoints_cuts_repeat_rail_arrivals_only() {
+        let json = fixture().walk("/SENSIN1", 4, 1, true, false, 200).expect("walk");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            rail_arrivals(&v),
+            [("GND".to_string(), vec!["R11".to_string(), "R21".to_string()])]
+        );
+        assert_eq!(v["truncated"], true);
+    }
+
     #[test]
     fn without_the_flag_there_is_no_topology_key() {
         let v = walk(&fixture(), "/SENSIN1", 4, false);
         assert!(v.get("topology").is_none(), "{v}");
     }
 
-    /// The case from #28: an RC to ground. `rails_reached` reports GND once,
-    /// via R21; the graph keeps C11 and the net on each of its pins.
+    /// The case from #28: an RC to ground. The graph keeps C11 and the net on
+    /// each of its pins.
     #[test]
     fn the_graph_keeps_the_shunt_cap_and_its_ground_side() {
         let v = walk(&fixture(), "/SENSIN1", 4, true);

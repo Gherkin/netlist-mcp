@@ -3177,13 +3177,14 @@ impl Mark {
 
 /// Which token a mark binds to.
 enum Binding {
-    /// An `@` written stuck to a token ("200mA@DC") is about that token,
-    /// whatever its unit. `at` is the `@`'s own index, to check the token
-    /// before it really is the one it was stuck to.
+    /// An `@` written stuck to a quantity ("200mA@DC") is about that
+    /// quantity, whatever its unit. Stuck to anything else, it binds as
+    /// [`Binding::Spaced`] does. `at` is the `@`'s own index, to check the
+    /// token before it really is the one it was stuck to.
     Glued { at: usize },
-    /// An `@` with a space before it ("600Ω ±25% @100MHz") is about the
-    /// nearest ohm value before it, stepping over anything that is not one:
-    /// a tolerance, a unit word ("600 ohm @ 100 MHz").
+    /// An `@` with a space before it is about the nearest quantity before
+    /// it, whatever its unit, stepping over what is not one: a tolerance
+    /// ("600Ω ±25% @100MHz"), a word ("1.2Ω DCR @DC").
     Spaced,
     /// A bare frequency literal, with no `@` to say what it belongs to, only
     /// marks a value that says of itself that it is ohms. Adjacency is
@@ -3237,6 +3238,12 @@ fn joins_split_unit(prev: &str, unit: &str) -> bool {
     }
     let joined = format!("{}{unit}", &prev[number_len..]);
     strip_long_unit_word(&joined, 'R').is_empty() || parse_unit_only_token(&joined, 'R', true).is_some()
+}
+
+/// True if `tok` is a quantity an `@` can be about: it has a number in it
+/// and is not a tolerance ("±25%", "(25%)").
+fn is_quantity(tok: &str) -> bool {
+    tok.chars().any(|c| c.is_ascii_digit()) && !tok.contains('%')
 }
 
 /// True if `tok` is digits and decimal points only: a number with no unit.
@@ -3310,21 +3317,23 @@ fn bead_tokens(tokens: &[(String, bool)]) -> Option<Vec<BeadToken>> {
 /// frequency landed on a bare number while a value with an ohm unit stands
 /// before it ("1kΩ 0603 @100MHz"): either could be the impedance.
 fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option<()> {
-    let has_digit = |tok: &BeadToken| tok.base.chars().any(|c| c.is_ascii_digit());
+    let nearest_quantity = |out: &[BeadToken]| out.iter().rposition(|tok| is_quantity(&tok.base));
     let pos = match binding {
         // Stuck to "200mA", an "@DC" is about the 200mA, so it cannot reach
-        // back and strike out the 2kΩ of "1.2Ω 2kΩ 200mA@DC". Stuck to a
-        // word with no number ("1.2Ω DCR@DC"), it is about the value the
-        // word labels. A unit split off its number ("1 kΩ@100MHz") is
-        // already joined back on by [`bead_split`].
-        Binding::Glued { at } => out
-            .last()
-            .filter(|tok| tok.index + 1 == at)
-            .map(|_| out.len() - 1)
-            .map(|pos| if pos > 0 && !has_digit(&out[pos]) { pos - 1 } else { pos }),
-        Binding::Spaced => out
-            .iter()
-            .rposition(|tok| parse_value_token(&tok.base, 'R').is_some()),
+        // back and strike out the 2kΩ of "1.2Ω 2kΩ 200mA@DC". Stuck to
+        // something that is no quantity — a word ("1.2Ω DCR@DC"), a
+        // tolerance ("600Ω ±25%@100MHz") — it binds as a spaced one does, so
+        // the spacing alone does not change the reading. A unit split off
+        // its number ("1 kΩ@100MHz") is already joined back on by
+        // [`bead_split`].
+        Binding::Glued { at } => match out.last() {
+            Some(tok) if tok.index + 1 == at && is_quantity(&tok.base) => Some(out.len() - 1),
+            Some(tok) if tok.index + 1 == at => nearest_quantity(out),
+            _ => None,
+        },
+        // The nearest quantity, whatever its unit: "1.2Ω 2kΩ 200mA @DC" is
+        // about the 200mA, the same as when the "@" is glued on.
+        Binding::Spaced => nearest_quantity(out),
         Binding::OhmMarked => out
             .iter()
             .rposition(|tok| bead_ohms(&tok.base).is_some() && is_ohm_marked_token(&tok.base)),
@@ -4157,12 +4166,24 @@ mod value_norm_tests {
 
     #[test]
     fn a_glued_at_binds_to_its_token_and_a_spaced_one_to_the_ohms() {
-        // Stuck to the 200mA, the "@DC" says nothing about the 2kΩ.
-        let v = normalize_value("1.2Ω 2kΩ 200mA@DC", "FB");
-        assert!(v.is_none(), "1.2Ω and 2kΩ stay ambiguous: {v:?}");
-        // Spaced off, it reaches the nearest ohm value.
-        let v = normalize_value("1kΩ 1.5Ω @DC", "FB").expect("should parse");
-        assert_eq!(v.canonical, "1kΩ");
+        // Stuck to the 200mA or spaced off it, the "@DC" is about the
+        // current and says nothing about the 2kΩ.
+        for raw in ["1.2Ω 2kΩ 200mA@DC", "1.2Ω 2kΩ 200mA @DC", "1.2Ω 2kΩ 200mA @ DC"] {
+            let v = normalize_value(raw, "FB");
+            assert!(v.is_none(), "{raw}: 1.2Ω and 2kΩ stay ambiguous: {v:?}");
+        }
+        // Nor does a spaced "@DC" after a current reach the rated impedance.
+        for (raw, want) in [
+            ("1kΩ 1.5Ω @DC", "1kΩ"),
+            ("1kΩ@100MHz 1.5A @DC", "1kΩ@100MHz"),
+            ("1 kΩ 1.5A @DC", "1kΩ"),
+            // Glued to a tolerance, it binds as a spaced one does.
+            ("600Ω ±25%@100MHz", "600Ω@100MHz"),
+            ("1kΩ 1.2Ω DCR@DC", "1kΩ"),
+        ] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, want, "{raw}");
+        }
     }
 
     #[test]

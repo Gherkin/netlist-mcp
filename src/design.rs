@@ -2990,9 +2990,10 @@ fn normalize_simple_value(value: &str, unit_symbol: &str, unit_letter: char) -> 
 ///
 /// It is a plausibility bound, not a parser: a DCR of 1.5Ω (the high end for
 /// a small-signal bead) sits inside the band unless the string says it was
-/// measured at DC, and a short numeric MPN or package code — "2512", "0603"
-/// — still reads as an ohm value. What the band cannot rule out, the rules
-/// below either leave ambiguous or read as written.
+/// measured at DC, and a short numeric MPN or package code with no leading
+/// zero ("2512", "1206") still reads as an ohm value. One with a leading zero
+/// ("0603") does not ([`is_package_code`]). What the band cannot rule out,
+/// the rules below either leave ambiguous or read as written.
 const BEAD_OHMS: std::ops::RangeInclusive<f64> = 1.0..=10_000.0;
 
 /// The FB reading: pick the *impedance*, not the first number that parses.
@@ -3090,10 +3091,15 @@ fn normalize_bead_value(value: &str) -> Option<ValueNorm> {
                 //    the candidate's own token, since the resistor reading
                 //    takes the *first* token for the value and here that may
                 //    be a rating ("2A 1k"). With no candidate at all it
-                //    starts from the top — but a value struck out as a DC
-                //    quantity must not come back that way.
+                //    starts from the top, unless the top is a package code.
+                //    Once a value was struck as a DC quantity, the survivor
+                //    says nothing of itself: "1.2Ω DCR 600" and "1.2Ω DCR
+                //    1206" look the same, and one is a package code.
                 [] => {
-                    if candidates.is_empty() && struck_dc {
+                    if struck_dc {
+                        return None;
+                    }
+                    if candidates.is_empty() && split.first().is_some_and(|(tok, _)| is_package_code(tok)) {
                         return None;
                     }
                     let start = candidates.first().map_or(0, |(tok, _)| tok.index);
@@ -3124,7 +3130,17 @@ fn normalize_bead_value(value: &str) -> Option<ValueNorm> {
 /// candidates with, and [`attach_mark`] binds with, so that a frequency lands
 /// on the token the reading will actually choose.
 fn bead_ohms(tok: &str) -> Option<f64> {
+    if is_package_code(tok) {
+        return None;
+    }
     parse_value_token(tok, 'R').filter(|magnitude| BEAD_OHMS.contains(magnitude))
+}
+
+/// True if `tok` is a bare number with a leading zero ("0402", "0603",
+/// "0805"): a package code, never a value. Nobody writes 603Ω as "0603".
+/// A decimal ("0.5") is a value.
+fn is_package_code(tok: &str) -> bool {
+    is_bare_number(tok) && tok.starts_with('0') && tok[1..].starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// One whitespace token of a bead's value string, as [`bead_tokens`] read it.
@@ -3311,6 +3327,8 @@ fn is_bare_number(tok: &str) -> bool {
 fn bead_tokens(tokens: &[(String, bool)]) -> Option<Vec<BeadToken>> {
     let mut out: Vec<BeadToken> = Vec::new();
     let mut i = 0;
+    // The index of a value a "DCR" label before it struck as DC.
+    let mut strike_next: Option<usize> = None;
 
     while i < tokens.len() {
         let index = i;
@@ -3343,20 +3361,30 @@ fn bead_tokens(tokens: &[(String, bool)]) -> Option<Vec<BeadToken>> {
             continue;
         }
 
-        // A "DCR" label standing after an ohm value ("1.2Ω DCR") says that
-        // value is the DC resistance, the same as an "@DC" stuck to it: it is
-        // no impedance candidate, and a frequency steps over it. Only the bare
-        // word labels: "DCR=0.3Ω" or "DCR/2A" carries its own value, and a
-        // lone "DC" ("600Ω DC") is not a resistance label.
+        // A "DCR" label next to an ohm value says that value is the DC
+        // resistance, the same as an "@DC" stuck to it: it is no impedance
+        // candidate, and a frequency steps over it. The label binds to the
+        // ohm value beside it, before ("1.2Ω DCR 1kΩ") or after ("600R DCR
+        // 0.3R"). With one on each side, the smaller is the DCR: a bead's
+        // DC resistance is far below its impedance. Only the bare word
+        // labels: "DCR=0.3Ω" or "DCR/2A" carries its own value, and a lone
+        // "DC" ("600Ω DC") is not a resistance label.
         if tok.eq_ignore_ascii_case("dcr") {
-            if let Some(prev) = out.last_mut().filter(|prev| prev.index + 1 == index) {
-                if parse_value_token(&prev.base, 'R').is_some() {
-                    prev.dc = true;
-                }
+            let before = out
+                .last()
+                .filter(|prev| prev.index + 1 == index)
+                .and_then(|prev| parse_value_token(&prev.base, 'R'));
+            let after = tokens.get(index + 1).and_then(|(next, _)| parse_value_token(next, 'R'));
+            match (before, after) {
+                (Some(b), Some(a)) if a < b => strike_next = Some(index + 1),
+                (Some(_), _) => out.last_mut().expect("before is Some").dc = true,
+                (None, Some(_)) => strike_next = Some(index + 1),
+                (None, None) => {}
             }
         }
 
-        out.push(BeadToken { base: tok.to_string(), freq: None, dc: false, index });
+        let dc = strike_next == Some(index);
+        out.push(BeadToken { base: tok.to_string(), freq: None, dc, index });
     }
     Some(out)
 }
@@ -3372,7 +3400,7 @@ fn bead_tokens(tokens: &[(String, bool)]) -> Option<Vec<BeadToken>> {
 /// the same reason — taking one by position would make the same part read
 /// differently depending on the order someone wrote it in. It also means a
 /// frequency landed on a bare number while a value with an ohm unit stands
-/// before it ("1kΩ 0603 @100MHz"): either could be the impedance.
+/// before it ("1kΩ 1206 @100MHz"): either could be the impedance.
 fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option<()> {
     // A mark that is neither a frequency nor DC ("@25C") says nothing about
     // the value, wherever it would land.
@@ -3384,13 +3412,15 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
     // 200mA. A frequency is about the nearest value that could be the
     // impedance, stepping over a current ("1kΩ 1.5A @100MHz"), a DCR under
     // the band ("1kΩ 120mΩ 2A @100MHz"), and a value marked or labelled DC
-    // ("1kΩ 1.2Ω DCR @100MHz"): each rates the 1kΩ. A bare package code is
-    // in band, so it is not stepped over ("1kΩ 0603 @100MHz" lands on the
-    // 0603) — unless the mark already stepped over a quantity to reach it
-    // and an ohm-marked value stands before it: "220Ω 0402 2A 50mΩ
-    // @100MHz" rates the 220Ω, since the mark plainly skipped the ratings
-    // written after the impedance. Only digits count as a bare number: the
-    // 2.2k of "1kΩ 2.2k 1.5A @100MHz" could be the impedance.
+    // ("1kΩ 1.2Ω DCR @100MHz"): each rates the 1kΩ. A leading-zero package
+    // code ("0603") is no candidate, so it is stepped over too. Any other
+    // bare number is in band, so it is not stepped over ("1kΩ 1206
+    // @100MHz" lands on the 1206) — unless the mark already stepped over a
+    // quantity to reach it and an ohm-marked value stands before it:
+    // "220Ω 1206 2A 50mΩ @100MHz" rates the 220Ω, since the mark plainly
+    // skipped the ratings written after the impedance. Only digits count
+    // as a bare number: the 2.2k of "1kΩ 2.2k 1.5A @100MHz" could be the
+    // impedance.
     let nearest = |out: &[BeadToken]| match mark {
         Mark::Dc => out.iter().rposition(|tok| is_quantity(&tok.base)),
         Mark::Other => None,
@@ -3462,7 +3492,7 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
             if !is_ohm_marked_token(&out[pos].base)
                 && out[..pos]
                     .iter()
-                    .any(|tok| is_ohm_marked_token(&tok.base) && bead_ohms(&tok.base).is_some()) =>
+                    .any(|tok| !tok.dc && is_ohm_marked_token(&tok.base) && bead_ohms(&tok.base).is_some()) =>
         {
             return None
         }
@@ -4237,7 +4267,8 @@ mod value_norm_tests {
             // package code behind an ohm-marked value...
             ("220Ω 0402 2A 50mΩ @100MHz", Some("220Ω@100MHz")),
             // ...but not one it reached without stepping over anything.
-            ("1kΩ 0603 @100MHz", None),
+            ("1kΩ 1206 @100MHz", None),
+            ("220Ω 1206 2A 50mΩ @100MHz", Some("220Ω@100MHz")),
             // "NA" and "PA" are words, not nanoamps and picoamps.
             ("600 NA", Some("600Ω")),
             ("600 PA", Some("600Ω")),
@@ -4264,6 +4295,31 @@ mod value_norm_tests {
             // A struck DCR is no ohm value for a package code to stand behind.
             ("1.2Ω DCR 0603 2A @100MHz", None),
             ("1.2Ω@DC 0603 1A @100MHz", None),
+            // Round 9 decisions. A leading-zero bare number is a package
+            // code, never a candidate.
+            ("1kΩ 0603 @100MHz", Some("1kΩ@100MHz")),
+            ("600 0603 @100MHz", Some("600Ω@100MHz")),
+            ("0603 12kΩ@100MHz", None),
+            ("0.3Ω DCR 0603 2A @100MHz", None),
+            ("0603 2A", None),
+            // Once a value is struck as DC, a bare survivor does not win.
+            ("1.2Ω DCR 0603", None),
+            ("1.2Ω@DC 0603", None),
+            ("1.2Ω DCR 600", None),
+            ("1.2Ω DCR 1kΩ", Some("1kΩ")),
+            // ...but a bare number the frequency names still does.
+            ("1.2Ω DCR 600 @100MHz", Some("600Ω@100MHz")),
+            ("1.2Ω DCR 600@100MHz", Some("600Ω@100MHz")),
+            // A DCR label binds to the ohm value beside it, and with one on
+            // each side, to the smaller.
+            ("600R DCR 0.3R", Some("600Ω")),
+            ("600Ω DCR 0.3Ω", Some("600Ω")),
+            ("600 ohm DCR 0.3 ohm", Some("600Ω")),
+            ("600R DCR 300mR", Some("600Ω")),
+            ("1kΩ DCR 1.2Ω", Some("1kΩ")),
+            ("1kΩ DCR 1.2Ω @100MHz", Some("1kΩ@100MHz")),
+            // With nothing after it, the label is about the value before.
+            ("600 ohm DCR @100MHz", None),
         ] {
             let got = normalize_value(raw, "FB").map(|v| v.canonical);
             assert_eq!(got.as_deref(), want, "{raw}");
@@ -4417,9 +4473,10 @@ mod value_norm_tests {
 
     #[test]
     fn a_frequency_on_a_bare_number_after_an_ohm_value_stays_null() {
-        // "0603" took the "@", but the 1kΩ before it says it is ohms: either
-        // could be the impedance, so do not guess.
-        assert!(normalize_value("1kΩ 0603 @100MHz", "FB").is_none());
+        // "1206" took the "@", but the 1kΩ before it says it is ohms: either
+        // could be the impedance, so do not guess. ("0603" is a package code
+        // and never a candidate, so "1kΩ 0603 @100MHz" is the 1kΩ.)
+        assert!(normalize_value("1kΩ 1206 @100MHz", "FB").is_none());
         for (raw, want) in [("600@100MHz", "600Ω@100MHz"), ("0603 1kΩ@100MHz", "1kΩ@100MHz")] {
             let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
             assert_eq!(v.canonical, want, "{raw}");
@@ -4475,11 +4532,9 @@ mod value_norm_tests {
         // An "@" says which value it means, so it may mark a bare number.
         let v = normalize_value("600@100MHz", "FB").expect("should parse");
         assert_eq!(v.canonical, "600Ω@100MHz");
-        // A lone package code is still misread as ohms — the band cannot
-        // tell "0603" from a value (see BEAD_OHMS) — but no frequency is
-        // invented for it.
-        let v = normalize_value("0603 100MHz", "FB").expect("should parse");
-        assert!(v.at_frequency.is_none());
+        // A lone package code is no value, with or without a frequency.
+        assert!(normalize_value("0603 100MHz", "FB").is_none());
+        assert!(normalize_value("0603", "FB").is_none());
     }
 
     #[test]

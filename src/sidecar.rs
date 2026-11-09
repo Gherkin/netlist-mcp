@@ -3,7 +3,8 @@
 //!
 //! Two files, both optional:
 //! - the project file, `<netlist stem>.sidecar.json` next to the `.net`;
-//! - the shared library, named by `$NETLIST_MCP_LIBRARY`.
+//! - the shared library, named by `$NETLIST_MCP_LIBRARY`. Unset or empty
+//!   means no library; set to a path that does not exist stops startup (#54).
 //!
 //! Each is a JSON object with up to three tables of entries:
 //!
@@ -222,8 +223,9 @@ impl Sidecar {
     }
 
     /// Load the library (if `library` is given) and the project file next to
-    /// `netlist`. A file that does not exist is skipped; a file that exists
-    /// but cannot be read or parsed is an error.
+    /// `netlist`. A missing project file is skipped; a missing library is an
+    /// error, since the user named it (#54). A file that exists but cannot be
+    /// read or parsed is an error.
     pub fn load(netlist: &Path, library: Option<&Path>) -> anyhow::Result<Sidecar> {
         let mut files = Vec::new();
         let mut probes = Vec::new();
@@ -238,6 +240,18 @@ impl Sidecar {
                 Ok(text) => {
                     files.push(SidecarFile::parse(&text, &shown, origin)?);
                     probes.push(Probe { path: shown, origin, found: true });
+                }
+                // Issue #54: a library path the user set but that is missing
+                // (a typo, or a relative path from another cwd) would turn
+                // the library off without a word, so it stops startup.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && origin == Origin::Library => {
+                    // Show the absolute path tried, quoted, so a cwd mistake
+                    // or a blank value is visible in the message.
+                    let tried = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+                    bail!(
+                        "sidecar {shown}: ${LIBRARY_ENV} names a file that does not exist (looked for \"{}\")",
+                        tried.display()
+                    );
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     probes.push(Probe { path: shown, origin, found: false });
@@ -452,12 +466,45 @@ mod tests {
     }
 
     #[test]
-    fn load_skips_missing_files() {
+    fn load_skips_missing_project_file() {
         let dir = std::env::temp_dir().join(format!("sidecar-test-{}", std::process::id()));
-        let s = Sidecar::load(&dir.join("none.net"), Some(&dir.join("nolib.json"))).expect("ok");
+        let s = Sidecar::load(&dir.join("none.net"), None).expect("ok");
         assert!(s.files.is_empty());
-        assert_eq!(s.probes.len(), 2);
-        assert!(s.probes.iter().all(|p| !p.found));
-        assert_eq!(s.probes[0].origin, Origin::Library);
+        assert_eq!(s.probes.len(), 1);
+        assert!(!s.probes[0].found);
+        assert_eq!(s.probes[0].origin, Origin::Project);
+    }
+
+    // Issue #54: a library path that is set but missing stops startup, with
+    // the path in the message.
+    #[test]
+    fn load_rejects_missing_library() {
+        let dir = std::env::temp_dir().join(format!("sidecar-test-{}", std::process::id()));
+        let lib = dir.join("nolib.json");
+        let err = Sidecar::load(&dir.join("none.net"), Some(&lib)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&lib.display().to_string()), "{msg}");
+        assert!(msg.contains("does not exist"), "{msg}");
+        assert!(msg.contains(LIBRARY_ENV), "{msg}");
+        let abs = std::path::absolute(&lib).unwrap();
+        assert!(msg.contains(&format!("\"{}\"", abs.display())), "{msg}");
+    }
+
+    // join() precedence needs library files before project files; load()
+    // must probe in that order.
+    #[test]
+    fn load_reads_library_before_project() {
+        let dir = std::env::temp_dir().join(format!("sidecar-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib = dir.join("lib.json");
+        std::fs::write(&lib, r#"{"mpn": {"X": {"n": 1}}}"#).unwrap();
+        std::fs::write(dir.join("board.sidecar.json"), r#"{"mpn": {"X": {"n": 2}}}"#).unwrap();
+        let s = Sidecar::load(&dir.join("board.net"), Some(&lib));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let s = s.expect("ok");
+        let order: Vec<(Origin, bool)> = s.probes.iter().map(|p| (p.origin, p.found)).collect();
+        assert_eq!(order, vec![(Origin::Library, true), (Origin::Project, true)]);
+        let j = s.join(&keys("U1", "", "X")).expect("matches");
+        assert_eq!(j.entry["n"], json!(2));
     }
 }

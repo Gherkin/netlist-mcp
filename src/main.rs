@@ -25,8 +25,9 @@ fn load_design() -> anyhow::Result<Design> {
     let data = load_file(&args[1]);
     let netlist = parser::kicad_parser::parse_netlist(&data)?;
     let mut design = design::Design::from_netlist(netlist)?;
-    // Issue #46: optional enrichment files. A missing file is skipped; a
-    // malformed one stops startup, so a typo never silently drops entries.
+    // Issue #46: optional enrichment files. A missing project file is
+    // skipped; a malformed file, or a set but missing library (#54), stops
+    // startup, so a typo never silently drops entries.
     let library = env::var_os(sidecar::LIBRARY_ENV)
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from);

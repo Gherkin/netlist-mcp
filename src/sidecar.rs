@@ -1,5 +1,7 @@
-//! Read-only enrichment sidecar (issue #46): facts the netlist does not carry,
-//! joined with the parsed design at startup and shown in `get_component`.
+//! Enrichment sidecar (issue #46): facts the netlist does not carry, joined
+//! with the parsed design at startup and shown in `get_component`. The query
+//! tools only read it; `write_sidecar` (issue #48, see `write_file`) is the
+//! one tool that changes it.
 //!
 //! Two files, both optional:
 //! - the project file, `<netlist stem>.sidecar.json` next to the `.net`;
@@ -23,19 +25,26 @@
 //! `MPN` property, else `value`) and by refdes, all exact. The matches are
 //! merged field by field (top-level keys only) in this order, later wins:
 //! library lib_id, project lib_id, library mpn, project mpn, project refdes.
+//!
+//! Writing (issue #48) changes one entry in one file. Another process (a
+//! second server sharing the library, or a person in an editor) may change
+//! the same file, so a write takes an OS lock on `<file>.lock`, re-reads the
+//! file from disk, changes only its own entry, and renames a temp file over
+//! the original. Entries written elsewhere are kept.
 
 use std::collections::{BTreeMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Environment variable naming the shared MPN / lib_id library file.
 pub const LIBRARY_ENV: &str = "NETLIST_MCP_LIBRARY";
 
 /// Which of the two files an entry came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
     Library,
@@ -43,7 +52,7 @@ pub enum Origin {
 }
 
 /// The three key scopes, in ascending precedence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
     LibId,
@@ -136,6 +145,184 @@ impl SidecarFile {
         }
         Ok(file)
     }
+
+    fn empty(path: &str, origin: Origin) -> SidecarFile {
+        SidecarFile {
+            path: path.to_string(),
+            origin,
+            lib_id: Entries::new(),
+            mpn: Entries::new(),
+            refdes: Entries::new(),
+        }
+    }
+
+    /// The file as JSON text: tables in scope order, empty tables left out,
+    /// keys sorted, two-space indent, trailing newline.
+    fn to_json(&self) -> String {
+        let mut root = Map::new();
+        for scope in Scope::ALL {
+            let table = self.table(scope);
+            if !table.is_empty() {
+                let entries = table.iter()
+                    .map(|(k, v)| (k.clone(), Value::Object(v.clone())))
+                    .collect();
+                root.insert(scope.table_name().to_string(), Value::Object(entries));
+            }
+        }
+        let mut text = serde_json::to_string_pretty(&Value::Object(root))
+            .expect("a serde_json::Value always serializes");
+        text.push('\n');
+        text
+    }
+
+    /// Apply one edit. Returns the entry as now stored, or None when it was
+    /// removed (by `delete`, or because its last field was nulled out).
+    fn apply(&mut self, edit: &Edit) -> anyhow::Result<Option<Map<String, Value>>> {
+        let path = self.path.clone();
+        let table = self.table_mut(edit.scope);
+        if edit.delete {
+            if table.remove(edit.key).is_none() {
+                bail!(
+                    "sidecar {path}: no {}.{:?} entry to delete",
+                    edit.scope.table_name(), edit.key
+                );
+            }
+            return Ok(None);
+        }
+        let entry = table.entry(edit.key.to_string()).or_default();
+        for (k, v) in edit.fields {
+            if v.is_null() {
+                entry.remove(k);
+            } else {
+                entry.insert(k.clone(), v.clone());
+            }
+        }
+        if entry.is_empty() {
+            table.remove(edit.key);
+            return Ok(None);
+        }
+        Ok(Some(entry.clone()))
+    }
+}
+
+/// One change asked of `write_file` (issue #48).
+pub struct Edit<'a> {
+    /// The file to change.
+    pub origin: Origin,
+    pub scope: Scope,
+    /// Matched exactly, like `join` does.
+    pub key: &'a str,
+    /// Top-level fields to set; a null value removes that field. Fields not
+    /// named are kept. An entry left with no fields is removed.
+    pub fields: &'a Map<String, Value>,
+    /// Remove the whole entry. `fields` must then be empty.
+    pub delete: bool,
+}
+
+impl Edit<'_> {
+    /// Reject an edit that cannot be meant: one no component could ever
+    /// match, or one that asks for nothing.
+    pub fn check(&self) -> anyhow::Result<()> {
+        let table = self.scope.table_name();
+        if self.key.is_empty() {
+            bail!("sidecar: the key is empty; an empty key never matches a component");
+        }
+        if self.key.trim() != self.key {
+            bail!(
+                "sidecar: the key {:?} has leading or trailing whitespace; keys match exactly, so it would never match",
+                self.key
+            );
+        }
+        if self.scope == Scope::Refdes && self.origin == Origin::Library {
+            bail!(
+                "sidecar: the shared library (${LIBRARY_ENV}) cannot hold \"refdes\" entries; write them to the project file"
+            );
+        }
+        if self.delete && !self.fields.is_empty() {
+            bail!("sidecar: give either `fields` or `delete`, not both");
+        }
+        if !self.delete && self.fields.is_empty() {
+            bail!("sidecar: nothing to write for {table}.{:?}: give `fields`, or `delete`", self.key);
+        }
+        Ok(())
+    }
+}
+
+/// What `write_file` did.
+#[derive(Debug, Clone, Serialize)]
+pub struct Written {
+    pub file: String,
+    pub origin: Origin,
+    pub scope: Scope,
+    pub key: String,
+    /// True when the project file did not exist and this write created it.
+    pub created_file: bool,
+    /// The entry as now stored in this file, or null when it was removed.
+    /// Other files' entries for the same component are not merged in here;
+    /// `get_component` shows the joined result.
+    pub entry: Option<Map<String, Value>>,
+}
+
+/// Change one entry in the sidecar file at `path` (issue #48).
+///
+/// Holds an exclusive OS lock on `<file>.lock` for the whole
+/// read-change-write, so two writers (in this process or another) take
+/// turns. The file is re-read from disk under the lock, so entries another
+/// writer or a person added since startup are kept. The new text goes to a
+/// temp file in the same directory, which is renamed over the original. A
+/// symlink is followed: the file it points at is replaced, not the link.
+///
+/// A missing project file is created; a missing library file is an error,
+/// as at startup (#54). A file that does not parse is an error and is left
+/// unchanged.
+pub fn write_file(path: &Path, edit: &Edit) -> anyhow::Result<Written> {
+    edit.check()?;
+    let shown = path.display().to_string();
+    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut lock_name = target.file_name().unwrap_or_default().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = target.with_file_name(lock_name);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("sidecar {shown}: cannot open lock file {}", lock_path.display()))?;
+    // Released when `lock` is dropped at the end of this function.
+    lock.lock()
+        .with_context(|| format!("sidecar {shown}: cannot lock {}", lock_path.display()))?;
+
+    let (mut file, created_file) = match fs::read_to_string(&target) {
+        Ok(text) => (SidecarFile::parse(&text, &shown, edit.origin)?, false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && edit.origin == Origin::Project => {
+            (SidecarFile::empty(&shown, edit.origin), true)
+        }
+        Err(e) => return Err(e).with_context(|| format!("sidecar {shown}: cannot read")),
+    };
+    let entry = file.apply(edit)?;
+
+    let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp-{}", std::process::id()));
+    let tmp = target.with_file_name(tmp_name);
+    let result = fs::write(&tmp, file.to_json())
+        .and_then(|()| match fs::metadata(&target) {
+            // Keep the original file's permissions.
+            Ok(meta) => fs::set_permissions(&tmp, meta.permissions()),
+            Err(_) => Ok(()),
+        })
+        .and_then(|()| fs::rename(&tmp, &target));
+    if let Err(e) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("sidecar {shown}: cannot write"));
+    }
+    Ok(Written {
+        file: shown,
+        origin: edit.origin,
+        scope: edit.scope,
+        key: edit.key.to_string(),
+        created_file,
+        entry,
+    })
 }
 
 /// A file the loader looked for, found or not. Reported by `design_overview`
@@ -152,6 +339,11 @@ pub struct Probe {
 pub struct Sidecar {
     files: Vec<SidecarFile>,
     probes: Vec<Probe>,
+    /// Where `load` looked: the project path is set even when that file
+    /// was not found, so `write_sidecar` can create it. Both None for a
+    /// sidecar that was not loaded from disk.
+    project: Option<PathBuf>,
+    library: Option<PathBuf>,
 }
 
 /// The identity a component is matched on.
@@ -162,7 +354,7 @@ pub struct Keys<'a> {
 }
 
 impl<'a> Keys<'a> {
-    fn get(&self, scope: Scope) -> &'a str {
+    pub fn get(&self, scope: Scope) -> &'a str {
         match scope {
             Scope::LibId => self.lib_id,
             Scope::Mpn => self.mpn,
@@ -213,7 +405,25 @@ impl Sidecar {
     /// project files; `load` does this.
     #[cfg(test)]
     pub fn from_files(files: Vec<SidecarFile>, probes: Vec<Probe>) -> Sidecar {
-        Sidecar { files, probes }
+        Sidecar { files, probes, project: None, library: None }
+    }
+
+    /// The path of the file an `origin` write goes to.
+    pub fn path_for(&self, origin: Origin) -> anyhow::Result<&Path> {
+        match origin {
+            Origin::Project => self.project.as_deref()
+                .context("sidecar: no project file path (the sidecar was not loaded from disk)"),
+            Origin::Library => self.library.as_deref().with_context(|| format!(
+                "sidecar: no shared library is set; set ${LIBRARY_ENV} to a file and restart, or write to the project file"
+            )),
+        }
+    }
+
+    /// Load the same files again, from disk.
+    pub fn reload(&self) -> anyhow::Result<Sidecar> {
+        let project = self.project.as_deref()
+            .context("sidecar: no project file path (the sidecar was not loaded from disk)")?;
+        Self::load_paths(project, self.library.as_deref())
     }
 
     /// The project file path for a netlist: same directory and stem,
@@ -227,13 +437,17 @@ impl Sidecar {
     /// error, since the user named it (#54). A file that exists but cannot be
     /// read or parsed is an error.
     pub fn load(netlist: &Path, library: Option<&Path>) -> anyhow::Result<Sidecar> {
+        Self::load_paths(&Self::project_path(netlist), library)
+    }
+
+    /// `load`, given the project file path itself.
+    fn load_paths(project: &Path, library: Option<&Path>) -> anyhow::Result<Sidecar> {
         let mut files = Vec::new();
         let mut probes = Vec::new();
-        let project = Self::project_path(netlist);
         let candidates = library
             .map(|p| (p.to_path_buf(), Origin::Library))
             .into_iter()
-            .chain(std::iter::once((project, Origin::Project)));
+            .chain(std::iter::once((project.to_path_buf(), Origin::Project)));
         for (path, origin) in candidates {
             let shown = path.display().to_string();
             match std::fs::read_to_string(&path) {
@@ -261,7 +475,12 @@ impl Sidecar {
                 }
             }
         }
-        Ok(Sidecar { files, probes })
+        Ok(Sidecar {
+            files,
+            probes,
+            project: Some(project.to_path_buf()),
+            library: library.map(Path::to_path_buf),
+        })
     }
 
     /// Join the entries that match `keys`, or None when nothing matches.
@@ -488,6 +707,196 @@ mod tests {
         assert!(msg.contains(LIBRARY_ENV), "{msg}");
         let abs = std::path::absolute(&lib).unwrap();
         assert!(msg.contains(&format!("\"{}\"", abs.display())), "{msg}");
+    }
+
+    // --- write_file (issue #48) ---
+
+    /// A fresh, empty directory for one test.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sidecar-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn fields(v: Value) -> Map<String, Value> {
+        let Value::Object(m) = v else { panic!("fields must be an object") };
+        m
+    }
+
+    fn edit<'a>(origin: Origin, scope: Scope, key: &'a str, f: &'a Map<String, Value>) -> Edit<'a> {
+        Edit { origin, scope, key, fields: f, delete: false }
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn write_creates_missing_project_file() {
+        let dir = temp_dir("create");
+        let path = dir.join("board.sidecar.json");
+        let f = fields(json!({"note": "quad"}));
+        let w = write_file(&path, &edit(Origin::Project, Scope::Mpn, "TLV9004", &f)).unwrap();
+        assert!(w.created_file);
+        assert_eq!(w.entry, Some(f.clone()));
+        assert_eq!(read_json(&path), json!({"mpn": {"TLV9004": {"note": "quad"}}}));
+        // The written file loads again.
+        assert!(SidecarFile::parse(&fs::read_to_string(&path).unwrap(), "t", Origin::Project).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Fields merge per top-level key; null removes one; other entries and
+    // tables are kept.
+    #[test]
+    fn write_merges_fields_and_null_removes() {
+        let dir = temp_dir("merge");
+        let path = dir.join("board.sidecar.json");
+        fs::write(&path, json!({
+            "lib_id": {"Amp:Quad": {"x": 1}},
+            "mpn": {"TLV9004": {"a": 1, "b": 2}, "OTHER": {"c": 3}}
+        }).to_string()).unwrap();
+        let f = fields(json!({"b": null, "d": {"pins": [1, 2]}}));
+        let w = write_file(&path, &edit(Origin::Project, Scope::Mpn, "TLV9004", &f)).unwrap();
+        assert!(!w.created_file);
+        assert_eq!(Value::Object(w.entry.unwrap()), json!({"a": 1, "d": {"pins": [1, 2]}}));
+        assert_eq!(read_json(&path), json!({
+            "lib_id": {"Amp:Quad": {"x": 1}},
+            "mpn": {"TLV9004": {"a": 1, "d": {"pins": [1, 2]}}, "OTHER": {"c": 3}}
+        }));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Nulling the last field removes the entry; the emptied table is left
+    // out of the file.
+    #[test]
+    fn write_removes_entry_left_empty() {
+        let dir = temp_dir("empty");
+        let path = dir.join("board.sidecar.json");
+        fs::write(&path, r#"{"refdes": {"U1": {"a": 1}}, "mpn": {"X": {"n": 1}}}"#).unwrap();
+        let f = fields(json!({"a": null}));
+        let w = write_file(&path, &edit(Origin::Project, Scope::Refdes, "U1", &f)).unwrap();
+        assert_eq!(w.entry, None);
+        assert_eq!(read_json(&path), json!({"mpn": {"X": {"n": 1}}}));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_delete_removes_entry_and_missing_is_an_error() {
+        let dir = temp_dir("delete");
+        let path = dir.join("board.sidecar.json");
+        fs::write(&path, r#"{"mpn": {"X": {"n": 1}, "Y": {"n": 2}}}"#).unwrap();
+        let none = Map::new();
+        let del = |key| Edit { origin: Origin::Project, scope: Scope::Mpn, key, fields: &none, delete: true };
+        assert_eq!(write_file(&path, &del("X")).unwrap().entry, None);
+        assert_eq!(read_json(&path), json!({"mpn": {"Y": {"n": 2}}}));
+        let err = write_file(&path, &del("X")).unwrap_err();
+        assert!(format!("{err:#}").contains("no mpn.\"X\" entry to delete"), "{err:#}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // The file is re-read under the lock: an entry a person (or another
+    // server) added after this server loaded it survives the write.
+    #[test]
+    fn write_keeps_entries_added_on_disk_since_load() {
+        let dir = temp_dir("reread");
+        let net = dir.join("board.net");
+        let path = Sidecar::project_path(&net);
+        fs::write(&path, r#"{"mpn": {"X": {"n": 1}}}"#).unwrap();
+        let loaded = Sidecar::load(&net, None).unwrap();
+        fs::write(&path, r#"{"mpn": {"X": {"n": 1}, "BY-HAND": {"n": 2}}}"#).unwrap();
+        let f = fields(json!({"n": 3}));
+        let target = loaded.path_for(Origin::Project).unwrap();
+        write_file(target, &edit(Origin::Project, Scope::Mpn, "X", &f)).unwrap();
+        assert_eq!(read_json(&path), json!({"mpn": {"X": {"n": 3}, "BY-HAND": {"n": 2}}}));
+        let fresh = loaded.reload().unwrap();
+        assert_eq!(fresh.join(&keys("U1", "", "BY-HAND")).unwrap().entry["n"], json!(2));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Many writers on one file take turns under the lock: no entry is lost.
+    #[test]
+    fn concurrent_writes_all_land() {
+        let dir = temp_dir("concurrent");
+        let path = dir.join("lib.json");
+        fs::write(&path, "{}").unwrap();
+        let handles: Vec<_> = (0..16).map(|i| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let f = fields(json!({"i": i}));
+                let key = format!("P{i}");
+                write_file(&path, &edit(Origin::Library, Scope::Mpn, &key, &f)).unwrap();
+            })
+        }).collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let v = read_json(&path);
+        assert_eq!(v["mpn"].as_object().unwrap().len(), 16, "{v}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_rejects_impossible_edits() {
+        let dir = temp_dir("reject");
+        let path = dir.join("board.sidecar.json");
+        let f = fields(json!({"n": 1}));
+        let none = Map::new();
+        let cases: [(Edit, &str); 5] = [
+            (edit(Origin::Library, Scope::Refdes, "U1", &f), "cannot hold \"refdes\""),
+            (edit(Origin::Project, Scope::Mpn, "", &f), "the key is empty"),
+            (edit(Origin::Project, Scope::Mpn, "X ", &f), "whitespace"),
+            (edit(Origin::Project, Scope::Mpn, "X", &none), "nothing to write"),
+            (Edit { origin: Origin::Project, scope: Scope::Mpn, key: "X", fields: &f, delete: true },
+             "not both"),
+        ];
+        for (e, want) in cases {
+            let err = write_file(&path, &e).unwrap_err();
+            assert!(format!("{err:#}").contains(want), "{want}: {err:#}");
+        }
+        assert!(!path.exists(), "a rejected edit must not create the file");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // A missing library is not created (as at startup, #54), and a file
+    // that does not parse is left as it was.
+    #[test]
+    fn write_refuses_missing_library_and_malformed_file() {
+        let dir = temp_dir("refuse");
+        let f = fields(json!({"n": 1}));
+        let lib = dir.join("lib.json");
+        assert!(write_file(&lib, &edit(Origin::Library, Scope::Mpn, "X", &f)).is_err());
+        assert!(!lib.exists());
+        let path = dir.join("board.sidecar.json");
+        fs::write(&path, r#"{"mpns": {}}"#).unwrap();
+        let err = write_file(&path, &edit(Origin::Project, Scope::Mpn, "X", &f)).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown top-level key"), "{err:#}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"mpns": {}}"#);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // A symlinked sidecar stays a symlink; the file it points at changes.
+    #[cfg(unix)]
+    #[test]
+    fn write_follows_symlink() {
+        let dir = temp_dir("symlink");
+        let real = dir.join("real.json");
+        fs::write(&real, "{}").unwrap();
+        let link = dir.join("lib.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let f = fields(json!({"n": 1}));
+        write_file(&link, &edit(Origin::Library, Scope::Mpn, "X", &f)).unwrap();
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(read_json(&real), json!({"mpn": {"X": {"n": 1}}}));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn path_for_library_needs_the_env_var() {
+        let s = Sidecar::default();
+        let err = s.path_for(Origin::Library).unwrap_err();
+        assert!(format!("{err:#}").contains(LIBRARY_ENV), "{err:#}");
+        assert!(s.path_for(Origin::Project).is_err());
     }
 
     // join() precedence needs library files before project files; load()

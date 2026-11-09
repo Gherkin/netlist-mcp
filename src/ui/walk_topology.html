@@ -76,6 +76,8 @@
   footer { padding: 0 12px 10px; color: var(--nl-faint); font-size: 11px; }
 
   svg { display: block; }
+  /* Centered when narrower than the frame; auto margins are 0 when wider. */
+  #canvas svg { margin: 0 auto; }
   svg text { fill: var(--nl-fg); font-family: var(--nl-font); font-size: 11px; }
   svg .w { stroke: var(--nl-fg); stroke-width: 1.4; fill: none; }
   svg .sym { stroke: var(--nl-fg); stroke-width: 1.6; fill: none; stroke-linejoin: round; }
@@ -109,8 +111,7 @@
 <div class="notes" id="notes"></div>
 <div id="message">Waiting for the walk result…</div>
 <div id="canvas" class="fit"></div>
-<footer id="footer" hidden>Topology only, not the board layout. Dashed part = DNP (not fitted).
-  Lines that cross without a dot are not connected.</footer>
+<footer id="footer" hidden>Dashed part = DNP (not fitted). Lines that cross without a dot are not connected.</footer>
 <script>
 "use strict";
 

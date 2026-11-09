@@ -269,7 +269,8 @@ impl NetlistServer {
 
     #[tool(description = "Full detail on one component: identity, keywords, \
         footprint, subsystem, the symbol's library id (`lib_id`, \
-        \"lib:part\"), the dnp / exclude_from_bom flags, the full \
+        \"lib:part\", as KiCad writes it: escape tokens like {slash} are kept \
+        so the first ':' always splits lib from part), the dnp / exclude_from_bom flags, the full \
         property map, and paginated pins (each with name, electrical type, and \
         net). `dnp: true` means the schematic marks the part Do Not Populate — \
         it is in the netlist and on every net it touches, but not on the built \

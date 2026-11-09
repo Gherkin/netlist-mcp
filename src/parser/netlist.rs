@@ -22,6 +22,8 @@ pub struct Component {
     pub sheet: Option<String>,
     /// The symbol's library id, "lib:part", from `(libsource (lib ..) (part ..))`.
     /// Every exported component carries one; the parser requires it.
+    /// Kept as KiCad wrote it: escape tokens such as `{slash}` and `{colon}`
+    /// are not decoded, so the `lib:part` split stays unambiguous (#51).
     pub lib_id: String,
     pub properties: HashMap<String, Option<String>>,
     pub pins: Vec<Pin>

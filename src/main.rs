@@ -147,8 +147,8 @@ struct WalkParams {
     /// Use it to draw or reason about the circuit shape (shunts, branches).
     #[serde(default)]
     include_topology: Option<bool>,
-    /// Max parts in `topology` (default 200, minimum 1), nearest to the start
-    /// first.
+    /// Max parts in `topology` (default 200, minimum 1; 0 is read as 1),
+    /// nearest to the start first.
     /// Nets only the cut parts reach are left out too. `topology.truncated`
     /// and the `omitted_parts`/`omitted_nets` counts report the cut; a net's
     /// own `omitted_parts` counts the cut parts on it (left out when 0).
@@ -319,7 +319,8 @@ impl NetlistServer {
         endpoint carries a `dnp` flag — a hop through a DNP part exists on the \
         schematic but not on the built board. include_topology adds a \
         net/part graph, capped at max_topology_parts (default 200); check \
-        topology.truncated.")]
+        topology.truncated, and also the top-level truncated: endpoint parts \
+        that max_endpoints dropped are missing from the graph too.")]
     fn walk(&self, Parameters(p): Parameters<WalkParams>) -> String {
         let max_depth = p.max_depth.unwrap_or(4);
         let max_endpoints = p.max_endpoints.unwrap_or(50);

@@ -1475,9 +1475,9 @@ impl Design {
     /// the nodes the walk touched (expanded, or stopped at). Parts are the
     /// edges: the start part, the series parts traversed (all their pins), and
     /// the reported endpoint parts, up to the cap below. Start and endpoint
-    /// parts list only the
-    /// pins that sit on a node net (in any state, rail and depth_limit
-    /// included), so a 100-pin IC shows only its pins on nets in the graph.
+    /// parts list only the pins that sit on a node net (in any state, rail
+    /// and depth_limit included), so a 100-pin IC shows only its pins on nets
+    /// in the graph.
     ///
     /// At most `max_parts` parts are kept (issue #34): the start part first,
     /// then series and endpoint parts by hop distance, series parts before
@@ -1537,19 +1537,21 @@ impl Design {
         }
         // `kept_nets` is a subset of `topo.nets`: `walk_bfs` notes every net
         // it pops and every far-side net of a series part it traverses.
-        let omitted_nets = topo.nets.len() - kept_nets.len();
+        debug_assert!(kept_nets.iter().all(|n| topo.nets.iter().any(|(t, _)| t == n)));
+        let omitted_nets = topo.nets.len().saturating_sub(kept_nets.len());
 
         // Per kept net: how many cut parts have a pin on it.
         let mut cut_on_net: HashMap<usize, usize> = HashMap::new();
+        let mut on: HashSet<usize> = HashSet::new();
         for &(c, _) in &cut {
-            let on: HashSet<usize> = self
+            on.clear();
+            on.extend(self
                 .component(&CompId(c))
                 .pins
                 .iter()
                 .filter_map(|p| self.pin(p).net.as_ref().map(|n| n.0))
-                .filter(|n| kept_nets.contains(n))
-                .collect();
-            for n in on {
+                .filter(|n| kept_nets.contains(n)));
+            for &n in &on {
                 *cut_on_net.entry(n).or_default() += 1;
             }
         }
@@ -2557,7 +2559,9 @@ struct TopoNet {
     /// Parts with a pin on this net that `max_topology_parts` cut. Above 0,
     /// this node's edges in the graph are incomplete. Like
     /// `Topology::truncated`, it does not count `max_endpoints` drops.
-    /// Left out when 0.
+    /// Left out when 0. Absent does not mean complete: a node whose `state`
+    /// is not "expanded" was never walked past, so its other members are
+    /// not listed either way.
     #[serde(skip_serializing_if = "is_zero")]
     omitted_parts: usize,
 }
@@ -5606,6 +5610,19 @@ mod walk_topology_tests {
                     "{ctx}: a zero per-net omitted_parts was serialized"
                 );
                 assert_eq!(net_cut > 0, cap < n_parts as u32, "{ctx}: per-net omitted_parts");
+                // Recount each net's cut parts from the uncapped graph.
+                let kept: HashSet<&str> = parts.iter().map(|p| p["refdes"].as_str().unwrap()).collect();
+                for n in t["nets"].as_array().unwrap() {
+                    let name = n["name"].as_str().unwrap();
+                    let want = full["topology"]["parts"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|p| !kept.contains(p["refdes"].as_str().unwrap()))
+                        .filter(|p| pins(p).iter().any(|(_, net)| net.as_deref() == Some(name)))
+                        .count() as u64;
+                    assert_eq!(n["omitted_parts"].as_u64().unwrap_or(0), want, "{ctx}: {name}");
+                }
             }
         }
     }

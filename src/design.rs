@@ -2723,13 +2723,23 @@ pub struct Component {
 /// (e.g. "33 pF" and "33p") without reparsing free text themselves.
 #[derive(Debug, Serialize, Clone)]
 pub struct ValueNorm {
-    /// The value in base SI units (ohms for R, farads for C, henries for L).
+    /// The value in base SI units (ohms for R and FB, farads for C, henries
+    /// for L).
     pub magnitude: f64,
     /// The base unit symbol: "Ω", "F", or "H".
     pub unit: String,
     /// A normalized display string using the SI prefix that puts the
-    /// mantissa in [1, 1000), e.g. "348kΩ", "33pF", "4.7µF", "0Ω".
+    /// mantissa in [1, 1000), e.g. "348kΩ", "33pF", "4.7µF", "0Ω". A bead's
+    /// carries its frequency too ("1kΩ@100MHz"), since that is part of what
+    /// makes two beads the same part — see `at_frequency`.
     pub canonical: String,
+    /// The frequency the magnitude is specified at, copied verbatim from the
+    /// value string ("100MHz"). Only ferrite beads have one: a bead's rating
+    /// is an impedance at a stated frequency, and 1kΩ@100MHz and 1kΩ@10MHz
+    /// are different parts. Omitted from the JSON when absent, so R/C/L are
+    /// serialized exactly as before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_frequency: Option<String>,
 }
 
 /// SI prefix letter -> multiplier, for a value of the given class.
@@ -2761,7 +2771,13 @@ pub struct ValueNorm {
 /// Both micro signs are accepted: U+00B5 MICRO SIGN and U+03BC GREEK SMALL
 /// LETTER MU, which exports use interchangeably.
 fn si_prefix(c: char, unit_letter: char) -> Option<f64> {
-    let mult = match c {
+    si_multiplier(c, unit_letter).filter(|&mult| prefix_is_real(mult, unit_letter))
+}
+
+/// The multiplier an SI prefix letter stands for, whether or not parts of the
+/// class come in that decade. [`si_prefix`] adds that check.
+fn si_multiplier(c: char, unit_letter: char) -> Option<f64> {
+    Some(match c {
         'p' | 'P' => 1e-12,
         'n' | 'N' => 1e-9,
         'u' | 'U' | 'µ' | 'μ' => 1e-6,
@@ -2772,8 +2788,7 @@ fn si_prefix(c: char, unit_letter: char) -> Option<f64> {
         'M' => 1e6,
         'G' => 1e9,
         _ => return None,
-    };
-    prefix_is_real(mult, unit_letter).then_some(mult)
+    })
 }
 
 /// Whether parts of this class are made in the decade `mult` names.
@@ -2911,20 +2926,28 @@ fn format_canonical(magnitude: f64, unit_symbol: &str) -> String {
 }
 
 /// Best-effort parse of a passive's raw `value` into a normalized magnitude.
-/// Only meaningful for R/C/L (resistors/capacitors/inductors); any other
-/// `refdes_class` returns `None`. The FIRST whitespace-separated token in
-/// `value` is taken as the value token; later tokens (ratings like "50V",
-/// dielectric codes like "C0G") are ignored for the magnitude, except that
-/// when the first token is a bare number, a later token may supply the
-/// prefix/unit (e.g. "33 pF").
+/// Only meaningful for R/C/L/FB (resistors, capacitors, inductors, ferrite
+/// beads); any other `refdes_class` returns `None`.
+///
+/// For R/C/L the FIRST whitespace-separated token in `value` is taken as the
+/// value token; later tokens (ratings like "50V", dielectric codes like
+/// "C0G") are ignored for the magnitude, except that when the first token is
+/// a bare number, a later token may supply the prefix/unit (e.g. "33 pF").
+///
+/// FB is ohms too but cannot use that rule — see [`normalize_bead_value`].
 pub fn normalize_value(value: &str, refdes_class: &str) -> Option<ValueNorm> {
-    let (unit_symbol, unit_letter) = match refdes_class {
-        "R" => ("Ω", 'R'),
-        "C" => ("F", 'F'),
-        "L" => ("H", 'H'),
-        _ => return None,
-    };
+    match refdes_class {
+        "R" => normalize_simple_value(value, "Ω", 'R'),
+        "C" => normalize_simple_value(value, "F", 'F'),
+        "L" => normalize_simple_value(value, "H", 'H'),
+        "FB" => normalize_bead_value(value),
+        _ => None,
+    }
+}
 
+/// The R/C/L reading described on [`normalize_value`]: the first token is the
+/// value, later tokens are ratings unless the first was a bare number.
+fn normalize_simple_value(value: &str, unit_symbol: &str, unit_letter: char) -> Option<ValueNorm> {
     let mut tokens = value.split_whitespace();
     let first = tokens.next()?;
     let stripped = strip_long_unit_word(first, unit_letter);
@@ -2949,7 +2972,680 @@ pub fn normalize_value(value: &str, refdes_class: &str) -> Option<ValueNorm> {
         magnitude,
         unit: unit_symbol.to_string(),
         canonical: format_canonical(magnitude, unit_symbol),
+        at_frequency: None,
     })
+}
+
+/// The band, in ohms, a ferrite bead's impedance rating lies in. The smallest
+/// bead anyone catalogues is a few ohms and the largest a few kilohms, so a
+/// number outside it is not an impedance at all but something else the value
+/// field happens to hold: a DC resistance under the floor ("120mΩ"), a bare
+/// numeric part number over the ceiling ("742792625" reads as 742.793MΩ).
+///
+/// Bounding the reading is what lets a bead string be read at all. Without it
+/// a lone "1.5A 120mΩ" — a real spelling, where the impedance is left to the
+/// MPN — is indistinguishable from a lone "1.5A 120Ω", and the DCR gets
+/// reported as the value: exactly the confident wrong answer issue #20 is
+/// about.
+///
+/// It is a plausibility bound, not a parser: a DCR of 1.5Ω (the high end for
+/// a small-signal bead) sits inside the band unless the string says it was
+/// measured at DC, and a short numeric MPN or package code with no leading
+/// zero ("2512", "1206") still reads as an ohm value. One with a leading zero
+/// ("0603") does not ([`is_package_code`]). What the band cannot rule out,
+/// the rules below either leave ambiguous or read as written.
+const BEAD_OHMS: std::ops::RangeInclusive<f64> = 1.0..=10_000.0;
+
+/// The FB reading: pick the *impedance*, not the first number that parses.
+///
+/// A bead is rated as an impedance at a frequency, and its value string
+/// normally lists two other ohm-valued quantities before it — the real ones
+/// from an 879-component board read `1.5A 120mΩ 1kΩ@100MHz` and
+/// `450mA 290mΩ 220Ω@100MHz`: current rating, DC resistance, then the
+/// impedance anyone actually means by "the value of the bead". Taking the
+/// first parseable token, which is what routing FB through
+/// [`normalize_simple_value`] would do, reports the 120mΩ DCR — a confident,
+/// plausible, wrong answer where the old `None` was merely incomplete
+/// (issue #20).
+///
+/// Candidates are the tokens that parse as ohms, fall in [`BEAD_OHMS`], and
+/// are not marked as measured at DC. Then, in order:
+///
+/// 1. An ohm token carrying a frequency is the impedance rating, named as
+///    such. Use it, and keep the frequency, since a bead's impedance means
+///    nothing without it. Quoted points that do not agree — on the ohms or
+///    on the frequency — are a spec table rather than a rating: which point
+///    is the headline figure is the one thing the string does not say, so
+///    return `None` rather than take one by position, which would make the
+///    same part read differently depending on the order someone wrote it in.
+///    Agreeing on the ohms alone is not enough, since `at_frequency` is part
+///    of what makes two beads the same part.
+/// 2. Otherwise, a token that *says* it is a resistance ("600R", "1kΩ") beats
+///    bare numbers that do not — a package code, the digits of a split
+///    rating, a fragment of a part number.
+/// 3. Otherwise, if more than one token could be read as the ohms, there is
+///    nothing to tell DCR from impedance: return `None` rather than guess.
+/// 4. Otherwise it is a plain single-value string ("120 ohm", "1 k"), which
+///    reads exactly like a resistor's — read from the candidate's own token,
+///    so that a leading rating does not take the value's place ("2A 1k"),
+///    and held to the same band.
+///
+/// What it still gives up, all of it in the direction of a missing frequency
+/// rather than a wrong value: a frequency written before its value
+/// ("100 MHz 600R") or after a value that does not carry its own unit
+/// ("1k 100MHz") is dropped, and punctuation stuck to the *value* rather
+/// than the frequency ("1kΩ, 100MHz") defeats [`parse_value_token`] the same
+/// way it does for an R or a C.
+fn normalize_bead_value(value: &str) -> Option<ValueNorm> {
+    let split = bead_split(value);
+
+    // Every token that could be read as a bead impedance, paired with the
+    // frequency it was quoted at. Ratings in other units ("1.5A", "25V")
+    // parse as nothing, DC resistances fall under the band, and a quantity
+    // marked as measured at DC drops out in `bead_tokens` — so none of them
+    // makes a string look ambiguous.
+    let read = bead_tokens(&split)?;
+    let struck_dc = read.iter().any(|tok| tok.dc);
+    let candidates: Vec<(BeadToken, f64)> = read
+        .into_iter()
+        .filter(|tok| !tok.dc)
+        .filter_map(|tok| {
+            let magnitude = bead_ohms(&tok.base)?;
+            Some((tok, magnitude))
+        })
+        .collect();
+
+    let marked: Vec<&(BeadToken, f64)> =
+        candidates.iter().filter(|(tok, _)| tok.freq.is_some()).collect();
+
+    let (magnitude, freq) = match marked.as_slice() {
+        // 1. The impedance rating, named as such — unless the quoted points
+        //    disagree, which says a table was pasted in, not a value. Marks
+        //    are canonicalized, so equality is the right test.
+        [first, rest @ ..] => {
+            if rest.iter().any(|(tok, magnitude)| {
+                *magnitude != first.1 || tok.freq != first.0.freq
+            }) {
+                return None;
+            }
+            if is_four_digit_number(&first.0.base) {
+                return None;
+            }
+            (first.1, first.0.freq.clone())
+        }
+        // No frequency quoted anywhere, so the ohm mark is all there is to go
+        // on.
+        [] => {
+            let ohm_marked: Vec<&(BeadToken, f64)> = candidates
+                .iter()
+                .filter(|(tok, _)| is_ohm_marked_token(&tok.base))
+                .collect();
+            match ohm_marked.as_slice() {
+                // 2. One token says of itself that it is a resistance and the
+                //    others are bare numbers — package codes ("0603"), MPN
+                //    fragments. It need not be
+                //    the first token: "2A 600R" is still a 600Ω bead.
+                [only] => (only.1, None),
+                // 3. Several in-band numbers that could each be the ohms, and
+                //    nothing saying which is the impedance.
+                [] if candidates.len() > 1 => return None,
+                // 4. The unit is split off or absent ("120 ohm", "1 k"), and
+                //    the value reads exactly like a resistor's — read from
+                //    the candidate's own token, since the resistor reading
+                //    takes the *first* token for the value and here that may
+                //    be a rating ("2A 1k"). With no candidate at all it
+                //    starts from the top, unless the top is a package code.
+                //    Once a value was struck as a DC quantity, the survivor
+                //    says nothing of itself: "1.2Ω DCR 600" and "1.2Ω DCR
+                //    1206" look the same, and one is a package code. A bare
+                //    four-digit number ("1206", "2512") may be one too, so
+                //    it is no reading on its own.
+                [] => {
+                    if struck_dc {
+                        return None;
+                    }
+                    if candidates.first().is_some_and(|(tok, _)| is_four_digit_number(&tok.base)) {
+                        return None;
+                    }
+                    if candidates.is_empty() && split.first().is_some_and(|(tok, _)| is_package_code(tok)) {
+                        return None;
+                    }
+                    let start = candidates.first().map_or(0, |(tok, _)| tok.index);
+                    let rest: Vec<&str> = split[start..].iter().map(|(tok, _)| tok.as_str()).collect();
+                    let norm = normalize_simple_value(&rest.join(" "), "Ω", 'R')?;
+                    return BEAD_OHMS.contains(&norm.magnitude).then_some(norm);
+                }
+                // 3. Two in-band resistances, both marked as such.
+                _ => return None,
+            }
+        }
+    };
+
+    let canonical = format_canonical(magnitude, "Ω");
+    Some(ValueNorm {
+        magnitude,
+        unit: "Ω".to_string(),
+        canonical: match &freq {
+            Some(freq) => format!("{canonical}@{freq}"),
+            None => canonical,
+        },
+        at_frequency: freq,
+    })
+}
+
+/// The impedance a token could be, if it could be one at all: a value in
+/// [`BEAD_OHMS`]. This is the predicate [`normalize_bead_value`] picks
+/// candidates with, and [`attach_mark`] binds with, so that a frequency lands
+/// on the token the reading will actually choose.
+fn bead_ohms(tok: &str) -> Option<f64> {
+    if is_package_code(tok) {
+        return None;
+    }
+    parse_value_token(tok, 'R').filter(|magnitude| BEAD_OHMS.contains(magnitude))
+}
+
+/// True if `tok` is a bare number with a leading zero ("0402", "0603",
+/// "0805"): a package code, never a value. Nobody writes 603Ω as "0603".
+/// A decimal ("0.5") is a value.
+fn is_package_code(tok: &str) -> bool {
+    is_bare_number(tok) && tok.starts_with('0') && tok[1..].starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// True if `tok` is four digits and nothing else ("1206", "2512", "1000"):
+/// it may be a package code, so a reading that rests on it alone is `null`.
+/// Unlike [`is_package_code`] it still counts as a candidate, so it still
+/// makes a string ambiguous ("1kΩ 1206 @100MHz" stays `null`).
+fn is_four_digit_number(tok: &str) -> bool {
+    tok.len() == 4 && tok.chars().all(|c| c.is_ascii_digit())
+}
+
+/// One whitespace token of a bead's value string, as [`bead_tokens`] read it.
+struct BeadToken {
+    /// The token itself; `@` marks are separate tokens by this point, and a
+    /// unit split off its number is joined back on ([`bead_split`]).
+    base: String,
+    /// The frequency the value was quoted at, canonicalized.
+    freq: Option<String>,
+    /// Whether an "@DC" marked this value as a DC quantity — a DC
+    /// resistance, whatever its magnitude — and so not the bead's impedance.
+    dc: bool,
+    /// Which whitespace token this was, so a reading that falls back to the
+    /// resistor parser can start it there rather than at the string's first
+    /// token, which may be a rating.
+    index: usize,
+}
+
+/// What an `@` mark says about the value it follows.
+enum Mark {
+    /// A frequency: the value is an impedance rating at that point.
+    Frequency(String),
+    /// The value was measured at DC, so whatever it is, it is not an
+    /// impedance rating at a frequency.
+    Dc,
+    /// Something else. It says nothing either way, so the value it marks
+    /// stays a plain unmarked candidate rather than acquiring a frequency
+    /// that is not one.
+    Other,
+}
+
+impl Mark {
+    fn read(mark: &str) -> Mark {
+        let mark = trim_frequency(mark);
+        match frequency_hz(mark) {
+            Some(hz) => Mark::from_hz(hz),
+            None if is_dc_mark(mark) => Mark::Dc,
+            None => Mark::Other,
+        }
+    }
+
+    /// A frequency in one spelling, so two spellings of one point ("100MHz",
+    /// "0.1GHz", "100.0MHz") give one `at_frequency`. Zero hertz is DC
+    /// written another way ("@0Hz"), not an impedance rating.
+    fn from_hz(hz: f64) -> Mark {
+        if hz == 0.0 {
+            Mark::Dc
+        } else {
+            Mark::Frequency(format_canonical(hz, "Hz"))
+        }
+    }
+}
+
+/// Which token a mark binds to.
+enum Binding {
+    /// An `@` written stuck to a value it can describe is about that value:
+    /// "@DC" on any quantity ("200mA@DC"), a frequency on an in-band ohm
+    /// value — the same test a spaced one binds with, so "1kΩ 120mΩ@100MHz"
+    /// reads like "1kΩ 120mΩ @100MHz". Stuck to anything else, it binds as
+    /// [`Binding::Spaced`] does. `at` is the `@`'s own index, to check the
+    /// token before it really is the one it was stuck to.
+    Glued { at: usize },
+    /// An `@` with a space before it is about the nearest value before it
+    /// that it can describe: for "@DC", any quantity ("1.2Ω 2kΩ 200mA
+    /// @DC"); for a frequency, an in-band ohm value not marked or labelled DC
+    /// ("1kΩ 1.2Ω DCR 1.5A @100MHz"). Either steps over a tolerance ("600Ω ±25%
+    /// @100MHz") or a word ("1.2Ω DCR @DC").
+    Spaced,
+    /// A bare frequency literal, with no `@` to say what it belongs to, only
+    /// marks a value that says of itself that it is ohms. Adjacency is
+    /// weaker evidence, and "1kΩ 0603 100MHz" must not read the package code
+    /// as a frequency-marked impedance — that would beat the real value.
+    OhmMarked,
+}
+
+/// Split a bead's value on whitespace, with every `@` its own token. Each
+/// token carries whether an `@` was stuck to the token before it
+/// ("1kΩ@100MHz", "1kΩ@ 100MHz") rather than spaced off it ("1kΩ @100MHz"),
+/// which decides its [`Binding`]. The flag is always false for other tokens.
+///
+/// A unit split off its number is joined back on here ("1 kΩ", "1 k ohm",
+/// "600 ohm"), before anything binds or counts: otherwise every reading
+/// sees a bare "1" and a "kΩ" with no number, and "1.2Ω 1 kΩ 100MHz" reads
+/// the DCR as the impedance.
+fn bead_split(value: &str) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = Vec::new();
+    for raw in value.split_whitespace() {
+        let mut after_value = false;
+        for (k, part) in raw.split('@').enumerate() {
+            if k > 0 {
+                out.push(("@".to_string(), after_value));
+            }
+            after_value = !part.is_empty();
+            if !after_value {
+                continue;
+            }
+            match out.last_mut() {
+                Some((prev, _)) if k == 0 && joins_split_unit(prev, part) => prev.push_str(part),
+                _ => out.push((part.to_string(), false)),
+            }
+        }
+    }
+    out
+}
+
+/// True if `unit` is the rest of the value `prev` starts. A bare number takes
+/// a unit word: an ohm unit ("1 kΩ", "600 ohm", "120 milliohm"), a frequency
+/// unit ("100 MHz"), or a current or voltage ("500 mA" is 500mA, a current,
+/// not a bare 500 that could be ohms). It does not take any other word: the 600 of
+/// "600 bead" or "600 Z @100MHz" is still the impedance, and the 600 of
+/// "600 to 1k" is still a rival to the 1k. A number that already took part
+/// of an ohm unit ("1k" before "ohm") takes more only while the whole is
+/// still an ohm unit, so the K of "4.7 ohm K" stays a tolerance code.
+fn joins_split_unit(prev: &str, unit: &str) -> bool {
+    let number_len = prev.len() - prev.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.').len();
+    if number_len == 0 {
+        return false;
+    }
+    // A unit word starts with a letter: the "100MHz" after "0603" is a
+    // frequency of its own, not the package code's unit.
+    let word = unit.starts_with(char::is_alphabetic);
+    if number_len == prev.len()
+        && word
+        && (is_frequency_unit(unit) || is_current_or_voltage_unit(unit) || is_ohm_word(unit))
+    {
+        return true;
+    }
+    let joined = format!("{}{unit}", &prev[number_len..]);
+    strip_long_unit_word(&joined, 'R').is_empty() || parse_unit_only_token(&joined, 'R', true).is_some()
+}
+
+/// True if `tok` is an amp or volt unit, in any case, with or without an SI
+/// prefix: "A", "mA", "ma", "µA", "Amps", "V", "kV", "VDC", "Vrms",
+/// "mAdc". The prefixes are the ones ratings use, lowercase but for kilo
+/// ("KV") and mega: "NA" and "PA" are words, not nanoamps and picoamps.
+fn is_current_or_voltage_unit(tok: &str) -> bool {
+    let is_unit = |word: &str| {
+        let lower = word.to_lowercase();
+        // "A"/"V" with an optional rms, dc or ac suffix: "Arms", "VDC".
+        let letter_unit = lower
+            .strip_prefix('a')
+            .or_else(|| lower.strip_prefix('v'))
+            .is_some_and(|suffix| matches!(suffix, "" | "rms" | "dc" | "ac"));
+        letter_unit || matches!(lower.as_str(), "amp" | "amps" | "volt" | "volts")
+    };
+    let mut chars = tok.chars();
+    let prefixed = chars.next().is_some_and(|c| matches!(c, 'p' | 'n' | 'u' | 'µ' | 'μ' | 'm' | 'k' | 'K' | 'M'))
+        && is_unit(chars.as_str());
+    prefixed || is_unit(tok)
+}
+
+/// True if `tok` ends in an ohm word, any case: "ohm", "ohms", or one with
+/// the prefix spelled out ("milliohm", "kilohms"). A spelled-out prefix
+/// makes the joined value unparseable, which is the point: a DCR written
+/// that way is no impedance candidate.
+fn is_ohm_word(tok: &str) -> bool {
+    strip_long_unit_word(tok, 'R').len() != tok.len()
+}
+
+/// True if `tok` is a quantity an `@` can be about: it has a number in it
+/// and is not a tolerance ("±25%", "(25%)").
+fn is_quantity(tok: &str) -> bool {
+    tok.chars().any(|c| c.is_ascii_digit()) && !tok.contains('%')
+}
+
+/// True if `tok` is digits and decimal points only: a number with no unit.
+fn is_bare_number(tok: &str) -> bool {
+    !tok.is_empty() && tok.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// Split a bead's value into (value token, frequency) pairs, tolerating the
+/// spellings of the `@` that real value fields use: glued to the value
+/// ("1kΩ@100MHz"), standing alone ("1kΩ @ 100MHz"), or leaning either way —
+/// [`bead_split`] has already split those out. A frequency split across two
+/// tokens ("@ 100 MHz") is joined back up, and a bare frequency literal
+/// marks the value before it even with no `@` at all ("1kΩ 100MHz").
+/// Otherwise the same part normalizes two ways depending only on how it was
+/// punctuated, which is the grouping that `at_frequency` exists to make
+/// reliable.
+///
+/// Takes the value already split on whitespace, since the caller needs the
+/// tokens too. `None` is the [`attach_mark`] verdict: one value quoted at two
+/// different frequencies is a spec table, not a rating.
+fn bead_tokens(tokens: &[(String, bool)]) -> Option<Vec<BeadToken>> {
+    let mut out: Vec<BeadToken> = Vec::new();
+    let mut i = 0;
+    // The index of a value a "DCR" label before it struck as DC.
+    let mut strike_next: Option<usize> = None;
+
+    while i < tokens.len() {
+        let index = i;
+        let (tok, glued) = (tokens[i].0.as_str(), tokens[i].1);
+        i += 1;
+
+        if tok == "@" {
+            let Some((mark, _)) = tokens.get(i) else { continue };
+            i += 1;
+            let mut mark = mark.clone();
+            // "@ 100 MHz": the unit spilled into the token after the number.
+            let bare_number = is_bare_number(&mark);
+            if let Some((unit, _)) = tokens.get(i).filter(|(t, _)| bare_number && is_frequency_unit(t)) {
+                mark.push_str(trim_frequency(unit));
+                i += 1;
+            }
+            let binding = if glued { Binding::Glued { at: index } } else { Binding::Spaced };
+            attach_mark(&mut out, Mark::read(&mark), binding)?;
+            continue;
+        }
+
+        // A frequency literal standing on its own ("100MHz") marks what came
+        // before it, the same as an "@" would. A bare "0Hz" is dropped: the
+        // ohm-marked binding would walk past an out-of-band DCR and strike
+        // out the impedance before it.
+        if let Some(hz) = frequency_literal(tok) {
+            if hz != 0.0 {
+                attach_mark(&mut out, Mark::from_hz(hz), Binding::OhmMarked)?;
+            }
+            continue;
+        }
+
+        // A "DCR" label next to an ohm value says that value is the DC
+        // resistance, the same as an "@DC" stuck to it: it is no impedance
+        // candidate, and a frequency steps over it. The label binds to the
+        // ohm value beside it, before ("1.2Ω DCR 1kΩ") or after ("600R DCR
+        // 0.3R"). With one on each side, the smaller is the DCR: a bead's
+        // DC resistance is far below its impedance. Only the bare word
+        // labels: "DCR=0.3Ω" or "DCR/2A" carries its own value, and a lone
+        // "DC" ("600Ω DC") is not a resistance label.
+        if tok.eq_ignore_ascii_case("dcr") {
+            let before = out
+                .last()
+                .filter(|prev| prev.index + 1 == index)
+                .and_then(|prev| parse_value_token(&prev.base, 'R'));
+            let after = tokens.get(index + 1).and_then(|(next, _)| parse_value_token(next, 'R'));
+            match (before, after) {
+                (Some(b), Some(a)) if a < b => strike_next = Some(index + 1),
+                (Some(_), _) => out.last_mut().expect("before is Some").dc = true,
+                (None, Some(_)) => strike_next = Some(index + 1),
+                (None, None) => {}
+            }
+        }
+
+        let dc = strike_next == Some(index);
+        out.push(BeadToken { base: tok.to_string(), freq: None, dc, index });
+    }
+    Some(out)
+}
+
+/// Apply a mark to the most recent token it can bind to — the `@` is talking
+/// about the number before it, and "600 ohm @ 100 MHz" has a word in
+/// between. A mark with no value before it at all ("100 MHz 600R") has
+/// nothing to say and is dropped.
+///
+/// `None` means the string quotes one value at two different frequencies,
+/// which makes it a spec table rather than a rating: the same verdict
+/// [`normalize_bead_value`] reaches for two disagreeing impedances, and for
+/// the same reason — taking one by position would make the same part read
+/// differently depending on the order someone wrote it in. It also means a
+/// frequency landed on a bare number while a value with an ohm unit stands
+/// before it ("1kΩ 1206 @100MHz"): either could be the impedance.
+fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option<()> {
+    // A mark that is neither a frequency nor DC ("@25C") says nothing about
+    // the value, wherever it would land.
+    if matches!(mark, Mark::Other) {
+        return Some(());
+    }
+    // Where a mark lands when nothing is stuck to it. A DC mark is about the
+    // nearest quantity, whatever its unit: "1.2Ω 2kΩ 200mA @DC" is about the
+    // 200mA. A frequency is about the nearest value that could be the
+    // impedance, stepping over a current ("1kΩ 1.5A @100MHz"), a DCR under
+    // the band ("1kΩ 120mΩ 2A @100MHz"), and a value marked or labelled DC
+    // ("1kΩ 1.2Ω DCR @100MHz"): each rates the 1kΩ. A leading-zero package
+    // code ("0603") is no candidate, so it is stepped over too. Any other
+    // bare number is in band, so it is not stepped over ("1kΩ 1206
+    // @100MHz" lands on the 1206) — unless the mark already stepped over a
+    // quantity to reach it and an ohm-marked value stands before it:
+    // "220Ω 1206 2A 50mΩ @100MHz" rates the 220Ω, since the mark plainly
+    // skipped the ratings written after the impedance. Only digits count
+    // as a bare number: the 2.2k of "1kΩ 2.2k 1.5A @100MHz" could be the
+    // impedance.
+    let nearest = |out: &[BeadToken]| match mark {
+        Mark::Dc => out.iter().rposition(|tok| is_quantity(&tok.base)),
+        Mark::Other => None,
+        Mark::Frequency(_) => {
+            let mut stepped = false;
+            (0..out.len()).rev().find(|&i| {
+                let tok = &out[i];
+                if bead_ohms(&tok.base).is_none() || tok.dc {
+                    stepped |= is_quantity(&tok.base);
+                    return false;
+                }
+                // A value struck as DC is no impedance, so it does not count.
+                let bare_after_ohms = is_bare_number(&tok.base)
+                    && out[..i]
+                        .iter()
+                        .any(|t| !t.dc && is_ohm_marked_token(&t.base) && bead_ohms(&t.base).is_some());
+                !(stepped && bare_after_ohms)
+            })
+        }
+    };
+    // What a mark glued to a token is about without looking further: for
+    // "@DC", any quantity; for a frequency, an in-band ohm value, as
+    // `nearest` uses. A glued frequency on an out-of-band DCR then steps
+    // over it as a spaced one does.
+    let describes = |tok: &BeadToken| match mark {
+        Mark::Dc => is_quantity(&tok.base),
+        Mark::Other => false,
+        Mark::Frequency(_) => bead_ohms(&tok.base).is_some(),
+    };
+    // A frequency after a current ("2A@1MHz", "2A @1MHz") rates the ohms
+    // before it, unless they already carry a frequency: then it is the
+    // current's own rating point ("600Ω@100MHz 2A@1MHz"), not a second
+    // impedance. Glued or spaced, the reading is the same.
+    let past_quantity = |out: &[BeadToken]| nearest(out).filter(|&p| out[p].freq.is_none());
+    let spaced = |out: &[BeadToken]| match out.last() {
+        Some(tok) if !describes(tok) && is_quantity(&tok.base) => past_quantity(out),
+        _ => nearest(out),
+    };
+    // A frequency that has to look for its value, with two in-band ohm
+    // values before it ("1kΩ 1.5Ω @100MHz"): the nearest is the DCR as often
+    // as the impedance, so `null`, as for a bare frequency below. A mark
+    // glued straight onto one of them says which it is.
+    let two_ohms = matches!(mark, Mark::Frequency(_))
+        && out
+            .iter()
+            .filter(|tok| !tok.dc && bead_ohms(&tok.base).is_some() && is_ohm_marked_token(&tok.base))
+            .count()
+            > 1;
+    let pos = match binding {
+        // Stuck to "200mA", an "@DC" is about the 200mA, so it cannot reach
+        // back and strike out the 2kΩ of "1.2Ω 2kΩ 200mA@DC". Stuck to
+        // something it cannot describe — a word ("1.2Ω DCR@DC", "1kΩ 2A
+        // typ@100MHz"), a tolerance ("600Ω ±25%@100MHz"), or, for a
+        // frequency, a current ("1kΩ 1.5A@100MHz") — it binds as a spaced
+        // one does, so the spacing alone does not change the reading.
+        // A unit split off its number ("1 kΩ@100MHz") is already joined back
+        // on by [`bead_split`].
+        Binding::Glued { at } => match out.last() {
+            Some(tok) if tok.index + 1 == at && describes(tok) => Some(out.len() - 1),
+            Some(tok) if tok.index + 1 == at => {
+                if two_ohms {
+                    return None;
+                }
+                spaced(out)
+            }
+            _ => None,
+        },
+        Binding::Spaced => {
+            if two_ohms {
+                return None;
+            }
+            spaced(out)
+        }
+        // Steps over a value struck as DC, as `nearest` does, so "1kΩ 1.2Ω
+        // DCR 100MHz" reads like "1kΩ 1.2Ω DCR @100MHz". With two in-band
+        // values before it ("1kΩ 1.5Ω 100MHz", "1.2Ω 600 100MHz"), marked
+        // or bare, adjacency is all there is to choose by, and it points at
+        // the DCR as often as not: `null`.
+        Binding::OhmMarked => {
+            let in_band = |tok: &BeadToken| !tok.dc && bead_ohms(&tok.base).is_some();
+            let ohms = |tok: &BeadToken| in_band(tok) && is_ohm_marked_token(&tok.base);
+            if out.iter().filter(|tok| in_band(tok)).count() > 1 {
+                return None;
+            }
+            out.iter().rposition(ohms)
+        }
+    };
+    let Some(pos) = pos else { return Some(()) };
+    match mark {
+        // A frequency on a value that is no plausible impedance says nothing
+        // about the bead: that value is not a candidate to begin with.
+        Mark::Frequency(_) if bead_ohms(&out[pos].base).is_none() => {}
+        // A bare number took the frequency, but an in-band value that says
+        // it is ohms comes first: a package code or MPN fragment may have
+        // caught the mark. Do not guess which is the impedance. The same
+        // after a value struck as DC: "1.2Ω DCR 600 @100MHz" and "1.2Ω DCR
+        // 1206 @100MHz" look alike, and one is a package code.
+        Mark::Frequency(_)
+            if !is_ohm_marked_token(&out[pos].base)
+                && out[..pos]
+                    .iter()
+                    .any(|tok| tok.dc || (is_ohm_marked_token(&tok.base) && bead_ohms(&tok.base).is_some())) =>
+        {
+            return None
+        }
+        Mark::Frequency(freq) => match &out[pos].freq {
+            Some(quoted) if quoted != &freq => return None,
+            _ => out[pos].freq = Some(freq),
+        },
+        // "120mΩ@DC" is a DC resistance saying so. It is not an impedance
+        // rating at any frequency, so it is not a candidate for the bead's
+        // value at all — not even a rival that makes the string ambiguous.
+        // Any ohm value counts, in band or not ("120mΩ@DC").
+        Mark::Dc if parse_value_token(&out[pos].base, 'R').is_some() => out[pos].dc = true,
+        Mark::Dc | Mark::Other => {}
+    }
+    Some(())
+}
+
+/// True if an `@` mark says the value was measured at DC: "DC", "DCR", or
+/// either with a separated tail ("DC/2A", like "100MHz/1.5A").
+fn is_dc_mark(mark: &str) -> bool {
+    let split = mark.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(mark.len());
+    let (word, tail) = mark.split_at(split);
+    matches!(word.to_ascii_lowercase().as_str(), "dc" | "dcr")
+        && !tail.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Read the frequency out of an `@` mark, in hertz: "100MHZ", "100mhz",
+/// "100M", "0.1GHz" and "100MHz/1.5A" all give 1e8. [`Mark::from_hz`] spells
+/// it one way, since two spellings of one point have to give one
+/// `at_frequency`, or the grouping it exists for splits a part in two.
+///
+/// A lowercase "m" here is mega, not milli: nothing is rated in millihertz,
+/// and reading it that way would invent a part rather than lose one.
+///
+/// `None` means the mark is not a frequency at all: "@DC", "@25C", or a bare
+/// "@100" with neither unit nor prefix to say what it measures.
+fn frequency_hz(mark: &str) -> Option<f64> {
+    let number: String = mark.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let value: f64 = number.parse().ok()?;
+    let rest = &mark[number.len()..];
+    let (multiplier, prefixed, rest) = match rest.chars().next().map(|c| c.to_ascii_lowercase()) {
+        Some('k') => (1e3, true, &rest[1..]),
+        Some('m') => (1e6, true, &rest[1..]),
+        Some('g') => (1e9, true, &rest[1..]),
+        _ => (1.0, false, rest),
+    };
+    let (hertz, tail) = match rest.get(..2) {
+        Some(unit) if unit.eq_ignore_ascii_case("hz") => (true, &rest[2..]),
+        _ => (false, rest),
+    };
+    // With neither unit nor prefix there is nothing saying this is a
+    // frequency; with either, whatever follows has to be separated from it
+    // ("100MHz/1.5A") rather than part of it ("25C", "120mΩ").
+    if (!hertz && !prefixed) || tail.starts_with(char::is_alphanumeric) {
+        return None;
+    }
+    Some(value * multiplier)
+}
+
+/// The frequency a bare token spells out, if it is one — "100MHz", "1GHz".
+/// The hertz has to be there: "100M" standing beside a value is a magnitude,
+/// not a frequency.
+fn frequency_literal(tok: &str) -> Option<f64> {
+    let tok = trim_frequency(tok);
+    strip_hertz(tok)?;
+    frequency_hz(tok)
+}
+
+/// `tok` without a trailing "Hz" in any case, or `None` if it has none.
+fn strip_hertz(tok: &str) -> Option<&str> {
+    let split = tok.len().checked_sub(2)?;
+    tok.get(split..)
+        .filter(|unit| unit.eq_ignore_ascii_case("hz"))
+        .map(|_| &tok[..split])
+}
+
+/// Strip the punctuation a value string wraps a frequency in: the comma in
+/// "1kΩ@100MHz, 0.5A" is not part of "100MHz". A decimal point in front of
+/// a digit is kept: ".1GHz" is 100MHz, not 1GHz.
+fn trim_frequency(tok: &str) -> &str {
+    let tok = tok.trim_end_matches(|c: char| !c.is_alphanumeric());
+    let trimmed = tok.trim_start_matches(|c: char| !c.is_alphanumeric());
+    let cut = tok.len() - trimmed.len();
+    if tok[..cut].ends_with('.') && trimmed.starts_with(|c: char| c.is_ascii_digit()) {
+        &tok[cut - 1..]
+    } else {
+        trimmed
+    }
+}
+
+/// True if `tok` is the unit of a frequency someone wrote as two tokens: the
+/// "MHz" of "@ 100 MHz", or a lone prefix ("@ 100 M"), which reads the same
+/// way it does glued on ("@100M"). Read by [`frequency_hz`] itself, so the
+/// two cannot disagree on which prefixes exist.
+fn is_frequency_unit(tok: &str) -> bool {
+    frequency_hz(&format!("1{}", trim_frequency(tok))).is_some()
+}
+
+/// True if `tok` is a parseable ohm value that *says* it is ohms — "120mΩ",
+/// "600R", "120ohm" — as opposed to a bare number. That distinction is what
+/// lets a lone value be read where it stands: "600R" carries its own unit, so
+/// it is the value even when it is not the first token, while a bare "100"
+/// may still be waiting for the "k" in the token after it.
+fn is_ohm_marked_token(tok: &str) -> bool {
+    let stripped = strip_long_unit_word(tok, 'R');
+    let marked = stripped.len() != tok.len() || stripped.chars().any(|c| is_unit_char(c, 'R'));
+    marked && parse_value_token(tok, 'R').is_some()
 }
 
 impl Component {
@@ -3474,6 +4170,485 @@ mod value_norm_tests {
     }
 
     #[test]
+    fn a_bead_reads_its_impedance_not_its_dc_resistance() {
+        // Issue #20. The compound form real boards use: current rating, DC
+        // resistance, impedance@frequency. The first parseable token is the
+        // 120mΩ DCR — reporting that would be a confident wrong answer.
+        let v = normalize_value("1.5A 120mΩ 1kΩ@100MHz", "FB").expect("should parse");
+        assert_eq!(v.canonical, "1kΩ@100MHz");
+        assert_eq!(v.unit, "Ω");
+        assert_eq!(v.at_frequency.as_deref(), Some("100MHz"));
+        assert!((v.magnitude - 1000.0).abs() < 1e-9);
+
+        let v = normalize_value("450mA 290mΩ 220Ω@100MHz", "FB").expect("should parse");
+        assert_eq!(v.canonical, "220Ω@100MHz");
+        assert!((v.magnitude - 220.0).abs() < 1e-9);
+
+        // The same rule with the current rating left off, and on its own —
+        // the bare "@freq" suffix used to defeat the parser entirely.
+        for raw in ["120mΩ 1kΩ@100MHz", "1kΩ@100MHz"] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "1kΩ@100MHz", "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_single_valued_bead_reads_like_a_resistor() {
+        for (raw, canonical) in [("600R", "600Ω"), ("1kΩ", "1kΩ"), ("120 ohm", "120Ω")] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, canonical, "{raw}");
+            assert_eq!(v.at_frequency, None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn an_unmarked_pair_of_ohm_values_stays_null() {
+        // Two values that could each be the impedance and nothing to tell
+        // them apart. Null is the honest answer here; picking either one is a
+        // coin flip that reads downstream as fact. 1.5Ω is the high end of a
+        // small-signal bead's DCR, so the band cannot rule it out.
+        assert!(normalize_value("1.5Ω 1kΩ", "FB").is_none());
+        // Two bare in-band numbers, one of which is the "500" of a split
+        // current rating. Nothing marks either as the ohms.
+        assert!(normalize_value("500 mA 100 k", "FB").is_none());
+    }
+
+    #[test]
+    fn a_value_behind_a_rating_reads_from_its_own_token() {
+        // The resistor reading takes the FIRST token for the value, which
+        // here is a rating it cannot parse at all — so a bead whose only
+        // in-band ohm value sits further along used to come back null. With
+        // the DCR out of the candidate pool by band, that value is alone and
+        // unambiguous, exactly as it is in the ohm-marked "2A 600R".
+        for (raw, canonical) in
+            [("1.5A 120mΩ 1k", "1kΩ"), ("2A 1k", "1kΩ"), ("0.5A 100", "100Ω")]
+        {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, canonical, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_lone_sub_ohm_value_is_a_dc_resistance_not_a_bead() {
+        // The impedance is left to the MPN and only the rating and the DCR
+        // are written out. With no second ohm value there is nothing to trip
+        // the ambiguity rule, so only the plausibility band stands between
+        // this and reporting a 0.12Ω "bead" (issue #20).
+        assert!(normalize_value("1.5A 120mΩ", "FB").is_none());
+        assert!(normalize_value("120mΩ", "FB").is_none());
+        // ...and once out of the way, a DCR no longer makes its own string
+        // ambiguous: 120mΩ is not a candidate, so the 1kΩ stands alone.
+        let v = normalize_value("120mΩ 1kΩ", "FB").expect("should parse");
+        assert_eq!(v.canonical, "1kΩ");
+    }
+
+    #[test]
+    fn a_bare_number_out_of_band_is_a_part_number() {
+        // Bead value fields commonly hold the MPN, and a numeric one parses
+        // as a perfectly good ohm value: 742792625 is a Würth WE-CBF part,
+        // not a 742.793MΩ part. Only the band catches it.
+        assert!(normalize_value("742792625", "FB").is_none());
+        assert!(normalize_value("BLM18PG121SN1D", "FB").is_none());
+    }
+
+    #[test]
+    fn a_bead_ignores_ratings_that_are_not_ohms() {
+        // Only values that could plausibly be the impedance count towards
+        // the ambiguity test — in-band, and not marked as measured at DC —
+        // or every compound string would look like it held two impedances.
+        // Bare in-band numbers do count: see the "500 mA 100 k" case above.
+        let v = normalize_value("1.5A 1kΩ@100MHz 25V", "FB").expect("should parse");
+        assert_eq!(v.canonical, "1kΩ@100MHz");
+        // ...and with no marked token at all, the resistor reading still
+        // applies to the one value present.
+        let v = normalize_value("2A 600R", "FB").expect("should parse");
+        assert_eq!(v.canonical, "600Ω");
+    }
+
+    #[test]
+    fn two_disagreeing_impedance_points_stay_null() {
+        // A spec table pasted into the value field, not a rating. Taking one
+        // by position would make the same part read differently depending on
+        // the order it was written in — the opposite of what at_frequency is
+        // for.
+        assert!(normalize_value("600Ω@10MHz 1kΩ@100MHz", "FB").is_none());
+        assert!(normalize_value("1kΩ@100MHz 600Ω@10MHz", "FB").is_none());
+        // A DCR quoted at DC is not a second opinion about the impedance.
+        // Under the band it never becomes a candidate at all; inside it —
+        // 1.5Ω is a real small-signal DCR — the "@DC" is what rules it out,
+        // and saying so must not cost the reading.
+        for raw in ["1kΩ@100MHz 120mΩ@DC", "1kΩ@100MHz 1.5Ω@DC", "1.5Ω@DC 1kΩ@100MHz"] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "1kΩ@100MHz", "{raw}");
+        }
+        // On its own it is a DC resistance and nothing else.
+        assert!(normalize_value("1.5Ω@DC", "FB").is_none());
+        // Two points that agree on the ohms but not on where they were
+        // measured are still a table: at_frequency is part of the identity,
+        // so taking one by position splits the part in two.
+        assert!(normalize_value("1kΩ@100MHz 1kΩ@1GHz", "FB").is_none());
+        assert!(normalize_value("1kΩ@1GHz 1kΩ@100MHz", "FB").is_none());
+        // The same figure quoted twice is not a disagreement.
+        let v = normalize_value("1kΩ@100MHz 1kΩ@100MHz", "FB").expect("should parse");
+        assert_eq!(v.canonical, "1kΩ@100MHz");
+    }
+
+    #[test]
+    fn an_at_mark_binds_to_the_quantity_it_follows() {
+        // A mark on a current rating is about the current rating. Walking
+        // back past it to an ohm value struck out the impedance and read the
+        // DCR, or took the rating's frequency as a second impedance point.
+        let v = normalize_value("1.2Ω 2kΩ 200mA@DC", "FB");
+        assert!(v.is_none(), "{v:?}");
+        for raw in ["600Ω@100MHz 1.5A@DC", "600Ω@100MHz 2A@1MHz", "600Ω@100MHz 2A @1MHz"] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "600Ω@100MHz", "{raw}");
+        }
+    }
+
+    #[test]
+    fn review_27_round_8_decisions() {
+        for (raw, want) in [
+            // A frequency that stepped over ratings also steps over a bare
+            // package code behind an ohm-marked value...
+            ("220Ω 0402 2A 50mΩ @100MHz", Some("220Ω@100MHz")),
+            // ...but not one it reached without stepping over anything.
+            ("1kΩ 1206 @100MHz", None),
+            ("220Ω 1206 2A 50mΩ @100MHz", Some("220Ω@100MHz")),
+            // "NA" and "PA" are words, not nanoamps and picoamps.
+            ("600 NA", Some("600Ω")),
+            ("600 PA", Some("600Ω")),
+            ("1k 500 nA", Some("1kΩ")),
+            // A and V take an rms, dc or ac suffix, any case.
+            ("1k 25 Vrms", Some("1kΩ")),
+            ("1k 500 mAdc", Some("1kΩ")),
+            ("1k 2 Arms", Some("1kΩ")),
+            ("1k 25 vac", Some("1kΩ")),
+            // "DCR" labels the value before it as DC, wherever the frequency is.
+            ("1.2Ω DCR 1kΩ", Some("1kΩ")),
+            ("1kΩ 1.2Ω DCR @100MHz", Some("1kΩ@100MHz")),
+            ("1kΩ@100MHz 1.2Ω DCR", Some("1kΩ@100MHz")),
+            // A bare frequency steps over a labelled DCR as an "@" one does.
+            ("1kΩ 1.2Ω DCR 100MHz", Some("1kΩ@100MHz")),
+            ("1kΩ 1.2Ω DCR 2A 100MHz", Some("1kΩ@100MHz")),
+            // Only the bare word labels. A label with its own value, or a
+            // lone "DC", leaves the value before it alone.
+            ("1kΩ DCR=0.3Ω", Some("1kΩ")),
+            ("600Ω DCR:0.3Ω", Some("600Ω")),
+            ("1kΩ DCR/2A", Some("1kΩ")),
+            ("600Ω DC", Some("600Ω")),
+            ("600 DC 2A", Some("600Ω")),
+            // A struck DCR is no ohm value for a package code to stand behind.
+            ("1.2Ω DCR 0603 2A @100MHz", None),
+            ("1.2Ω@DC 0603 1A @100MHz", None),
+            // Round 9 decisions. A leading-zero bare number is a package
+            // code, never a candidate.
+            ("1kΩ 0603 @100MHz", Some("1kΩ@100MHz")),
+            ("600 0603 @100MHz", Some("600Ω@100MHz")),
+            ("0603 12kΩ@100MHz", None),
+            ("0.3Ω DCR 0603 2A @100MHz", None),
+            ("0603 2A", None),
+            // Once a value is struck as DC, a bare survivor does not win.
+            ("1.2Ω DCR 0603", None),
+            ("1.2Ω@DC 0603", None),
+            ("1.2Ω DCR 600", None),
+            ("1.2Ω DCR 1kΩ", Some("1kΩ")),
+            // ...nor one a frequency names (corpus rows 160-162, 169).
+            ("1.2Ω DCR 600 @100MHz", None),
+            ("1.2Ω DCR 600@100MHz", None),
+            // A DCR label binds to the ohm value beside it, and with one on
+            // each side, to the smaller.
+            ("600R DCR 0.3R", Some("600Ω")),
+            ("600Ω DCR 0.3Ω", Some("600Ω")),
+            ("600 ohm DCR 0.3 ohm", Some("600Ω")),
+            ("600R DCR 300mR", Some("600Ω")),
+            ("1kΩ DCR 1.2Ω", Some("1kΩ")),
+            ("1kΩ DCR 1.2Ω @100MHz", Some("1kΩ@100MHz")),
+            // With nothing after it, the label is about the value before.
+            ("600 ohm DCR @100MHz", None),
+        ] {
+            let got = normalize_value(raw, "FB").map(|v| v.canonical);
+            assert_eq!(got.as_deref(), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn dc_reads_as_dc_however_it_is_written() {
+        for raw in ["1.5Ω@DC,", "1.5Ω@(DC)", "1.5Ω@DC, 2A", "1.5Ω@DC/2A", "1.5Ω@0Hz", "0.5 kΩ@DC"] {
+            let v = normalize_value(raw, "FB");
+            assert!(v.is_none(), "{raw}: {v:?}");
+        }
+        // A bare "0Hz" has no "@" to say what it means, so it strikes
+        // nothing, least of all the impedance two tokens back.
+        for raw in ["1kΩ@100MHz 1.5Ω@0Hz", "1kΩ@100MHz 120mΩ 0Hz"] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "1kΩ@100MHz", "{raw}");
+        }
+    }
+
+    #[test]
+    fn an_at_reads_past_a_tolerance_and_a_split_unit() {
+        // A tolerance is no value, and a unit split off its number belongs
+        // to it: "1 kΩ@100MHz" is 1kΩ, not 1Ω.
+        for (raw, want) in [
+            ("600Ω ±25% @100MHz", "600Ω@100MHz"),
+            ("220Ω (±25%) @ 100MHz", "220Ω@100MHz"),
+            ("1 kΩ@100MHz", "1kΩ@100MHz"),
+            ("2.2 k @ 100MHz", "2.2kΩ@100MHz"),
+        ] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn only_a_unit_word_joins_a_bare_number() {
+        for (raw, want) in [
+            ("600 Ferrite Bead", Some("600Ω")),
+            ("600 bead", Some("600Ω")),
+            ("120 FB", Some("120Ω")),
+            ("600 Z @100MHz", Some("600Ω@100MHz")),
+            ("600 typ @100MHz", Some("600Ω@100MHz")),
+            // Not "600to" and a lone 1k: two rivals, no unit on either.
+            ("600 to 1k", None),
+            // A current or voltage still joins, so it is not a candidate.
+            ("500 mA 1kΩ", Some("1kΩ")),
+            ("1kΩ 25 V", Some("1kΩ")),
+        ] {
+            let got = normalize_value(raw, "FB").map(|v| v.canonical);
+            assert_eq!(got.as_deref(), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_frequency_steps_over_a_current_to_the_ohms() {
+        for (raw, want) in [
+            ("1kΩ 1.5A @100MHz", Some("1kΩ@100MHz")),
+            ("220Ω 0.5A max @ 100MHz", Some("220Ω@100MHz")),
+            ("1kΩ 1.5A ±25% @100MHz", Some("1kΩ@100MHz")),
+            ("1kΩ (0603) @100MHz", Some("1kΩ@100MHz")),
+            ("1kΩ 1.5A, @100MHz", Some("1kΩ@100MHz")),
+            // Two in-band ohm values before the mark: `null` (corpus row 82).
+            ("1.2Ω 600Ω 2A @100MHz", None),
+            ("1kΩ 2A typ@100MHz", Some("1kΩ@100MHz")),
+        ] {
+            let got = normalize_value(raw, "FB").map(|v| v.canonical);
+            assert_eq!(got.as_deref(), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_rating_word_joins_in_any_case_and_spelling() {
+        for (raw, want) in [
+            ("1k 2 Amps", Some("1kΩ")),
+            ("1k 1.5 Amp", Some("1kΩ")),
+            ("1k 500 ma", Some("1kΩ")),
+            ("1k 2 a", Some("1kΩ")),
+            ("1k 25 v", Some("1kΩ")),
+            ("1k 25 VDC", Some("1kΩ")),
+            ("1k 25 Vdc", Some("1kΩ")),
+            ("1k 25 KV", Some("1kΩ")),
+            ("1k 120 milliohm", Some("1kΩ")),
+            ("600 1.5 Amp", Some("600Ω")),
+        ] {
+            let got = normalize_value(raw, "FB").map(|v| v.canonical);
+            assert_eq!(got.as_deref(), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_frequency_skips_what_cannot_be_the_impedance() {
+        for (raw, want) in [
+            // Glued or spaced, a current is stepped over.
+            ("1kΩ 1.5A@100MHz", Some("1kΩ@100MHz")),
+            // A DCR under the band, or one a "DCR" labels, is too.
+            ("1kΩ 120mΩ 2A @100MHz", Some("1kΩ@100MHz")),
+            ("1kΩ 1.2Ω DCR @100MHz", Some("1kΩ@100MHz")),
+            // A glued frequency on an ohm value stays on it.
+            ("1kΩ@100MHz", Some("1kΩ@100MHz")),
+            // A bare in-band number behind an ohm value: either could be
+            // the impedance, with or without a current in between.
+            ("1kΩ 2.2k @100MHz", None),
+            ("1kΩ 2.2k 1.5A @100MHz", None),
+        ] {
+            let got = normalize_value(raw, "FB").map(|v| v.canonical);
+            assert_eq!(got.as_deref(), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_split_unit_is_one_value_before_anything_binds() {
+        // Joined in the tokenizer, so a bare frequency and the candidate
+        // count see "1kΩ", not a "1" and a "kΩ".
+        for (raw, want) in [
+            ("1 k ohm@100MHz", Some("1kΩ@100MHz")),
+            ("1 kΩ 100MHz", Some("1kΩ@100MHz")),
+            // Two ohm values before a bare frequency: `null` (corpus row 83),
+            // but not the 1.2Ω, as an unjoined "1" and "kΩ" would give.
+            ("1.2Ω 1 kΩ 100MHz", None),
+            ("1.5Ω 1 kΩ", None),
+            ("600 ohm @ 100 MHz", Some("600Ω@100MHz")),
+            ("1k @ 100 M", Some("1kΩ@100MHz")),
+        ] {
+            let got = normalize_value(raw, "FB").map(|v| v.canonical);
+            assert_eq!(got.as_deref(), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn an_at_binds_to_the_nearest_quantity_glued_or_spaced() {
+        // Stuck to the 200mA or spaced off it, the "@DC" is about the
+        // current and says nothing about the 2kΩ.
+        for raw in ["1.2Ω 2kΩ 200mA@DC", "1.2Ω 2kΩ 200mA @DC", "1.2Ω 2kΩ 200mA @ DC"] {
+            let v = normalize_value(raw, "FB");
+            assert!(v.is_none(), "{raw}: 1.2Ω and 2kΩ stay ambiguous: {v:?}");
+        }
+        // Nor does a spaced "@DC" after a current reach the rated impedance.
+        for (raw, want) in [
+            ("1kΩ 1.5Ω @DC", "1kΩ"),
+            ("1kΩ@100MHz 1.5A @DC", "1kΩ@100MHz"),
+            ("1 kΩ 1.5A @DC", "1kΩ"),
+            // Glued to a tolerance, it binds as a spaced one does.
+            ("600Ω ±25%@100MHz", "600Ω@100MHz"),
+            ("1kΩ 1.2Ω DCR@DC", "1kΩ"),
+            // Glued to an out-of-band DCR, a frequency steps over it as a
+            // spaced one does.
+            ("1kΩ 120mΩ@100MHz", "1kΩ@100MHz"),
+            ("1kΩ 120mΩ @100MHz", "1kΩ@100MHz"),
+        ] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_frequency_on_a_bare_number_after_an_ohm_value_stays_null() {
+        // "1206" took the "@", but the 1kΩ before it says it is ohms: either
+        // could be the impedance, so do not guess. ("0603" is a package code
+        // and never a candidate, so "1kΩ 0603 @100MHz" is the 1kΩ.)
+        assert!(normalize_value("1kΩ 1206 @100MHz", "FB").is_none());
+        for (raw, want) in [("600@100MHz", "600Ω@100MHz"), ("0603 1kΩ@100MHz", "1kΩ@100MHz")] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn one_frequency_point_has_one_spelling() {
+        for raw in ["1kΩ@0.1GHz", "1kΩ@.1GHz", "1kΩ@100.0MHz", "1kΩ@100000kHz", "1k @ 100 M"] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "1kΩ@100MHz", "{raw}");
+            assert_eq!(v.at_frequency.as_deref(), Some("100MHz"), "{raw}");
+        }
+        let v = normalize_value("1kΩ@100MHz 1kΩ@0.1GHz", "FB").expect("should parse");
+        assert_eq!(v.canonical, "1kΩ@100MHz");
+    }
+
+    #[test]
+    fn a_frequency_reads_the_same_however_it_is_punctuated() {
+        // Same part, six spellings. Any of these normalizing differently
+        // would split one bead into several lines of a sweep, which is the
+        // whole reason at_frequency exists.
+        for raw in [
+            "1kΩ@100MHz",
+            "1kΩ @100MHz",
+            "1kΩ@ 100MHz",
+            "1kΩ @ 100MHz",
+            "1kΩ @ 100 MHz",
+            "1kΩ 100MHz",
+        ] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "1kΩ@100MHz", "{raw}");
+            assert_eq!(v.at_frequency.as_deref(), Some("100MHz"), "{raw}");
+        }
+        // The unit spelled out, and the "@" talking past it to the number.
+        let v = normalize_value("600 ohm @ 100 MHz", "FB").expect("should parse");
+        assert_eq!(v.canonical, "600Ω@100MHz");
+        assert_eq!(v.at_frequency.as_deref(), Some("100MHz"));
+    }
+
+    #[test]
+    fn a_bare_frequency_only_marks_a_value_that_says_it_is_ohms() {
+        // With no "@" to say what it belongs to, a frequency binds by
+        // adjacency, which is weak evidence — so it only marks a value that
+        // carries its own unit, and only one that could be an impedance at
+        // all. Otherwise a package code or a DC resistance standing between
+        // the value and the frequency would take the mark, and a marked
+        // token beats every other rule.
+        for raw in ["1kΩ 0603 100MHz", "1kΩ 120mΩ 100MHz", "1kΩ 100MHz 120mΩ"] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "1kΩ@100MHz", "{raw}");
+        }
+        // An "@" says which value it means, so it may mark a bare number.
+        let v = normalize_value("600@100MHz", "FB").expect("should parse");
+        assert_eq!(v.canonical, "600Ω@100MHz");
+        // A lone package code is no value, with or without a frequency.
+        assert!(normalize_value("0603 100MHz", "FB").is_none());
+        assert!(normalize_value("0603", "FB").is_none());
+    }
+
+    #[test]
+    fn one_value_quoted_at_two_frequencies_stays_null() {
+        // Two points for one value is a sweep, not a rating, and taking
+        // either one by position would make the reading depend on the order
+        // they were written in.
+        assert!(normalize_value("1kΩ 100MHz 200MHz", "FB").is_none());
+        assert!(normalize_value("1kΩ@100MHz 200MHz", "FB").is_none());
+        // The same point twice is not a disagreement, however it is spelled.
+        let v = normalize_value("1kΩ@100MHz 100Mhz", "FB").expect("should parse");
+        assert_eq!(v.canonical, "1kΩ@100MHz");
+    }
+
+    #[test]
+    fn a_frequency_reads_the_same_however_it_is_spelled() {
+        // One point, six spellings, one identity. A lowercase "m" is mega
+        // here: a bead rated in millihertz does not exist, and splitting the
+        // part in two is the cost of pretending the ambiguity matters.
+        for raw in [
+            "1kΩ@100MHz",
+            "1kΩ@100Mhz",
+            "1kΩ@100mhz",
+            "1kΩ@100MHZ",
+            "1kΩ@100M",
+            "1kΩ@100MHz/1.5A",
+        ] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "1kΩ@100MHz", "{raw}");
+            assert_eq!(v.at_frequency.as_deref(), Some("100MHz"), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_mark_that_is_not_a_frequency_does_not_become_one() {
+        // "@25C" is a temperature and "@x" is a typo; neither says the value
+        // is an impedance at a frequency, and neither says it is not. The
+        // value reads, without an at_frequency that would claim a rating
+        // point the string never gave.
+        for raw in ["1kΩ@25C", "1kΩ@x", "1kΩ@"] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "1kΩ", "{raw}");
+            assert!(v.at_frequency.is_none(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_frequency_drops_the_punctuation_around_it() {
+        // "100MHz," and "100MHz" are the same frequency; letting the comma
+        // through would make them different parts.
+        for raw in ["1kΩ@100MHz, 0.5A", "0.5A, 1kΩ@100MHz", "1kΩ@100MHz@x"] {
+            let v = normalize_value(raw, "FB").unwrap_or_else(|| panic!("{raw} should parse"));
+            assert_eq!(v.canonical, "1kΩ@100MHz", "{raw}");
+            assert_eq!(v.at_frequency.as_deref(), Some("100MHz"), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_bead_with_no_readable_value_stays_null() {
+        assert!(normalize_value("BLM18PG121SN1D", "FB").is_none());
+        assert!(normalize_value("FerriteBead", "FB").is_none());
+    }
+
+    #[test]
     fn presence_flag_absent_key_is_false() {
         let props: HashMap<String, Option<String>> = HashMap::new();
         assert!(!presence_flag(&props, "dnp"));
@@ -3506,6 +4681,28 @@ mod value_norm_tests {
         props.insert("dnp".to_string(), None);
         assert!(presence_flag(&props, "dnp"));
         assert!(!presence_flag(&props, "exclude_from_bom"));
+    }
+
+    /// Every bead value string quoted in the review of PR #27, pinned to its
+    /// agreed reading. A rule change that moves any of them fails here, before
+    /// a push, rather than in the next review round. See the file's header
+    /// for how a row may change.
+    #[test]
+    fn bead_corpus_reads_as_agreed() {
+        let corpus = include_str!("../tests/bead_corpus.tsv");
+        let mut wrong = Vec::new();
+        let mut rows = 0;
+        for line in corpus.lines().map(str::trim_end).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let (raw, want) = line.split_once('\t').unwrap_or_else(|| panic!("no tab in corpus row {line:?}"));
+            let want = (want != "null").then_some(want);
+            let got = normalize_value(raw, "FB").map(|v| v.canonical);
+            if got.as_deref() != want {
+                wrong.push(format!("{raw:?}: want {want:?}, got {got:?}"));
+            }
+            rows += 1;
+        }
+        assert!(rows > 0, "empty corpus");
+        assert!(wrong.is_empty(), "{} of {rows} corpus rows changed:\n{}", wrong.len(), wrong.join("\n"));
     }
 }
 

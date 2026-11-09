@@ -1,0 +1,199 @@
+# Ferrite bead value strings from the review of PR #27, with the agreed
+# reading of each: `normalize_value(input, "FB")` canonical, or `null`.
+# One row per line: input, a tab, expected. Lines starting with # are skipped.
+#
+# Changing a row's expected value is a decision, not a fix: say which
+# row and why in the commit message. A wrong value may only be fixed
+# toward `null`, never by adding a rule to recover a reading.
+600R	600Ω
+1kΩ	1kΩ
+1k	1kΩ
+2.2k	2.2kΩ
+120 ohm	120Ω
+120Ω	120Ω
+220Ω	220Ω
+500Ω	500Ω
+1000Ω	1kΩ
+600Ω	600Ω
+603Ω	603Ω
+120mΩ	null
+1.2Ω	1.2Ω
+1.5Ω	1.5Ω
+1	1Ω
+100	100Ω
+100 k	null
+0.5 k	500Ω
+1206	null
+2512	null
+0402	null
+0603	null
+0805	null
+1.5A	null
+450mA	null
+500mA	null
+500 mA	null
+200mA	null
+25V	null
+BLM18PG121SN1D	null
+600 bead	600Ω
+600 a bead	null
+600 Ferrite Bead	600Ω
+120 FB	120Ω
+600 to 1k	null
+600 1000	null
+120mΩ 1kΩ	1kΩ
+1.5Ω 1kΩ	null
+1.5Ω 1 kΩ	null
+10k, 1%	null
+1kΩ@100MHz	1kΩ@100MHz
+1 kΩ@100MHz	1kΩ@100MHz
+1 k ohm@100MHz	1kΩ@100MHz
+1kΩ@10MHz	1kΩ@10MHz
+1kΩ@200MHz	1kΩ@200MHz
+1kΩ@100M	1kΩ@100MHz
+1kΩ@.1GHz	1kΩ@100MHz
+1kΩ @100MHz	1kΩ@100MHz
+1kΩ @10MHz	1kΩ@10MHz
+1k @ 100 M	1kΩ@100MHz
+2.2 k @ 100MHz	2.2kΩ@100MHz
+600 ohm @ 100 MHz	600Ω@100MHz
+1Ω@100MHz	1Ω@100MHz
+1.2Ω@100MHz	1.2Ω@100MHz
+1.5Ω@100MHz	1.5Ω@100MHz
+2.2Ω@100MHz	2.2Ω@100MHz
+220Ω@100MHz	220Ω@100MHz
+600Ω@100MHz	600Ω@100MHz
+603Ω@100MHz	603Ω@100MHz
+1.206kΩ@100MHz	1.206kΩ@100MHz
+1kΩ, 100MHz	null
+100 MHz 600R	600Ω
+1.5A 120mΩ 1kΩ@100MHz	1kΩ@100MHz
+450mA 290mΩ 220Ω@100MHz	220Ω@100MHz
+1.5A 120mΩ 1k	1kΩ
+120mΩ 1kΩ@100MHz	1kΩ@100MHz
+2A 600R	600Ω
+2A 1k	1kΩ
+500 mA 600R	600Ω
+0.5A 100	100Ω
+500 mA 100 k	null
+600R 0603	600Ω
+1.5Ω 600@100MHz	null
+2A 1.2Ω 600@100MHz	null
+1.2Ω 600Ω 2A @100MHz	null
+1.2Ω 1 kΩ 100MHz	null
+1kΩ 1.5Ω 100MHz	null
+1kΩ 120mΩ 100MHz	1kΩ@100MHz
+1kΩ 120mΩ @100MHz	1kΩ@100MHz
+1kΩ 120mΩ@100MHz	1kΩ@100MHz
+1kΩ 120mΩ 2A @100MHz	1kΩ@100MHz
+1kΩ 1.5A @100MHz	1kΩ@100MHz
+1kΩ 1.5A@100MHz	1kΩ@100MHz
+1kΩ 2A @100MHz	1kΩ@100MHz
+1kΩ 2A typ@100MHz	1kΩ@100MHz
+600 typ @100MHz	600Ω@100MHz
+600 Z @100MHz	600Ω@100MHz
+220Ω 0.5A max @ 100MHz	220Ω@100MHz
+1kΩ 2.2k @100MHz	null
+1kΩ 2.2k 1.5A @100MHz	null
+1kΩ@100MHz 200MHz	null
+1kΩ@100MHz 120mΩ 1GHz	null
+1kΩ@100MHz 120mΩ 0Hz	1kΩ@100MHz
+1kΩ@100MHz 120mΩ@DC	1kΩ@100MHz
+1kΩ@100MHz 1.5A @DC	1kΩ@100MHz
+600Ω ±25% @100MHz	600Ω@100MHz
+600Ω ±25%@100MHz	600Ω@100MHz
+1.5Ω@DC	null
+1.5Ω@DC,	null
+1.5Ω@DC/2A	null
+0.5 kΩ@DC	null
+200mA@DC	null
+1.2Ω@DC 1kΩ	1kΩ
+1.2Ω 2kΩ 200mA @DC	null
+1.2Ω 2kΩ 200mA@DC	null
+1kΩ 1.2Ω 100mA @DC	null
+600Ω@100MHz 2A @1MHz	600Ω@100MHz
+600Ω@100MHz 2A@1MHz	600Ω@100MHz
+600Ω@100MHz 120mΩ @200MHz	600Ω@100MHz
+600Ω@100MHz 1.2Ω DCR @1GHz	null
+1k 2 a	1kΩ
+1k 2 Amps	1kΩ
+1k 1.5 Amp	1kΩ
+600 1.5 Amp	600Ω
+1k 500 ma	1kΩ
+1k 25 v	1kΩ
+1k 25 KV	1kΩ
+1k 25 VDC	1kΩ
+1k 25 Vrms	1kΩ
+1k 500 mAdc	1kΩ
+1k 120 milliohm	1kΩ
+1k 2 UA	null
+1k 2 Ua	null
+1k 5 UV	null
+1k 2 MA	1kΩ
+600 NA	600Ω
+600 PA	600Ω
+600 ADC	null
+1kΩ 0603 @100MHz	1kΩ@100MHz
+1kΩ 0603@100MHz	1kΩ@100MHz
+1kΩ (0603) @100MHz	1kΩ@100MHz
+1kΩ 0603 X7R @100MHz	1kΩ@100MHz
+1kΩ 0603 BLM18 @100MHz	1kΩ@100MHz
+1kΩ 1206 @100MHz	null
+0603 100MHz	null
+0603 12kΩ@100MHz	null
+0603 2A	null
+600 0603 @100MHz	600Ω@100MHz
+220Ω 0402 2A 50mΩ @100MHz	220Ω@100MHz
+220Ω 1206 2A 50mΩ @100MHz	220Ω@100MHz
+220Ω 0402 25V @100MHz	220Ω@100MHz
+220Ω 0402 ±25% @100MHz	220Ω@100MHz
+220 0402 2A 50mΩ @100MHz	220Ω@100MHz
+1.2Ω DCR 1kΩ	1kΩ
+1.2Ω dcr 1kΩ	1kΩ
+1kΩ DCR 1.2Ω	1kΩ
+1kΩ DCR 1.2Ω @100MHz	1kΩ@100MHz
+1kΩ 1.2Ω DCR @100MHz	1kΩ@100MHz
+1kΩ 1.2Ω DCR 100MHz	1kΩ@100MHz
+1kΩ 1.2Ω DCR 2A 100MHz	1kΩ@100MHz
+1kΩ@100MHz 1.2Ω DCR	1kΩ@100MHz
+1.2Ω DCR 600	null
+1.2Ω DCR 600 @100MHz	null
+1.2Ω DCR 600@100MHz	null
+1.2Ω@DC 600 @100MHz	null
+1.2Ω DCR 0603	null
+1.2Ω@DC 0603	null
+1.2Ω DCR 0603 2A @100MHz	null
+1.2Ω@DC 0603 1A @100MHz	null
+1.5Ω DCR 0805 1A @100MHz	null
+0.3Ω DCR 0603 2A @100MHz	null
+1.2Ω DCR 1206 @100MHz	null
+600R DCR 0.3R	600Ω
+600Ω DCR 0.3Ω	600Ω
+600 ohm DCR 0.3 ohm	600Ω
+600R DCR 300mR	600Ω
+600R DC-R 0.3R	600Ω
+600Ω DCR max 0.3Ω	null
+600 ohm DCR @100MHz	null
+1kΩ DCR=0.3Ω	1kΩ
+600Ω DCR:0.3Ω	600Ω
+600Ω DCR=0.15Ω @100MHz	600Ω@100MHz
+1kΩ DCR/2A	1kΩ
+1.2Ω DC/2A 1kΩ	null
+600Ω DC	600Ω
+600 DC 2A	600Ω
+1kΩ 1.5Ω 0603 @100MHz	null
+220Ω 1.5Ω 0603 @100MHz	null
+1.2Ω 0603 @100MHz	1.2Ω@100MHz
+2A 1.2Ω 0603 @100MHz	1.2Ω@100MHz
+1kΩ 1.5Ω 2A @100MHz	null
+1kΩ 1.5Ω @100MHz	null
+1kΩ 0603 1.5Ω @100MHz	null
+1kΩ 1.5Ω@100MHz	1.5Ω@100MHz
+1kΩ 1.5Ω 2A 100MHz	null
+1.2Ω 600 100MHz	null
+1.5Ω 600 100MHz	null
+600 1.5Ω 100MHz	null
+600Ω DCR 0805	null
+1kΩ DCR 0805	1kΩ
+DCR 600Ω 1Ω	1Ω
+600 DCR 0.3Ω @100MHz	600Ω@100MHz

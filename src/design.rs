@@ -3492,11 +3492,13 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
         Binding::Spaced => spaced(out),
         // Steps over a value struck as DC, as `nearest` does, so "1kΩ 1.2Ω
         // DCR 100MHz" reads like "1kΩ 1.2Ω DCR @100MHz". With two in-band
-        // ohm values before it ("1kΩ 1.5Ω 100MHz"), adjacency is all there
-        // is to choose by, and it points at the DCR as often as not: `null`.
+        // values before it ("1kΩ 1.5Ω 100MHz", "1.2Ω 600 100MHz"), marked
+        // or bare, adjacency is all there is to choose by, and it points at
+        // the DCR as often as not: `null`.
         Binding::OhmMarked => {
-            let ohms = |tok: &BeadToken| !tok.dc && bead_ohms(&tok.base).is_some() && is_ohm_marked_token(&tok.base);
-            if out.iter().filter(|tok| ohms(tok)).count() > 1 {
+            let in_band = |tok: &BeadToken| !tok.dc && bead_ohms(&tok.base).is_some();
+            let ohms = |tok: &BeadToken| in_band(tok) && is_ohm_marked_token(&tok.base);
+            if out.iter().filter(|tok| in_band(tok)).count() > 1 {
                 return None;
             }
             out.iter().rposition(ohms)
@@ -4460,7 +4462,7 @@ mod value_norm_tests {
         for (raw, want) in [
             ("1 k ohm@100MHz", Some("1kΩ@100MHz")),
             ("1 kΩ 100MHz", Some("1kΩ@100MHz")),
-            // Two ohm values before a bare frequency: `null` (corpus row 84),
+            // Two ohm values before a bare frequency: `null` (corpus row 83),
             // but not the 1.2Ω, as an unjoined "1" and "kΩ" would give.
             ("1.2Ω 1 kΩ 100MHz", None),
             ("1.5Ω 1 kΩ", None),
@@ -4669,7 +4671,7 @@ mod value_norm_tests {
         let corpus = include_str!("../tests/bead_corpus.tsv");
         let mut wrong = Vec::new();
         let mut rows = 0;
-        for line in corpus.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        for line in corpus.lines().map(str::trim_end).filter(|l| !l.is_empty() && !l.starts_with('#')) {
             let (raw, want) = line.split_once('\t').unwrap_or_else(|| panic!("no tab in corpus row {line:?}"));
             let want = (want != "null").then_some(want);
             let got = normalize_value(raw, "FB").map(|v| v.canonical);

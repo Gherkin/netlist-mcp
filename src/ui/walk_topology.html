@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Walk topology</title>
+<!--
+  MCP App view for the netlist server's draw_walk tool (issue #32).
+  Reads the walk JSON (with `topology`) from ui/notifications/tool-result and
+  draws it as an SVG schematic. Self-contained on purpose: the host's default
+  CSP blocks every external origin, and this page declares none.
+  Protocol: modelcontextprotocol/ext-apps specification/2026-01-26/apps.mdx.
+-->
+<style>
+  :root {
+    color-scheme: light dark;
+    --nl-bg: var(--color-background-primary, #ffffff);
+    --nl-fg: var(--color-text-primary, #1f2328);
+    --nl-muted: var(--color-text-secondary, #59636e);
+    --nl-faint: var(--color-text-tertiary, #8c959f);
+    --nl-accent: var(--color-text-info, #0969da);
+    --nl-warn: var(--color-text-warning, #9a6700);
+    --nl-box: var(--color-background-secondary, #f6f8fa);
+    --nl-font: var(--font-sans, system-ui, -apple-system, "Segoe UI", sans-serif);
+    --nl-mono: var(--font-mono, ui-monospace, "SFMono-Regular", Menlo, monospace);
+  }
+  :root[data-theme="dark"] {
+    --nl-bg: var(--color-background-primary, #0d1117);
+    --nl-fg: var(--color-text-primary, #e6edf3);
+    --nl-muted: var(--color-text-secondary, #9198a1);
+    --nl-faint: var(--color-text-tertiary, #6e7681);
+    --nl-accent: var(--color-text-info, #4493f8);
+    --nl-warn: var(--color-text-warning, #d29922);
+    --nl-box: var(--color-background-secondary, #161b22);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --nl-bg: var(--color-background-primary, #0d1117);
+      --nl-fg: var(--color-text-primary, #e6edf3);
+      --nl-muted: var(--color-text-secondary, #9198a1);
+      --nl-faint: var(--color-text-tertiary, #6e7681);
+      --nl-accent: var(--color-text-info, #4493f8);
+      --nl-warn: var(--color-text-warning, #d29922);
+      --nl-box: var(--color-background-secondary, #161b22);
+    }
+  }
+  html, body { margin: 0; padding: 0; }
+  /* Fixed layout width whether or not a scrollbar shows. Without it a fitted
+     drawing changes height when the scrollbar comes and goes, and the
+     reported size never settles. */
+  html { scrollbar-gutter: stable; }
+  [hidden] { display: none !important; }
+  body {
+    background: var(--nl-bg);
+    color: var(--nl-fg);
+    font-family: var(--nl-font);
+    font-size: 13px;
+  }
+  header {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px;
+    padding: 10px 12px 4px;
+  }
+  header h1 { font-size: 14px; font-weight: 600; margin: 0; }
+  header h1 code { font-family: var(--nl-mono); font-weight: 600; }
+  header .meta { color: var(--nl-muted); }
+  header button {
+    margin-left: auto; font: inherit; font-size: 12px; color: var(--nl-fg);
+    background: transparent; border: 1px solid var(--nl-faint); border-radius: 6px;
+    padding: 2px 8px; cursor: pointer;
+  }
+  .notes { padding: 0 12px; color: var(--nl-warn); }
+  .notes p { margin: 2px 0; }
+  #message { padding: 12px; color: var(--nl-muted); white-space: pre-wrap; }
+  #canvas { overflow-x: auto; padding: 4px 0 8px; }
+  #canvas.fit svg { max-width: 100%; height: auto; }
+  footer { padding: 0 12px 10px; color: var(--nl-faint); font-size: 11px; }
+
+  svg { display: block; }
+  /* Centered when narrower than the frame; auto margins are 0 when wider. */
+  #canvas svg { margin: 0 auto; }
+  svg text { fill: var(--nl-fg); font-family: var(--nl-font); font-size: 11px; }
+  svg .w { stroke: var(--nl-fg); stroke-width: 1.4; fill: none; }
+  svg .sym { stroke: var(--nl-fg); stroke-width: 1.6; fill: none; stroke-linejoin: round; }
+  svg .solid { fill: var(--nl-fg); stroke: none; }
+  svg .dot { fill: var(--nl-fg); }
+  svg .bus { stroke: var(--nl-fg); stroke-width: 2; }
+  svg .bus.cont { stroke-dasharray: 3 3; }
+  svg .box { fill: var(--nl-box); stroke: var(--nl-fg); stroke-width: 1.4; }
+  svg .ref { font-weight: 600; }
+  svg .val, svg .pnum, svg .note { fill: var(--nl-muted); }
+  svg .pnum { font-size: 9px; font-family: var(--nl-mono); }
+  svg .pname { font-size: 10px; font-family: var(--nl-mono); }
+  svg .netname { font-family: var(--nl-mono); font-weight: 600; }
+  /* A halo, so a supply name that crosses the next bus stays readable. */
+  svg .netname, svg .note { paint-order: stroke; stroke: var(--nl-bg); stroke-width: 3px; stroke-linejoin: round; }
+  svg .note { font-size: 10px; }
+  svg .start .busname, svg .start .ref, svg .startpin { fill: var(--nl-accent); }
+  svg .start .box { stroke: var(--nl-accent); stroke-width: 2; }
+  svg .dnp { opacity: 0.6; }
+  svg .dnp .sym, svg .dnp .w, svg .dnp .box { stroke-dasharray: 4 3; }
+  svg .dnp .solid { fill: none; stroke: var(--nl-fg); stroke-width: 1.4; stroke-dasharray: 4 3; }
+  svg .open { stroke-dasharray: 2 3; }
+</style>
+</head>
+<body>
+<header id="header" hidden>
+  <h1 id="title"></h1>
+  <span class="meta" id="counts"></span>
+  <button id="zoom" type="button">Actual size</button>
+</header>
+<div class="notes" id="notes"></div>
+<div id="message">Waiting for the walk result…</div>
+<div id="canvas" class="fit"></div>
+<footer id="footer" hidden>Dashed part = DNP (not fitted). Lines that cross without a dot are not connected.</footer>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// MCP Apps transport: JSON-RPC 2.0 over postMessage with the host.
+// ---------------------------------------------------------------------------
+const PROTOCOL_VERSION = "2026-01-26";
+let nextId = 1;
+const pending = new Map();
+
+function post(msg) { window.parent.postMessage(msg, "*"); }
+function request(method, params) {
+  const id = nextId++;
+  post({ jsonrpc: "2.0", id, method, params });
+  return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+}
+function notify(method, params) { post({ jsonrpc: "2.0", method, params }); }
+
+window.addEventListener("message", (ev) => {
+  if (ev.source !== window.parent) return;
+  const m = ev.data;
+  if (!m || m.jsonrpc !== "2.0") return;
+  if (m.method === undefined && m.id !== undefined) {
+    const p = pending.get(m.id);
+    if (p) { pending.delete(m.id); m.error ? p.reject(m.error) : p.resolve(m.result); }
+    return;
+  }
+  if (m.id !== undefined) {
+    // A request from the host. We hold no state, so teardown and ping just ack.
+    if (m.method === "ui/resource-teardown" || m.method === "ping") {
+      post({ jsonrpc: "2.0", id: m.id, result: {} });
+    } else {
+      post({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: "Method not found" } });
+    }
+    return;
+  }
+  switch (m.method) {
+    case "ui/notifications/tool-input": onToolInput(m.params); break;
+    case "ui/notifications/tool-result": onToolResult(m.params); break;
+    case "ui/notifications/tool-cancelled":
+      showMessage("The walk was cancelled" + (m.params && m.params.reason ? ": " + m.params.reason : "."));
+      break;
+    case "ui/notifications/host-context-changed": applyHostContext(m.params); break;
+  }
+});
+
+function applyHostContext(ctx) {
+  if (!ctx) return;
+  const root = document.documentElement;
+  if (ctx.theme === "light" || ctx.theme === "dark") root.setAttribute("data-theme", ctx.theme);
+  const vars = ctx.styles && ctx.styles.variables;
+  if (vars) for (const [k, v] of Object.entries(vars)) if (v) root.style.setProperty(k, v);
+  const fonts = ctx.styles && ctx.styles.css && ctx.styles.css.fonts;
+  if (fonts) {
+    let s = document.getElementById("host-fonts");
+    if (!s) {
+      s = document.createElement("style");
+      s.id = "host-fonts";
+      document.head.appendChild(s);
+    }
+    s.textContent = fonts;
+  }
+  // New fonts or font variables change text widths.
+  if (drawing) { fitDrawing(); reportSize(); }
+}
+
+let lastSize = "";
+function reportSize() {
+  // The content box, not scrollHeight: scrollHeight never drops below the
+  // frame, so a short result would keep a tall frame.
+  const size = {
+    width: Math.ceil(document.documentElement.scrollWidth),
+    height: Math.ceil(document.documentElement.getBoundingClientRect().height),
+  };
+  const key = size.width + "x" + size.height;
+  if (key === lastSize) return;
+  lastSize = key;
+  notify("ui/notifications/size-changed", size);
+}
+
+async function start() {
+  if (window.parent === window) {
+    showMessage("This page is an MCP App view. It is shown by an MCP host after a draw_walk call.");
+    return;
+  }
+  try {
+    const res = await request("ui/initialize", {
+      appInfo: { name: "netlist-walk-topology", version: "0.1.0" },
+      appCapabilities: { availableDisplayModes: ["inline"] },
+      protocolVersion: PROTOCOL_VERSION,
+    });
+    applyHostContext(res && res.hostContext);
+  } catch (e) {
+    // Keep going: a host that fails initialize may still send the result.
+  }
+  notify("ui/notifications/initialized", {});
+  if (typeof ResizeObserver === "function") {
+    let queued = false;
+    new ResizeObserver(() => {
+      if (queued) return;
+      queued = true;
+      requestAnimationFrame(() => { queued = false; fitDrawing(); reportSize(); });
+    }).observe(document.body);
+  }
+  reportSize();
+}
+
+// ---------------------------------------------------------------------------
+// Tool data
+// ---------------------------------------------------------------------------
+function onToolInput(params) {
+  const a = (params && params.arguments) || {};
+  if (a.start) showMessage("Walking from " + a.start + "…");
+}
+
+function onToolResult(res) {
+  if (!res) return;
+  let data = res.structuredContent;
+  if (!data) {
+    const block = (res.content || []).find((c) => c && c.type === "text");
+    const text = block ? block.text : "";
+    try { data = JSON.parse(text); } catch (e) {
+      showMessage(text || "The tool returned no result.");
+      return;
+    }
+  }
+  if (res.isError) { showMessage(JSON.stringify(data, null, 2)); return; }
+  if (!data || !data.topology) { showMessage("The result has no topology to draw."); return; }
+  render(data);
+}
+
+function showMessage(text) {
+  const m = document.getElementById("message");
+  m.textContent = text;
+  m.hidden = false;
+  reportSize();
+}
+
+// ---------------------------------------------------------------------------
+// Layout
+//
+// Every walked net that is not a rail is a vertical bus, placed left to right
+// in BFS order from the start net. Rails are not buses: each pin on a rail
+// ends in a ground or supply symbol. Between bus i and bus i+1 is "gap i";
+// gap -1 is a lane left of the first bus.
+//   - A two-terminal part between two buses is drawn horizontally in the gap
+//     left of its right-hand bus ("series").
+//   - A two-terminal part with one bus pin hangs down from that bus in the
+//     gap to its right ("shunt"); its other end is a rail symbol, a no-connect,
+//     or an open lead for a pin that is not on a walked net.
+//   - Every other part is a box with its pins on the side facing its buses.
+//     Boxes on the first bus only sit left of it; the rest sit right of their
+//     right-most bus.
+// Rows are reserved per gap, and a wire that runs across buses reserves its
+// row in every gap it crosses, so nothing overlaps. Wires crossing a bus
+// without a dot are not connected to it, as on a schematic.
+// ---------------------------------------------------------------------------
+const COLW = 210, ROW = 34, TOP = 74, BOXW = 112, PAD = 16;
+const TWO_TERMINAL = new Set(["R", "C", "L", "FB", "D"]);
+
+function layout(data) {
+  const topo = data.topology;
+  const nets = topo.nets || [];
+  const parts = topo.parts || [];
+  const netByName = new Map(nets.map((n) => [n.name, n]));
+  const startNet = data.start_net;
+  const isBus = (n) => n.state !== "rail" || n.name === startNet;
+
+  // Bus order: BFS over parts from the start net, then any left over.
+  const partsOnNet = new Map();
+  for (const p of parts) for (const pin of p.pins) {
+    if (pin.net == null) continue;
+    if (!partsOnNet.has(pin.net)) partsOnNet.set(pin.net, []);
+    partsOnNet.get(pin.net).push(p);
+  }
+  const order = [];
+  const seen = new Set();
+  const visit = (name) => {
+    const n = netByName.get(name);
+    if (!n || seen.has(name) || !isBus(n)) return;
+    seen.add(name);
+    order.push(name);
+  };
+  visit(startNet);
+  for (let i = 0; i < order.length; i++) {
+    for (const p of partsOnNet.get(order[i]) || []) for (const pin of p.pins) visit(pin.net);
+  }
+  for (const n of nets) visit(n.name);
+  const col = new Map(order.map((n, i) => [n, i]));
+
+  const endOf = (pin) => {
+    if (!pin) return { kind: "open", pin: null };
+    if (pin.net == null) return { kind: "nc", pin };
+    if (col.has(pin.net)) return { kind: "bus", col: col.get(pin.net), pin };
+    if (netByName.has(pin.net)) return { kind: "rail", net: pin.net, pin };
+    return { kind: "open", pin };
+  };
+
+  // Classify parts into placeable items.
+  const items = [];
+  const shuntsByGap = new Map();
+  parts.forEach((part, idx) => {
+    const ends = part.pins.map(endOf);
+    if (TWO_TERMINAL.has(part.class) && ends.length >= 1 && ends.length <= 2) {
+      let a = ends[0], b = ends[1] || { kind: "open", pin: null };
+      if (a.kind === "bus" && b.kind === "bus" && a.col === b.col) b = { kind: "open", pin: b.pin, same: true };
+      if (a.kind === "bus" && b.kind === "bus") {
+        const [l, r] = a.col < b.col ? [a, b] : [b, a];
+        items.push({ type: "series", part, idx, left: l, right: r, from: l.col, gap: r.col - 1, h: 1 });
+      } else {
+        const top = a.kind === "bus" ? a : b.kind === "bus" ? b : a;
+        const bot = top === a ? b : a;
+        const g = top.kind === "bus" ? top.col : 0;
+        if (!shuntsByGap.has(g)) shuntsByGap.set(g, []);
+        shuntsByGap.get(g).push({ part, idx, top, bot });
+      }
+      return;
+    }
+    if (part.class === "TP" && ends.length === 1 && ends[0].kind === "bus") {
+      items.push({ type: "tp", part, idx, end: ends[0], from: ends[0].col, gap: ends[0].col, h: 1 });
+      return;
+    }
+    const busEnds = ends.filter((e) => e.kind === "bus").sort((x, y) => x.col - y.col);
+    // Pins on the same rail share one row ("1,4,7 → GND"): connectors often
+    // have dozens of ground pins.
+    const otherEnds = [];
+    const byRail = new Map();
+    for (const e of ends) {
+      if (e.kind === "bus") continue;
+      if (e.kind !== "rail") { otherEnds.push(e); continue; }
+      if (!byRail.has(e.net)) {
+        const row = { ...e, pins: [] };
+        byRail.set(e.net, row);
+        otherEnds.push(row);
+      }
+      byRail.get(e.net).pins.push(e.pin);
+    }
+    const left = busEnds.length > 0 && busEnds.every((e) => e.col === 0);
+    const lo = busEnds.length ? busEnds[0].col : 0;
+    const hi = busEnds.length ? busEnds[busEnds.length - 1].col : 0;
+    const rows = Math.max(busEnds.length, otherEnds.length, 1);
+    // A rail name or "not walked" right of the box runs across the next
+    // bus, so keep those rows free in the next gap too.
+    const labelsRight = !left && otherEnds.some((e) => e.kind === "open" || (e.kind === "rail" && railHasLabel(e.net)));
+    items.push({
+      type: "box", part, idx, busEnds, otherEnds, mirror: left,
+      from: left ? -1 : lo, gap: left ? -1 : hi, to: labelsRight ? Math.min(hi + 1, order.length - 1) : undefined,
+      h: rows + 1,
+    });
+  });
+
+  // Shunts on the same bus share a horizontal wire, a few per bank.
+  const lastGap = order.length - 1;
+  for (const [g, list] of shuntsByGap) {
+    const per = g === lastGap ? 6 : 2;
+    for (let i = 0; i < list.length; i += per) {
+      const bank = list.slice(i, i + per);
+      items.push({ type: "bank", shunts: bank, idx: bank[0].idx, from: g, gap: g, h: 3, free: bank[0].top.kind !== "bus" });
+    }
+  }
+
+  // Start part first, then by where the item hangs, then netlist order.
+  const rank = (it) => (it.part && it.part.role === "start" ? 0 : 1);
+  items.sort((x, y) => rank(x) - rank(y) || x.gap - y.gap || x.from - y.from || x.idx - y.idx);
+
+  const cursor = new Map();
+  const cur = (g) => cursor.get(g) || 0;
+  for (const it of items) {
+    let r = 0;
+    const to = it.to ?? it.gap;
+    for (let g = it.from; g <= to; g++) r = Math.max(r, cur(g));
+    for (let g = it.from; g <= to; g++) cursor.set(g, r + it.h);
+    it.row = r;
+  }
+  const rowsUsed = Math.max(1, ...[...cursor.values()]);
+  const hasLeft = items.some((it) => it.gap === -1);
+  // Room left of the first bus for its boxes. Labels that stick out past
+  // this are caught by measuring the drawing (see render).
+  const left = hasLeft ? 270 : 40;
+  return { order, col, netByName, items, rowsUsed, left, startNet };
+}
+
+// ---------------------------------------------------------------------------
+// Drawing
+// ---------------------------------------------------------------------------
+const SVGNS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) if (attrs[k] !== undefined && attrs[k] !== null) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function text(parent, x, y, str, cls, anchor) {
+  const t = el("text", { x, y, class: cls, "text-anchor": anchor || "start" }, parent);
+  t.textContent = str;
+  return t;
+}
+function clip(s, n) { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+function title(parent, str) { el("title", {}, parent).textContent = str; }
+function line(parent, x1, y1, x2, y2, cls) { return el("line", { x1, y1, x2, y2, class: cls || "w" }, parent); }
+
+function shortRail(name) {
+  const parts = String(name).split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : String(name);
+}
+function isGround(name) { return /^(A|D|P|S|C)?GND|^VSS|^0V$|^GROUND|^EARTH|^CHASSIS/i.test(shortRail(name)); }
+// Every rail symbol carries its name, except a ground named plain GND.
+function railHasLabel(name) { return !isGround(name) || shortRail(name).toUpperCase() !== "GND"; }
+
+// Rail symbol at a lead end (x, y). dir: "down" or "up".
+function railGlyph(g, x, y, name, dir) {
+  const n = shortRail(name);
+  const s = dir === "up" ? -1 : 1;
+  if (isGround(name)) {
+    line(g, x, y, x, y + 6 * s, "sym");
+    line(g, x - 8, y + 6 * s, x + 8, y + 6 * s, "sym");
+    line(g, x - 5, y + 9 * s, x + 5, y + 9 * s, "sym");
+    line(g, x - 2, y + 12 * s, x + 2, y + 12 * s, "sym");
+    if (railHasLabel(name)) text(g, x, y + (s > 0 ? 24 : -16), clip(n, 14), "note", "middle");
+  } else {
+    line(g, x, y, x, y + 7 * s, "sym");
+    line(g, x - 8, y + 7 * s, x + 8, y + 7 * s, "sym");
+    text(g, x, y + (s > 0 ? 19 : -11), clip(n, 14), "netname", "middle");
+  }
+  title(g, String(name));
+}
+
+// Draw the far end of a lead: rail symbol, no-connect, or open (not walked).
+function terminal(g, x, y, end, dir) {
+  if (end.kind === "rail") {
+    if (dir === "up" || dir === "down") {
+      railGlyph(g, x, y, end.net, dir);
+    } else if (isGround(end.net)) {
+      railGlyph(g, x, y, end.net, "down");
+    } else {
+      // A supply on the side of a box: a name flag, which stays on its row.
+      const t = text(g, x + (dir === "left" ? -3 : 3), y + 4, clip(shortRail(end.net), 14), "netname",
+        dir === "left" ? "end" : "start");
+      title(t, String(end.net));
+    }
+  } else if (end.kind === "nc") {
+    line(g, x - 4, y - 4, x + 4, y + 4, "sym");
+    line(g, x - 4, y + 4, x + 4, y - 4, "sym");
+    title(g, "unconnected pin");
+  } else if (end.kind === "open") {
+    const dx = dir === "right" ? 1 : dir === "left" ? -1 : 0;
+    const dy = dir === "down" ? 1 : dir === "up" ? -1 : 0;
+    line(g, x, y, x + 12 * dx, y + 12 * dy, "w open");
+    const t = text(g, x + 16 * dx + (dy ? 6 : 0), y + 16 * dy + 4, end.same ? "same net" : "not walked", "note",
+      dx < 0 ? "end" : "start");
+    title(t, end.same ? "both pins are on the same net" :
+      "this pin is on a net the walk did not reach" + (end.pin && end.pin.net ? " (" + end.pin.net + ")" : ""));
+  }
+}
+
+// Two-terminal symbol along local x from 0 to 50 at y = 0. `cathodeAtEnd`
+// orients a diode: true = the cathode bar is at x = 50.
+const SYMLEN = 50;
+function symbol(g, cls, cathodeAtEnd) {
+  switch (cls) {
+    case "R":
+      el("polyline", { class: "sym", points: "0,0 9,0 11.8,-6 17.5,6 23.2,-6 28.8,6 34.5,-6 40.2,6 41,0 50,0" }, g);
+      break;
+    case "C":
+      el("path", { class: "sym", d: "M0,0 H22 M28,0 H50 M22,-10 V10 M28,-10 V10" }, g);
+      break;
+    case "L":
+      el("path", { class: "sym", d: "M0,0 H9 a4,4 0 0 1 8,0 a4,4 0 0 1 8,0 a4,4 0 0 1 8,0 a4,4 0 0 1 8,0 H50" }, g);
+      break;
+    case "FB":
+      el("path", { class: "sym", d: "M0,0 H14 M36,0 H50" }, g);
+      el("rect", { class: "solid", x: 14, y: -5, width: 22, height: 10, rx: 1 }, g);
+      break;
+    case "D": {
+      const d = el("g", { transform: cathodeAtEnd ? "" : "translate(50,0) scale(-1,1)" }, g);
+      el("path", { class: "sym", d: "M0,0 H18 M32,0 H50 M32,-8 V8" }, d);
+      el("path", { class: "sym", d: "M18,-8 L18,8 L32,0 Z" }, d);
+      break;
+    }
+  }
+}
+// True when this pin is the diode cathode. KiCad diode symbols name it "K";
+// with no usable name, pin 1 is taken as the cathode (the Device:D default).
+function isCathode(pin) {
+  if (!pin) return false;
+  const n = (pin.name || "").toUpperCase();
+  if (n === "K" || n === "C" || n === "CATHODE") return true;
+  if (n === "A" || n === "ANODE") return false;
+  return pin.pin === "1";
+}
+function partLabel(part) {
+  return part.refdes + (part.dnp ? " DNP" : "");
+}
+function partTitle(part) {
+  return part.refdes + " " + part.value + " (" + part.class + ", " + part.role + (part.dnp ? ", DNP" : "") + ")\n" +
+    part.pins.map((p) => "pin " + p.pin + (p.name && p.name !== "~" ? " " + p.name : "") + ": " + (p.net == null ? "unconnected" : p.net)).join("\n");
+}
+
+function render(data) {
+  const L = layout(data);
+  const busX = (i) => L.left + i * COLW;
+  const rowY = (r) => TOP + r * ROW;
+  const attach = new Map(); // bus index -> list of y
+  const addAttach = (c, y) => { if (!attach.has(c)) attach.set(c, []); attach.get(c).push(y); };
+  let maxX = L.left + Math.max(L.order.length - 1, 0) * COLW + 60;
+
+  const svg = el("svg", { xmlns: SVGNS, role: "img" });
+  const wires = el("g", {}, svg);
+  const body = el("g", {}, svg);
+  const dots = el("g", {}, svg);
+  const startRef = String(data.start || "").includes(":") ? String(data.start).split(":")[0] : null;
+  const startPin = startRef ? String(data.start).split(":").slice(1).join(":") : null;
+
+  const partGroup = (part) => {
+    const cls = [part.dnp ? "dnp" : "", part.refdes === startRef || part.role === "start" ? "start" : ""].join(" ").trim();
+    const g = el("g", { class: cls || undefined }, body);
+    title(g, partTitle(part));
+    return g;
+  };
+
+  for (const it of L.items) {
+    const y0 = rowY(it.row);
+    if (it.type === "series") {
+      const xl = busX(it.left.col), xr = busX(it.right.col);
+      const sx = xr - 30 - SYMLEN;
+      const g = partGroup(it.part);
+      line(g, xl, y0, sx, y0);
+      line(g, sx + SYMLEN, y0, xr, y0);
+      const s = el("g", { transform: `translate(${sx},${y0})` }, g);
+      symbol(s, it.part.class, isCathode(it.right.pin));
+      text(g, sx + SYMLEN / 2, y0 - 12, partLabel(it.part), "ref", "end");
+      text(g, sx + SYMLEN / 2 + 4, y0 - 12, clip(it.part.value, 12), "val");
+      addAttach(it.left.col, y0);
+      addAttach(it.right.col, y0);
+    } else if (it.type === "tp") {
+      const x = busX(it.end.col);
+      const g = partGroup(it.part);
+      line(g, x, y0, x + 34, y0);
+      el("circle", { class: "sym", cx: x + 38, cy: y0, r: 4 }, g);
+      text(g, x + 46, y0 + 4, partLabel(it.part), "ref");
+      addAttach(it.end.col, y0);
+    } else if (it.type === "bank") {
+      const g0 = it.gap;
+      const bx = it.free ? busX(0) + 40 : busX(g0);
+      const xs = it.shunts.map((_, k) => bx + 40 + k * 72);
+      if (!it.free) {
+        line(wires, bx, y0, xs[xs.length - 1], y0);
+        addAttach(g0, y0);
+        xs.slice(0, -1).forEach((x) => el("circle", { class: "dot", cx: x, cy: y0, r: 2.6 }, dots));
+      }
+      it.shunts.forEach((sh, k) => {
+        const x = xs[k];
+        const g = partGroup(sh.part);
+        if (it.free) terminal(g, x, y0, sh.top, "up");
+        const s = el("g", { transform: `translate(${x},${y0 + 6}) rotate(90)` }, g);
+        line(g, x, y0, x, y0 + 6);
+        // An endpoint diode lists only its pins on walked nets, so the bottom
+        // pin can be missing: then orient by the pin on the bus.
+        symbol(s, sh.part.class, sh.bot.pin ? isCathode(sh.bot.pin) : !isCathode(sh.top.pin));
+        const yb = y0 + 6 + SYMLEN;
+        terminal(g, x, yb, sh.bot, "down");
+        text(g, x + 14, y0 + 26, partLabel(sh.part), "ref");
+        text(g, x + 14, y0 + 39, clip(sh.part.value, 9), "val");
+        maxX = Math.max(maxX, x + 70);
+      });
+    } else if (it.type === "box") {
+      const part = it.part;
+      const g = partGroup(part);
+      const gapX = it.gap === -1 ? L.left - COLW : busX(it.gap);
+      const bx = it.mirror ? L.left - 60 - BOXW : gapX + 58;
+      const top = rowY(it.row + 1) - 14;
+      const h = (it.h - 1) * ROW - 6;
+      el("rect", { class: "box", x: bx, y: top, width: BOXW, height: h, rx: 3 }, g);
+      text(g, bx, top - 6, partLabel(part), "ref");
+      text(g, bx + BOXW, top - 6, clip(part.value, 16), "val", "end");
+      // Pins toward the buses go on the bus side; rail/nc pins on the other.
+      const busSideX = it.mirror ? bx + BOXW : bx;
+      const otherSideX = it.mirror ? bx : bx + BOXW;
+      const out = it.mirror ? 1 : -1;
+      it.busEnds.forEach((e, k) => {
+        const y = rowY(it.row + 1 + k);
+        const tip = busSideX + out * 16;
+        line(g, busSideX, y, tip, y);
+        line(wires, tip, y, busX(e.col), y);
+        addAttach(e.col, y);
+        const isStart = part.refdes === startRef && e.pin.pin === startPin;
+        text(g, busSideX + out * 4, y - 4, e.pin.pin, "pnum" + (isStart ? " startpin" : ""), out < 0 ? "end" : "start");
+        if (e.pin.name && e.pin.name !== "~" && e.pin.name !== e.pin.pin) {
+          text(g, busSideX - out * 5, y + 4, clip(e.pin.name, 13), "pname" + (isStart ? " startpin" : ""), out < 0 ? "start" : "end");
+        }
+        if (isStart) el("circle", { class: "dot startpin", cx: tip, cy: y, r: 3 }, dots);
+      });
+      it.otherEnds.forEach((e, k) => {
+        const y = rowY(it.row + 1 + k);
+        const tip = otherSideX - out * 16;
+        line(g, otherSideX, y, tip, y);
+        terminal(g, tip, y, e, out < 0 ? "right" : "left");
+        const pins = e.pins || [e.pin];
+        const num = text(g, otherSideX - out * 4, y - 4, clip(pins.map((p) => p.pin).join(","), 14), "pnum",
+          out < 0 ? "start" : "end");
+        if (pins.length > 1) title(num, "pins " + pins.map((p) => p.pin).join(", ") + " on " + e.net);
+        const names = [...new Set(pins.map((p) => p.name).filter((n) => n && n !== "~"))];
+        if (names.length === 1 && names[0] !== pins[0].pin) {
+          text(g, otherSideX + out * 5, y + 4, clip(names[0], 13), "pname", out < 0 ? "end" : "start");
+        } else if (pins.length > 1) {
+          text(g, otherSideX + out * 5, y + 4, pins.length + " pins", "pname", out < 0 ? "end" : "start");
+        }
+      });
+      maxX = Math.max(maxX, bx + BOXW + 60);
+    }
+  }
+
+  // Buses, with their net names on top.
+  L.order.forEach((name, i) => {
+    const n = L.netByName.get(name);
+    const x = busX(i);
+    const ys = (attach.get(i) || []).slice().sort((a, b) => a - b);
+    const yTop = TOP - 22;
+    const yBot = ys.length ? ys[ys.length - 1] : yTop + 16;
+    const g = el("g", { class: name === L.startNet ? "start" : undefined }, wires);
+    line(g, x, yTop, x, yBot, "bus");
+    const t = text(g, x, TOP - 46, clip(name, 26), "netname busname", "middle");
+    title(t, name + " — fanout " + n.fanout + ", " + n.state);
+    const notes = [];
+    if (n.state === "large_net") notes.push("large net, not walked");
+    else if (n.state === "depth_limit") notes.push("depth limit");
+    else if (n.state === "dangling") notes.push("dangling");
+    else if (n.state === "rail") notes.push("rail");
+    if (n.omitted_parts) notes.push("+" + n.omitted_parts + " parts cut");
+    if (notes.length) text(g, x, TOP - 33, notes.join(", "), "note", "middle");
+    if (n.state !== "expanded") line(g, x, yBot, x, yBot + 14, "bus cont");
+    ys.slice(0, -1).forEach((y) => el("circle", { class: "dot", cx: x, cy: y, r: 3 }, dots));
+  });
+
+  // The planned size; fitDrawing widens it to what was actually drawn.
+  drawing = { svg, x1: Math.max(maxX, L.left + 120) + PAD, y1: TOP + L.rowsUsed * ROW + PAD };
+  sizeTo(svg, 0, 0, drawing.x1, drawing.y1);
+  title(svg, "Walk topology from " + (data.start || ""));
+
+  // Header and notes.
+  const topo = data.topology;
+  document.getElementById("title").innerHTML = "";
+  const h1 = document.getElementById("title");
+  h1.append("Walk from ");
+  const code = document.createElement("code");
+  code.textContent = data.start || "";
+  h1.append(code);
+  document.getElementById("counts").textContent =
+    topo.parts.length + " parts · " + topo.nets.length + " nets";
+  const notes = document.getElementById("notes");
+  notes.innerHTML = "";
+  const note = (s) => { const p = document.createElement("p"); p.textContent = s; notes.appendChild(p); };
+  if (topo.truncated) {
+    note("Drawing cut by max_topology_parts: " + topo.omitted_parts + " parts and " +
+      topo.omitted_nets + " nets left out.");
+  }
+  if (data.truncated) note("The walk hit its depth or endpoint limit. The endpoint limit cuts only the endpoint " +
+    "list in the result, not the drawing. Nets marked \"depth limit\" were not walked past.");
+  if (!topo.parts.length) note("No parts on the walked nets.");
+
+  document.getElementById("header").hidden = false;
+  document.getElementById("footer").hidden = false;
+  document.getElementById("message").hidden = true;
+  const canvas = document.getElementById("canvas");
+  canvas.innerHTML = "";
+  canvas.appendChild(svg);
+  const width = fitDrawing();
+  // Fit to width unless that would shrink the text below about 60%; then
+  // show actual size and let the canvas scroll sideways.
+  setFit(width * 0.6 <= (canvas.clientWidth || width));
+  reportSize();
+}
+
+// The drawing on screen and its planned right and bottom edges.
+let drawing = null;
+function sizeTo(svg, x0, y0, x1, y1) {
+  svg.setAttribute("viewBox", `${x0} ${y0} ${x1 - x0} ${y1 - y0}`);
+  svg.setAttribute("width", x1 - x0);
+  svg.setAttribute("height", y1 - y0);
+  return x1 - x0;
+}
+// Text widths are only known once drawn: grow the box so no label at an edge
+// is cut off. Run again when fonts load or a hidden frame is shown, since both
+// change the widths. getBBox is all zeros (or throws, in some engines) when
+// nothing is laid out; then the planned size stays. Returns the width.
+function fitDrawing() {
+  if (!drawing) return 0;
+  const { svg, x1, y1 } = drawing;
+  let bb = null;
+  try { bb = svg.getBBox(); } catch (e) { bb = null; }
+  if (!bb || !(bb.width > 0)) return sizeTo(svg, 0, 0, x1, y1);
+  return sizeTo(svg, Math.min(0, bb.x - PAD), Math.min(0, bb.y - PAD),
+    Math.max(x1, bb.x + bb.width + PAD), Math.max(y1, bb.y + bb.height + PAD));
+}
+if (document.fonts && document.fonts.addEventListener) {
+  document.fonts.addEventListener("loadingdone", () => { fitDrawing(); reportSize(); });
+}
+
+function setFit(fit) {
+  document.getElementById("canvas").classList.toggle("fit", fit);
+  document.getElementById("zoom").textContent = fit ? "Actual size" : "Fit width";
+}
+
+document.getElementById("zoom").addEventListener("click", () => {
+  setFit(!document.getElementById("canvas").classList.contains("fit"));
+  reportSize();
+});
+
+start();
+</script>
+</body>
+</html>

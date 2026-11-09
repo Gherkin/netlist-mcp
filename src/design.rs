@@ -3073,8 +3073,8 @@ fn normalize_bead_value(value: &str) -> Option<ValueNorm> {
                 .collect();
             match ohm_marked.as_slice() {
                 // 2. One token says of itself that it is a resistance and the
-                //    others are bare numbers — package codes ("0603"), split
-                //    rating digits ("500 mA"), MPN fragments. It need not be
+                //    others are bare numbers — package codes ("0603"), MPN
+                //    fragments. It need not be
                 //    the first token: "2A 600R" is still a 600Ω bead.
                 [only] => (only.1, None),
                 // 3. Several in-band numbers that could each be the ohms, and
@@ -3085,10 +3085,8 @@ fn normalize_bead_value(value: &str) -> Option<ValueNorm> {
                 //    the candidate's own token, since the resistor reading
                 //    takes the *first* token for the value and here that may
                 //    be a rating ("2A 1k"). With no candidate at all it
-                //    starts from the top, since a number can be under the
-                //    band until its split prefix applies ("0.5 k") — but a
-                //    value struck out as a DC quantity must not come back
-                //    that way.
+                //    starts from the top — but a value struck out as a DC
+                //    quantity must not come back that way.
                 [] => {
                     if candidates.is_empty() && struck_dc {
                         return None;
@@ -3230,7 +3228,7 @@ fn bead_split(value: &str) -> Vec<(String, bool)> {
 /// "4.7 ohm K" stays a tolerance code.
 fn joins_split_unit(prev: &str, unit: &str) -> bool {
     let number_len = prev.len() - prev.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.').len();
-    if number_len == 0 || !is_bare_number(&prev[..number_len]) {
+    if number_len == 0 {
         return false;
     }
     if number_len == prev.len() && unit.chars().all(char::is_alphabetic) {
@@ -3361,8 +3359,7 @@ fn attach_mark(out: &mut Vec<BeadToken>, mark: Mark, binding: Binding) -> Option
         // "120mΩ@DC" is a DC resistance saying so. It is not an impedance
         // rating at any frequency, so it is not a candidate for the bead's
         // value at all — not even a rival that makes the string ambiguous.
-        // Any ohm value counts, in band or not: "0.5 kΩ@DC" binds to the
-        // 0.5, and only reaches the band once the split prefix applies.
+        // Any ohm value counts, in band or not ("120mΩ@DC").
         Mark::Dc if parse_value_token(&out[pos].base, 'R').is_some() => out[pos].dc = true,
         Mark::Dc | Mark::Other => {}
     }
@@ -4165,7 +4162,7 @@ mod value_norm_tests {
     }
 
     #[test]
-    fn a_glued_at_binds_to_its_token_and_a_spaced_one_to_the_ohms() {
+    fn an_at_binds_to_the_nearest_quantity_glued_or_spaced() {
         // Stuck to the 200mA or spaced off it, the "@DC" is about the
         // current and says nothing about the 2kΩ.
         for raw in ["1.2Ω 2kΩ 200mA@DC", "1.2Ω 2kΩ 200mA @DC", "1.2Ω 2kΩ 200mA @ DC"] {

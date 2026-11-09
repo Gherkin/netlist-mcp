@@ -526,47 +526,48 @@ fn parse_net(node: &NetListNode, comps: &mut Vec::<netlist::Component>) -> anyho
 
 }
 
-/// The next token, or an error if the input ended. An empty file, or one cut
-/// off while KiCad is still writing it, ends before every `(` is closed (#58).
+/// A file cut off while KiCad is still writing it ends before every `(` is
+/// closed (#58).
+const UNCLOSED: &str = "unexpected end of netlist: an s-expression is not closed (truncated file?)";
+
+/// The next token, or an error if the input ended.
 fn peek(syms: &[Token]) -> anyhow::Result<&Token> {
-    syms.first()
-        .context("unexpected end of netlist: an s-expression is not closed (empty or truncated file?)")
+    syms.first().context(UNCLOSED)
+}
+
+/// The next token, consumed, or an error if the input ended. The only place
+/// `syms` advances, so no read can run past its end.
+fn take<'a>(syms: &mut &'a [Token]) -> anyhow::Result<&'a Token> {
+    let (first, rest) = syms.split_first().context(UNCLOSED)?;
+    *syms = rest;
+    Ok(first)
 }
 
 fn structurize(syms: &mut &[Token]) -> anyhow::Result<NetListNode> {
-    let Token::LParen = peek(syms)? else {
+    let Token::LParen = take(syms)? else {
         bail!("no left paranthesis in structurize, misaligned")
     };
 
-    *syms = &syms[1..];
-
-    let key;
-    match peek(syms)?.clone() {
+    let key = match take(syms)? {
         Token::LParen => {
             bail!("two left paranthesis after each other in structurize!");
         }
         Token::RParen => {
             bail!("empty node in structurize!");
         }
-        x => {
-            *syms = &syms[1..];
-            key = NetListNode::Atom(x.clone());
-        },
+        x => NetListNode::Atom(x.clone()),
     };
 
     let mut val: Vec<NetListNode> = Vec::new();
     val.push(key);
     loop {
-        let elem = match peek(syms)?.clone() {
+        let elem = match peek(syms)? {
             Token::LParen => structurize(syms)?,
             Token::RParen => {
-                *syms = &syms[1..];
+                take(syms)?;
                 break;
             }
-            x => {
-                *syms = &syms[1..];
-                NetListNode::Atom(x)
-            }
+            _ => NetListNode::Atom(take(syms)?.clone()),
         };
         val.push(elem)
     }
@@ -582,6 +583,7 @@ fn structurize(syms: &mut &[Token]) -> anyhow::Result<NetListNode> {
 pub fn parse_netlist(data: &String) -> anyhow::Result<netlist::Netlist> {
     let scanner = Scanner::new(data);
     let syms: Vec<Token> = scanner.collect::<anyhow::Result<Vec<Token>>>()?;
+    ensure!(!syms.is_empty(), "netlist is empty");
 
     let mut slice: &[Token] = &syms;
     let nodetree : NetListNode = structurize(&mut slice)?;
@@ -689,8 +691,16 @@ mod truncated_input_tests {
     /// #58: these inputs used to panic on an out-of-bounds index.
     #[test]
     fn empty_file_is_an_error() {
-        assert!(err("").contains("unexpected end of netlist"));
-        assert!(err("  \n").contains("unexpected end of netlist"));
+        assert!(err("").contains("netlist is empty"));
+        assert!(err("  \n").contains("netlist is empty"));
+    }
+
+    /// A file cut off inside a quoted string fails in the scanner, and says
+    /// it is truncated too.
+    #[test]
+    fn file_cut_inside_a_string_is_an_error() {
+        assert!(err(r#"(export (version "E"#).contains("truncated file?"));
+        assert!(err(r#"(export (version "E\"#).contains("truncated file?"));
     }
 
     #[test]

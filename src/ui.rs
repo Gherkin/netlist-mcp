@@ -14,9 +14,6 @@ pub const WALK_TOPOLOGY_URI: &str = "ui://netlist/walk-topology.html";
 /// The capability key a client sets when it can show MCP App views.
 pub const UI_EXTENSION: &str = "io.modelcontextprotocol/ui";
 
-/// Tools that only make sense in a client that shows MCP App views.
-const UI_TOOLS: &[&str] = &["draw_walk"];
-
 /// Does this client show MCP App views? The spec puts the key under
 /// `extensions`; `experimental` is accepted too, for hosts that used it
 /// before extensions existed.
@@ -25,13 +22,15 @@ pub fn client_supports_ui(caps: &ClientCapabilities) -> bool {
         || caps.experimental.as_ref().is_some_and(|m| m.contains_key(UI_EXTENSION))
 }
 
+/// A UI tool is one whose `_meta` links a view (`ui.resourceUri`).
+fn is_ui_tool(t: &Tool) -> bool {
+    t.meta.as_ref().is_some_and(|m| m.get("ui").and_then(|u| u.get("resourceUri")).is_some())
+}
+
 /// The tool list a client sees: UI tools are left out unless it shows views
 /// (the spec says servers SHOULD gate them). They stay callable either way.
 pub fn visible_tools(tools: Vec<Tool>, supports_ui: bool) -> Vec<Tool> {
-    tools
-        .into_iter()
-        .filter(|t| supports_ui || !UI_TOOLS.contains(&t.name.as_ref()))
-        .collect()
+    tools.into_iter().filter(|t| supports_ui || !is_ui_tool(t)).collect()
 }
 
 /// The only mime type the spec allows for an MCP App resource.
@@ -153,7 +152,11 @@ mod tests {
     #[test]
     fn draw_walk_is_listed_only_to_ui_clients() {
         let schema = std::sync::Arc::new(serde_json::Map::new());
-        let tools = || vec![Tool::new("walk", "w", schema.clone()), Tool::new("draw_walk", "d", schema.clone())];
+        let tools = || {
+            let mut draw = Tool::new("draw_walk", "d", schema.clone());
+            draw.meta = Some(draw_walk_tool_meta());
+            vec![Tool::new("walk", "w", schema.clone()), draw]
+        };
         let names = |ts: Vec<Tool>| ts.into_iter().map(|t| t.name.to_string()).collect::<Vec<_>>();
         assert_eq!(names(visible_tools(tools(), true)), ["walk", "draw_walk"]);
         assert_eq!(names(visible_tools(tools(), false)), ["walk"]);

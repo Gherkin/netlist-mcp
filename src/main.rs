@@ -373,8 +373,7 @@ impl NetlistServer {
         on; in clients that support MCP Apps the result is also shown as a \
         drawing (R, C, L, FB, D as symbols, ICs and connectors as boxes, \
         rails as ground/supply symbols, DNP parts dashed). Use it when \
-        showing the circuit helps the user; use `walk` for your own tracing. \
-        In clients without MCP Apps it is just `walk` with the topology.",
+        showing the circuit helps the user; use `walk` for your own tracing.",
         meta = ui::draw_walk_tool_meta())]
     fn draw_walk(&self, Parameters(p): Parameters<DrawWalkParams>) -> String {
         // Same defaults and result as `walk`: only include_topology is fixed.
@@ -472,8 +471,9 @@ TRACE (connectivity — the point of this server):
   net it passes THROUGH series parts (resistors, inductors, ferrites, caps) to \
   the real endpoints (ICs, connectors), and stops at power/ground rails instead \
   of enumerating them. Topological, not electrical.
-- draw_walk: the same walk, shown to the user as a drawn schematic in clients \
-  that support MCP Apps. Use it when a picture of the circuit helps the user.
+- draw_walk: the same walk, shown to the user as a drawn schematic. Listed \
+  only to clients that support MCP Apps. Use it when a picture of the circuit \
+  helps the user.
 - neighbors: the parts one hop away, grouped by shared net (rails appear as one \
   capped group). Cheap orientation before a walk.
 - path_between: whether two pins are connected through series parts (not across \

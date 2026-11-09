@@ -93,6 +93,7 @@ impl Design {
             keywords: comp.properties.get("ki_keywords").cloned().flatten(),
             footprint: comp.footprint.clone(),
             sheet: comp.sheet.clone(),
+            lib_id: comp.lib_id.clone(),
             dnp: comp.dnp,
             exclude_from_bom: comp.exclude_from_bom,
             properties: comp.properties.clone(),
@@ -2024,6 +2025,7 @@ impl Design {
                 footprint: netlist_comp.footprint,
                 description: netlist_comp.description,
                 sheet: netlist_comp.sheet,
+                lib_id: netlist_comp.lib_id,
                 dnp,
                 exclude_from_bom,
                 properties,
@@ -2283,6 +2285,8 @@ struct ComponentDetail {
     keywords: Option<String>,
     footprint: Option<String>,
     sheet: Option<String>,
+    /// The symbol's library id, "lib:part" (e.g. "Device:R").
+    lib_id: String,
     /// Do Not Populate: the part is on the schematic but deliberately not
     /// fitted. Always emitted, never null — see `presence_flag`.
     dnp: bool,
@@ -3431,6 +3435,10 @@ pub struct Component {
     footprint: Option<String>,
     description: Option<String>,
     sheet: Option<String>,
+    /// The symbol's library id, "lib:part" (e.g. "Device:R"). A part-identity
+    /// key independent of `value`, which is an MPN for ICs and a spec for
+    /// passives.
+    lib_id: String,
     /// True if the schematic marks this part Do Not Populate. Derived from the
     /// netlist's presence-only `dnp` property (see `presence_flag`) and lifted
     /// out of `properties` so it can never be read as a null/unknown.
@@ -4579,6 +4587,7 @@ mod subsystem_filter_seam_tests {
                 footprint: None,
                 description: None,
                 sheet: Some(sheet.to_string()),
+                lib_id: String::new(),
                 dnp: false,
                 exclude_from_bom: false,
                 properties: HashMap::new(),
@@ -5696,6 +5705,7 @@ mod filter_nets_rail_tests {
                             footprint: None,
                             description: None,
                             sheet: Some(sheet.to_string()),
+                            lib_id: String::new(),
                             dnp: false,
                             exclude_from_bom: false,
                             properties: HashMap::new(),
@@ -5895,10 +5905,24 @@ mod filter_nets_rail_tests {
 }
 
 #[cfg(test)]
+mod component_detail_tests {
+    use super::walk_topology_tests::fixture;
+
+    // #45: the libsource lib:part is kept and returned by get_component.
+    #[test]
+    fn get_component_returns_lib_id() {
+        let design = fixture();
+        let json = design.comp_details("H1", 10, 0).expect("H1 exists");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(v["lib_id"], "Mechanical:MountingHole");
+    }
+}
+
+#[cfg(test)]
 mod walk_topology_tests {
     use super::*;
 
-    fn fixture() -> Design {
+    pub(super) fn fixture() -> Design {
         let data = include_str!("../tests/fixture.net").to_string();
         let netlist = crate::parser::kicad_parser::parse_netlist(&data).expect("fixture parses");
         Design::from_netlist(netlist).expect("fixture builds")

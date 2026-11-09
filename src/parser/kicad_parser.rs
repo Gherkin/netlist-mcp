@@ -364,6 +364,7 @@ fn parse_component(node: &NetListNode, base_tree: &NetListNode) -> anyhow::Resul
     let comp_lib_part = libsource
         .get_only_child_val(&Token::sym("part"))
         .with_context(|| format!("error looking for part child of libsource of node {:?}", node))?;
+    comp.lib_id = format!("{comp_lib}:{comp_lib_part}");
 
     let lib_part = base_tree.get_only_child(&Token::sym("libparts"))
         .context("couldnt find libparts node")?
@@ -387,7 +388,7 @@ fn parse_component(node: &NetListNode, base_tree: &NetListNode) -> anyhow::Resul
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    ensure!(lib_part.len() == 1, "more than one libpart {} with lib {} found!", comp_lib_part, comp_lib);
+    ensure!(lib_part.len() == 1, "expected one libpart {} with lib {}, found {}", comp_lib_part, comp_lib, lib_part.len());
 
     let lib_pins = lib_part.into_iter().next().unwrap()
         .get_child(&Token::sym("pin"))

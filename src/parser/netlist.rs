@@ -20,6 +20,9 @@ pub struct Component {
     pub footprint: Option<String>,
     pub description: Option<String>,
     pub sheet: Option<String>,
+    /// The symbol's library id, "lib:part", from `(libsource (lib ..) (part ..))`.
+    /// Every exported component carries one; the parser requires it.
+    pub lib_id: String,
     pub properties: HashMap<String, Option<String>>,
     pub pins: Vec<Pin>
 }
@@ -32,6 +35,7 @@ impl Component {
             footprint: None,
             description: None,
             sheet: None,
+            lib_id: String::new(),
             properties: HashMap::new(),
             pins: Vec::new()
         }

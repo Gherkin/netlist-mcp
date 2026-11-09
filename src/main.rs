@@ -147,6 +147,11 @@ struct WalkParams {
     /// Use it to draw or reason about the circuit shape (shunts, branches).
     #[serde(default)]
     include_topology: Option<bool>,
+    /// Max parts in `topology` (default 200), nearest to the start first.
+    /// Nets only the cut parts reach are left out too. `topology.truncated`
+    /// and the `omitted_parts`/`omitted_nets` counts report the cut.
+    #[serde(default)]
+    max_topology_parts: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -316,12 +321,14 @@ impl NetlistServer {
         let max_endpoints = p.max_endpoints.unwrap_or(50);
         let stop_at_power = p.stop_at_power.unwrap_or(true);
         let include_topology = p.include_topology.unwrap_or(false);
+        let max_topology_parts = p.max_topology_parts.unwrap_or(200);
         match self.design.walk(
             &p.start,
             max_depth,
             max_endpoints,
             stop_at_power,
             include_topology,
+            max_topology_parts,
         ) {
             Ok(out) => out,
             Err(e) => format!("error: {e:#}"),

@@ -1140,7 +1140,8 @@ impl Design {
     /// `include_topology` adds a `topology` object: the nets the walk touched
     /// as nodes and the parts as edges, each part with the pin number and net
     /// of every side (see `build_topology`). Without it the output is the flat
-    /// endpoint list only, unchanged.
+    /// endpoint list only, unchanged. `max_topology_parts` caps the parts in
+    /// that graph, nearest first; `max_endpoints` does not touch it.
     ///
     /// The BFS core lives in `walk_bfs`, shared with `path_between`.
     pub fn walk(
@@ -1150,6 +1151,7 @@ impl Design {
         max_endpoints: u32,
         stop_at_power: bool,
         include_topology: bool,
+        max_topology_parts: u32,
     ) -> anyhow::Result<String> {
         // Resolve the start: "REFDES:PIN" is a pin (start_comp excluded from
         // endpoints), otherwise a net name.
@@ -1199,8 +1201,15 @@ impl Design {
                 })
         });
 
-        let topology = include_topology
-            .then(|| self.build_topology(&data.topo, &data.endpoints, start_comp.as_ref()));
+        let topology = include_topology.then(|| {
+            self.build_topology(
+                &data.topo,
+                &data.endpoints,
+                start_net_id.0,
+                start_comp.as_ref(),
+                max_topology_parts as usize,
+            )
+        });
 
         let envelope = WalkEnvelope {
             start: start.to_string(),
@@ -1364,7 +1373,7 @@ impl Design {
                         .filter(|n| *n != net_idx);
 
                     visited_comps.insert(comp_id.0);
-                    topo.note_series(comp_id.0);
+                    topo.note_series(comp_id.0, depth);
 
                     if other_pin_has_no_net {
                         // Far pin is NC -> dangling, goes nowhere.
@@ -1466,17 +1475,73 @@ impl Design {
     /// every reported endpoint part. Start and endpoint parts list only the
     /// pins that sit on a node net (in any state, rail and depth_limit
     /// included), so a 100-pin IC shows only its pins on nets in the graph.
+    ///
+    /// At most `max_parts` parts are kept (issue #34): the start part first,
+    /// then series and endpoint parts by hop distance, endpoints before series
+    /// parts at the same distance. Every net a kept series part reaches comes
+    /// before any part one hop further, so the kept parts form a connected
+    /// graph around the start. Nets are then kept only when they are the start
+    /// net or sit on a pin of a kept series part, so no node hangs loose.
+    /// `truncated`, `omitted_parts` and `omitted_nets` report the cut.
     fn build_topology(
         &self,
         topo: &TopoTrace,
         endpoints: &[WalkEndpoint],
+        start_net: usize,
         start_comp: Option<&CompId>,
+        max_parts: usize,
     ) -> Topology {
-        let node_nets: HashSet<usize> = topo.nets.iter().map(|(n, _)| *n).collect();
+        // Candidate parts in keep order, deduplicated (an endpoint part shows
+        // up once per reached pin; the start part can also be traversed as a
+        // series part from its far side).
+        let mut ranked: Vec<(u32, u8, usize, &'static str)> = Vec::new();
+        for &(c, d) in &topo.series {
+            ranked.push((d, 1, c, "series"));
+        }
+        for e in endpoints {
+            ranked.push((e.distance, 0, e.comp_idx, "endpoint"));
+        }
+        // Stable: series keep BFS order, endpoints keep `walk`'s sort.
+        ranked.sort_by_key(|&(d, r, _, _)| (d, r));
+        let mut order: Vec<(usize, &'static str)> = Vec::new();
+        let mut seen: HashSet<usize> = HashSet::new();
+        if let Some(c) = start_comp {
+            seen.insert(c.0);
+            order.push((c.0, "start"));
+        }
+        for (_, _, c, role) in ranked {
+            if seen.insert(c) {
+                order.push((c, role));
+            }
+        }
+        let omitted_parts = order.len().saturating_sub(max_parts);
+        order.truncate(max_parts);
+
+        // Nets on a kept series part, plus the start net. Endpoint and start
+        // parts add no nets: their pins are filtered to this set below.
+        let mut kept_nets: HashSet<usize> = HashSet::new();
+        kept_nets.insert(start_net);
+        for &(c, role) in &order {
+            if role == "series" {
+                for p in &self.component(&CompId(c)).pins {
+                    if let Some(n) = &self.pin(p).net {
+                        kept_nets.insert(n.0);
+                    }
+                }
+            }
+        }
+        let node_nets: HashSet<usize> = topo
+            .nets
+            .iter()
+            .map(|(n, _)| *n)
+            .filter(|n| kept_nets.contains(n))
+            .collect();
+        let omitted_nets = topo.nets.len() - node_nets.len();
 
         let nets = topo
             .nets
             .iter()
+            .filter(|(idx, _)| node_nets.contains(idx))
             .map(|(idx, state)| {
                 let net = self.net(&NetId(*idx));
                 let (score, _) = self.rail_score(net);
@@ -1490,11 +1555,8 @@ impl Design {
             .collect();
 
         let mut parts: Vec<TopoPart> = Vec::new();
-        let mut seen: HashSet<usize> = HashSet::new();
-        let mut push_part = |comp_idx: usize, role: &'static str, all_pins: bool| {
-            if !seen.insert(comp_idx) {
-                return;
-            }
+        for (comp_idx, role) in order {
+            let all_pins = role == "series";
             let comp = self.component(&CompId(comp_idx));
             let mut pins: Vec<TopoPin> = comp
                 .pins
@@ -1516,19 +1578,15 @@ impl Design {
                 role,
                 pins,
             });
-        };
-
-        if let Some(c) = start_comp {
-            push_part(c.0, "start", false);
-        }
-        for c in &topo.series {
-            push_part(*c, "series", true);
-        }
-        for e in endpoints {
-            push_part(e.comp_idx, "endpoint", false);
         }
 
-        Topology { nets, parts }
+        Topology {
+            truncated: omitted_parts > 0,
+            omitted_parts,
+            omitted_nets,
+            nets,
+            parts,
+        }
     }
 
     /// Report whether two pins are connected through the signal/passthrough
@@ -2420,7 +2478,8 @@ struct TopoTrace {
     nets: Vec<(usize, NetState)>,
     /// net index -> position in `nets`.
     net_pos: HashMap<usize, usize>,
-    series: Vec<usize>,
+    /// (series part, depth of the net it was traversed from).
+    series: Vec<(usize, u32)>,
 }
 
 impl TopoTrace {
@@ -2446,9 +2505,9 @@ impl TopoTrace {
         }
     }
 
-    fn note_series(&mut self, comp_idx: usize) {
+    fn note_series(&mut self, comp_idx: usize, depth: u32) {
         if self.record {
-            self.series.push(comp_idx);
+            self.series.push((comp_idx, depth));
         }
     }
 }
@@ -2457,6 +2516,13 @@ impl TopoTrace {
 /// edges that list the net on each of their pins.
 #[derive(Debug, Serialize)]
 struct Topology {
+    /// True when `max_topology_parts` cut parts from the graph. Separate from
+    /// the top-level `truncated`, which the depth and endpoint limits set.
+    truncated: bool,
+    /// Parts the walk reached but the cap left out.
+    omitted_parts: usize,
+    /// Nets the walk reached that no kept part touches, so they are left out.
+    omitted_nets: usize,
     nets: Vec<TopoNet>,
     parts: Vec<TopoPart>,
 }
@@ -5391,8 +5457,78 @@ mod walk_topology_tests {
     }
 
     fn walk(design: &Design, start: &str, max_depth: u32, topology: bool) -> serde_json::Value {
-        let json = design.walk(start, max_depth, 50, true, topology).expect("walk");
+        capped(design, start, max_depth, topology, 200)
+    }
+
+    fn capped(
+        design: &Design,
+        start: &str,
+        max_depth: u32,
+        topology: bool,
+        max_parts: u32,
+    ) -> serde_json::Value {
+        let json = design.walk(start, max_depth, 50, true, topology, max_parts).expect("walk");
         serde_json::from_str(&json).expect("valid JSON")
+    }
+
+    fn refdes(v: &serde_json::Value) -> Vec<String> {
+        v["topology"]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["refdes"].as_str().unwrap().into())
+            .collect()
+    }
+
+    /// Under the cap, nothing is cut and the counts say so.
+    #[test]
+    fn an_uncapped_graph_reports_no_cut() {
+        let v = walk(&fixture(), "/SENSIN1", 4, true);
+        assert_eq!(v["topology"]["truncated"], false);
+        assert_eq!(v["topology"]["omitted_parts"], 0);
+        assert_eq!(v["topology"]["omitted_nets"], 0);
+    }
+
+    /// Issue #34: `max_topology_parts` caps the graph, nearest parts first,
+    /// endpoints before series parts at the same distance. A net only cut
+    /// parts reach is left out, so no node hangs loose.
+    #[test]
+    fn the_cap_keeps_the_nearest_parts_and_their_nets() {
+        let d = fixture();
+        let full = walk(&d, "/SENSIN1", 4, true);
+        let all = refdes(&full);
+        assert_eq!(&all[..2], ["J2", "R11"], "{full}");
+
+        let one = capped(&d, "/SENSIN1", 4, true, 1);
+        assert_eq!(refdes(&one), ["J2"]);
+        assert_eq!(nets(&one), [("/SENSIN1".into(), "expanded".into())]);
+        assert_eq!(one["topology"]["truncated"], true);
+        assert_eq!(one["topology"]["omitted_parts"], all.len() - 1);
+        assert_eq!(one["topology"]["omitted_nets"], 2);
+        assert_eq!(pins(part(&one, "J2").unwrap()), [pn("1", "/SENSIN1")]);
+
+        let two = capped(&d, "/SENSIN1", 4, true, 2);
+        assert_eq!(refdes(&two), ["J2", "R11"]);
+        assert_eq!(
+            nets(&two),
+            [
+                ("/SENSIN1".into(), "expanded".into()),
+                ("/SENSMID1".into(), "expanded".into()),
+            ]
+        );
+        assert_eq!(two["topology"]["omitted_nets"], 1);
+
+        // The endpoint list is not touched by the topology cap.
+        assert_eq!(one["endpoints"], full["endpoints"]);
+    }
+
+    /// The start part is kept first, whatever the cap (above zero).
+    #[test]
+    fn the_start_part_is_kept_first() {
+        let v = capped(&fixture(), "J2:1", 4, true, 1);
+        assert_eq!(refdes(&v), ["J2"]);
+        assert_eq!(v["topology"]["parts"][0]["role"], "start");
+        assert_eq!(nets(&v), [("/SENSIN1".into(), "expanded".into())]);
     }
 
     /// (name, state) for every topology net, in order.

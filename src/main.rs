@@ -268,7 +268,8 @@ struct WriteSidecarParams {
     /// boards), "mpn" (the `MPN` property, else `value` — reusable across
     /// boards), or "refdes" (one part on this board only).
     scope: sidecar::Scope,
-    /// The key, matched exactly (case and all) against components.
+    /// The key, matched exactly (case and all) against components, after
+    /// trimming leading and trailing whitespace on both sides.
     key: String,
     /// Top-level fields to set on the entry. A field given as null is
     /// removed; fields not named are kept. An entry left with no fields is

@@ -22,7 +22,8 @@
 //! them. An entry is any JSON object; its fields are not interpreted here.
 //!
 //! A component matches by `lib_id` (raw, escape tokens kept: #51), by MPN (the
-//! `MPN` property, else `value`) and by refdes, all exact. The matches are
+//! `MPN` property, else `value`) and by refdes, all exact after trimming the
+//! component's keys (a key `write_file` stores is trimmed too). The matches are
 //! merged field by field (top-level keys only) in this order, later wins:
 //! library lib_id, project lib_id, library mpn, project mpn, project refdes.
 //!
@@ -272,6 +273,8 @@ pub struct Written {
 /// is never replaced by a plain file. A file that does not parse is an error
 /// and is left unchanged.
 pub fn write_file(path: &Path, edit: &Edit) -> anyhow::Result<Written> {
+    // Keys are stored trimmed; components are matched on trimmed keys too.
+    let edit = &Edit { key: edit.key.trim(), ..*edit };
     edit.check()?;
     let shown = path.display().to_string();
     let target = match fs::canonicalize(path) {
@@ -931,15 +934,18 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    // Keys match exactly, untrimmed, as `join` does: a part whose MPN has a
-    // trailing space can still get an entry.
+    // Keys are stored trimmed (components are matched on trimmed keys); a
+    // key of only spaces is empty.
     #[test]
-    fn write_keeps_key_whitespace() {
+    fn write_trims_key() {
         let dir = temp_dir("space");
         let path = dir.join("board.sidecar.json");
         let f = fields(json!({"n": 1}));
-        write_file(&path, &edit(Origin::Project, Scope::Mpn, "X ", &f)).unwrap();
-        assert_eq!(read_json(&path), json!({"mpn": {"X ": {"n": 1}}}));
+        let w = write_file(&path, &edit(Origin::Project, Scope::Mpn, " X ", &f)).unwrap();
+        assert_eq!(w.key, "X");
+        assert_eq!(read_json(&path), json!({"mpn": {"X": {"n": 1}}}));
+        let err = write_file(&path, &edit(Origin::Project, Scope::Mpn, "  ", &f)).unwrap_err();
+        assert!(format!("{err:#}").contains("the key is empty"), "{err:#}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -75,6 +75,8 @@ impl Design {
     /// across both steps, so two writes in this server cannot reload out of
     /// order; readers are blocked only for the final swap.
     pub fn write_sidecar(&self, edit: &SidecarEdit) -> anyhow::Result<String> {
+        // Keys are trimmed on both sides; see `sidecar_keys`.
+        let edit = &SidecarEdit { key: edit.key.trim(), ..*edit };
         // Before the path lookup, so "the library cannot hold refdes" is
         // what a refdes-to-library write hears, set library or not.
         edit.check()?;
@@ -104,12 +106,14 @@ impl Design {
         Ok(serde_json::to_string_pretty(&out).context("error serializing write_sidecar")?)
     }
 
-    /// The keys a component is matched on in the sidecar.
+    /// The keys a component is matched on in the sidecar. Trimmed, as the
+    /// key `write_sidecar` stores is, so an MPN with a stray space (KiCad
+    /// keeps it) still matches.
     fn sidecar_keys<'a>(comp: &'a Component) -> SidecarKeys<'a> {
         SidecarKeys {
-            refdes: &comp.refdes,
-            lib_id: &comp.lib_id,
-            mpn: comp.mpn_key(),
+            refdes: comp.refdes.trim(),
+            lib_id: comp.lib_id.trim(),
+            mpn: comp.mpn_key().trim(),
         }
     }
 

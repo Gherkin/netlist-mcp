@@ -1480,12 +1480,14 @@ impl Design {
     /// included), so a 100-pin IC shows only its pins on nets in the graph.
     ///
     /// At most `max_parts` parts are kept (issue #34): the start part first,
-    /// then series and endpoint parts by hop distance, endpoints before series
-    /// parts at the same distance. Every net a kept series part reaches comes
+    /// then series and endpoint parts by hop distance, series parts before
+    /// endpoints at the same distance, so the cap spends itself on the branch
+    /// structure before leaf ICs. Every net a kept series part reaches comes
     /// before any part one hop further, so the kept parts form a connected
     /// graph around the start. Nets are then kept only when they are the start
     /// net or sit on a pin of a kept series part, so no node hangs loose.
-    /// `truncated`, `omitted_parts` and `omitted_nets` report the cut.
+    /// `truncated`, `omitted_parts` and `omitted_nets` report the cut; each
+    /// net's own `omitted_parts` counts the cut parts with a pin on it.
     fn build_topology(
         &self,
         topo: &TopoTrace,
@@ -1499,10 +1501,10 @@ impl Design {
         // series part from its far side).
         let mut ranked: Vec<(u32, u8, usize, &'static str)> = Vec::new();
         for &(c, d) in &topo.series {
-            ranked.push((d, 1, c, "series"));
+            ranked.push((d, 0, c, "series"));
         }
         for e in endpoints {
-            ranked.push((e.distance, 0, e.comp_idx, "endpoint"));
+            ranked.push((e.distance, 1, e.comp_idx, "endpoint"));
         }
         // Stable: series keep BFS order, endpoints keep `walk`'s sort.
         ranked.sort_by_key(|&(d, r, _, _)| (d, r));
@@ -1517,8 +1519,8 @@ impl Design {
                 order.push((c, role));
             }
         }
-        let omitted_parts = order.len().saturating_sub(max_parts);
-        order.truncate(max_parts);
+        let cut = order.split_off(max_parts.min(order.len()));
+        let omitted_parts = cut.len();
 
         // Nets on a kept series part, plus the start net. Endpoint and start
         // parts add no nets: their pins are filtered to this set below.
@@ -1537,6 +1539,21 @@ impl Design {
         // it pops and every far-side net of a series part it traverses.
         let omitted_nets = topo.nets.len() - kept_nets.len();
 
+        // Per kept net: how many cut parts have a pin on it.
+        let mut cut_on_net: HashMap<usize, usize> = HashMap::new();
+        for &(c, _) in &cut {
+            let on: HashSet<usize> = self
+                .component(&CompId(c))
+                .pins
+                .iter()
+                .filter_map(|p| self.pin(p).net.as_ref().map(|n| n.0))
+                .filter(|n| kept_nets.contains(n))
+                .collect();
+            for n in on {
+                *cut_on_net.entry(n).or_default() += 1;
+            }
+        }
+
         let nets = topo
             .nets
             .iter()
@@ -1549,6 +1566,7 @@ impl Design {
                     fanout: net.pins.len(),
                     rail: score >= RAIL_THRESHOLD,
                     state: state.as_str(),
+                    omitted_parts: cut_on_net.get(idx).copied().unwrap_or(0),
                 }
             })
             .collect();
@@ -2536,6 +2554,10 @@ struct TopoNet {
     rail: bool,
     /// "expanded", "rail", "large_net", "depth_limit" or "dangling".
     state: &'static str,
+    /// Parts with a pin on this net that `max_topology_parts` cut. Above 0,
+    /// this node's edges in the graph are incomplete. Like
+    /// `Topology::truncated`, it does not count `max_endpoints` drops.
+    omitted_parts: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -5491,33 +5513,38 @@ mod walk_topology_tests {
     }
 
     /// Issue #34: `max_topology_parts` caps the graph, nearest parts first,
-    /// endpoints before series parts at the same distance. A net only cut
+    /// series parts before endpoints at the same distance. A net only cut
     /// parts reach is left out, so no node hangs loose.
     #[test]
     fn the_cap_keeps_the_nearest_parts_and_their_nets() {
         let d = fixture();
         let full = walk(&d, "/SENSIN1", 4, true);
         let all = refdes(&full);
-        assert_eq!(&all[..2], ["J2", "R11"], "{full}");
+        // R11 (series) and J2 (endpoint) both sit at distance 0.
+        assert_eq!(&all[..2], ["R11", "J2"], "{full}");
+        let sens = || {
+            vec![
+                ("/SENSIN1".to_string(), "expanded".to_string()),
+                ("/SENSMID1".to_string(), "expanded".to_string()),
+            ]
+        };
 
         let one = capped(&d, "/SENSIN1", 4, true, 1);
-        assert_eq!(refdes(&one), ["J2"]);
-        assert_eq!(nets(&one), [("/SENSIN1".into(), "expanded".into())]);
+        assert_eq!(refdes(&one), ["R11"]);
+        assert_eq!(nets(&one), sens());
         assert_eq!(one["topology"]["truncated"], true);
         assert_eq!(one["topology"]["omitted_parts"], all.len() - 1);
-        assert_eq!(one["topology"]["omitted_nets"], 2);
-        assert_eq!(pins(part(&one, "J2").unwrap()), [pn("1", "/SENSIN1")]);
+        assert_eq!(one["topology"]["omitted_nets"], 1);
+        // J2 was cut from /SENSIN1; R21, C11 and TP11 from /SENSMID1.
+        assert_eq!(one["topology"]["nets"][0]["omitted_parts"], 1, "{one}");
+        assert_eq!(one["topology"]["nets"][1]["omitted_parts"], 3, "{one}");
 
         let two = capped(&d, "/SENSIN1", 4, true, 2);
-        assert_eq!(refdes(&two), ["J2", "R11"]);
-        assert_eq!(
-            nets(&two),
-            [
-                ("/SENSIN1".into(), "expanded".into()),
-                ("/SENSMID1".into(), "expanded".into()),
-            ]
-        );
+        assert_eq!(refdes(&two), ["R11", "J2"]);
+        assert_eq!(nets(&two), sens());
+        assert_eq!(pins(part(&two, "J2").unwrap()), [pn("1", "/SENSIN1")]);
         assert_eq!(two["topology"]["omitted_nets"], 1);
+        assert_eq!(two["topology"]["nets"][0]["omitted_parts"], 0, "{two}");
 
         // The endpoint list is not touched by the topology cap.
         assert_eq!(one["endpoints"], full["endpoints"]);
@@ -5565,6 +5592,9 @@ mod walk_topology_tests {
                 assert_eq!(parts.len() + t["omitted_parts"].as_u64().unwrap() as usize, n_parts, "{ctx}");
                 assert_eq!(listed.len() + t["omitted_nets"].as_u64().unwrap() as usize, n_nets, "{ctx}");
                 assert_eq!(t["truncated"], cap < n_parts as u32, "{ctx}");
+                let net_cut: u64 =
+                    t["nets"].as_array().unwrap().iter().map(|n| n["omitted_parts"].as_u64().unwrap()).sum();
+                assert_eq!(net_cut > 0, cap < n_parts as u32, "{ctx}: per-net omitted_parts");
             }
         }
     }

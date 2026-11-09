@@ -1513,16 +1513,15 @@ impl Design {
         // and natural refdes, so the graph does not depend on that cap.
         let mut ends: Vec<(usize, u32)> = endpoints.iter().map(|e| (e.comp_idx, e.distance)).collect();
         ends.extend(topo.dropped_endpoints.iter().copied());
-        ends.sort_by(|a, b| {
-            a.1.cmp(&b.1).then_with(|| {
-                Self::pin_sort_key(&self.component(&CompId(a.0)).refdes)
-                    .cmp(&Self::pin_sort_key(&self.component(&CompId(b.0)).refdes))
-            })
+        // The part index breaks `pin_sort_key` ties (R1 vs R01), so listed
+        // parts do not sort ahead of dropped ones.
+        ends.sort_by_cached_key(|&(c, d)| {
+            (d, Self::pin_sort_key(&self.component(&CompId(c)).refdes), c)
         });
         for (c, d) in ends {
             ranked.push((d, 1, c, "endpoint"));
         }
-        // Stable: series keep BFS order, endpoints keep `walk`'s sort.
+        // Stable: series keep BFS order, endpoints keep the order above.
         ranked.sort_by_key(|&(d, r, _, _)| (d, r));
         let mut order: Vec<(usize, &'static str)> = Vec::new();
         let mut seen: HashSet<usize> = HashSet::new();
@@ -2503,8 +2502,9 @@ impl NetState {
     }
 }
 
-/// Nets (in first-seen order, with state) and series parts (in traversal
-/// order) recorded by `walk_bfs` for `build_topology`.
+/// Nets (in first-seen order, with state), series parts (in traversal
+/// order) and endpoint parts past `max_endpoints` recorded by `walk_bfs` for
+/// `build_topology`.
 /// When `record` is false (plain `walk`, `path_between`) every method is a
 /// no-op, so the default path pays nothing.
 #[derive(Debug, Default)]
@@ -5599,12 +5599,21 @@ mod walk_topology_tests {
         };
         for start in ["/SENSIN1", "GND"] {
             let full = run(start, 50, 200);
-            let n_endpoints = full["endpoints"].as_array().unwrap().len();
-            assert!(n_endpoints > 1, "{start}: fixture needs more than one endpoint");
+            let end_parts: HashSet<&str> = full["endpoints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["component"]["refdes"].as_str().unwrap())
+                .collect();
+            assert!(end_parts.len() > 1, "{start}: fixture needs more than one endpoint part");
             let one = run(start, 1, 200);
             assert_eq!(one["endpoints"].as_array().unwrap().len(), 1, "{start}");
             assert_eq!(one["truncated"], true, "{start}");
             assert_eq!(one["topology"], full["topology"], "{start}");
+            // No endpoint listed: the graph comes from dropped parts alone.
+            let none = run(start, 0, 200);
+            assert!(none["endpoints"].as_array().unwrap().is_empty(), "{start}");
+            assert_eq!(none["topology"], full["topology"], "{start}");
             // Both caps at once: the graph cap counts the dropped endpoints.
             let n_parts = refdes(&full).len();
             let both = run(start, 1, 1);

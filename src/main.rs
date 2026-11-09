@@ -319,7 +319,8 @@ impl NetlistServer {
         endpoint carries a `dnp` flag — a hop through a DNP part exists on the \
         schematic but not on the built board. include_topology adds a \
         net/part graph, capped at max_topology_parts (default 200) and not by \
-        max_endpoints; check topology.truncated.")]
+        max_endpoints; check topology.truncated. A net whose state is not \
+        expanded was not walked past, so parts beyond it are not listed.")]
     fn walk(&self, Parameters(p): Parameters<WalkParams>) -> String {
         let max_depth = p.max_depth.unwrap_or(4);
         let max_endpoints = p.max_endpoints.unwrap_or(50);

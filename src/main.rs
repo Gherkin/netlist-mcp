@@ -210,6 +210,21 @@ struct PathBetweenParams {
     max_topology_parts: Option<u32>,
 }
 
+/// `path_between` parameters for `draw_path_between`, minus
+/// `include_topology`: the drawing needs the topology, so it is always on.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DrawPathBetweenParams {
+    /// Source pin as "REFDES:PIN".
+    from: String,
+    /// Destination pin as "REFDES:PIN".
+    to: String,
+    /// Max parts drawn (default 200, minimum 2: the `from` and `to` parts
+    /// are always kept). Route parts are kept before shunts, shunts before
+    /// other ICs. The drawing says when parts were cut.
+    #[serde(default)]
+    max_topology_parts: Option<u32>,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct AuditParams {
     /// Max nets to return per category (default 100). Each category also
@@ -388,7 +403,7 @@ impl NetlistServer {
         drawing (R, C, L, FB, D as symbols, ICs and connectors as boxes, \
         rails as ground/supply symbols, DNP parts dashed). Use it when \
         showing the circuit helps the user; use `walk` for your own tracing.",
-        meta = ui::draw_walk_tool_meta())]
+        meta = ui::draw_tool_meta())]
     fn draw_walk(&self, Parameters(p): Parameters<DrawWalkParams>) -> String {
         // Same defaults and result as `walk`: only include_topology is fixed.
         self.walk(Parameters(WalkParams {
@@ -426,6 +441,26 @@ impl NetlistServer {
             Ok(out) => out,
             Err(e) => format!("error: {e:#}"),
         }
+    }
+
+    #[tool(description = "Draw the connection between two pins as a \
+        schematic for the human in the chat. Same JSON result as \
+        `path_between` with include_topology on; in clients that support \
+        MCP Apps the from→to subgraph is also shown as a drawing: the route \
+        parts (parallel routes included), shunts to a rail, and the other \
+        ICs and connectors on a route net, with both pins marked and DNP \
+        parts dashed. Use it when showing the connection helps the user; use \
+        `path_between` for your own tracing.",
+        meta = ui::draw_tool_meta())]
+    fn draw_path_between(&self, Parameters(p): Parameters<DrawPathBetweenParams>) -> String {
+        // Same defaults and result as `path_between`: only include_topology
+        // is fixed.
+        self.path_between(Parameters(PathBetweenParams {
+            from: p.from,
+            to: p.to,
+            include_topology: Some(true),
+            max_topology_parts: p.max_topology_parts,
+        }))
     }
 
     #[tool(description = "Scan the whole net graph and report FACTUAL, \
@@ -499,6 +534,8 @@ TRACE (connectivity — the point of this server):
   capped group). Cheap orientation before a walk.
 - path_between: whether two pins are connected through series parts (not across \
   rails), and the parts on the path.
+- draw_path_between: the same path, shown to the user as a drawn schematic. \
+  Listed only to clients that support MCP Apps.
 
 REVIEW (factual patterns, not verdicts):
 - audit: scans every net for FACTUAL graph patterns worth a look — unpowered \

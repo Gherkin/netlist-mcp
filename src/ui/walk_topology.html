@@ -5,9 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Walk topology</title>
 <!--
-  MCP App view for the netlist server's draw_walk tool (issue #32).
-  Reads the walk JSON (with `topology`) from ui/notifications/tool-result and
-  draws it as an SVG schematic. Self-contained on purpose: the host's default
+  MCP App view for the netlist server's draw_walk (issue #32) and
+  draw_path_between (issue #42) tools. Reads the walk or path_between JSON
+  (with `topology`, the same shape in both) from
+  ui/notifications/tool-result and draws it as an SVG schematic. Self-contained on purpose: the host's default
   CSP blocks every external origin, and this page declares none.
   Protocol: modelcontextprotocol/ext-apps specification/2026-01-26/apps.mdx.
 -->
@@ -152,7 +153,7 @@ window.addEventListener("message", (ev) => {
     case "ui/notifications/tool-input": onToolInput(m.params); break;
     case "ui/notifications/tool-result": onToolResult(m.params); break;
     case "ui/notifications/tool-cancelled":
-      showMessage("The walk was cancelled" + (m.params && m.params.reason ? ": " + m.params.reason : "."));
+      showMessage("The tool call was cancelled" +(m.params && m.params.reason ? ": " + m.params.reason : "."));
       break;
     case "ui/notifications/host-context-changed": applyHostContext(m.params); break;
   }
@@ -194,7 +195,7 @@ function reportSize() {
 
 async function start() {
   if (window.parent === window) {
-    showMessage("This page is an MCP App view. It is shown by an MCP host after a draw_walk call.");
+    showMessage("This page is an MCP App view. It is shown by an MCP host after a draw_walk or draw_path_between call.");
     return;
   }
   try {
@@ -225,6 +226,30 @@ async function start() {
 function onToolInput(params) {
   const a = (params && params.arguments) || {};
   if (a.start) showMessage("Walking from " + a.start + "…");
+  else if (a.from && a.to) showMessage("Tracing from " + a.from + " to " + a.to + "…");
+}
+
+// The net a "REFDES:PIN" handle sits on, read from the topology's parts.
+function netOfPin(topo, handle) {
+  const [ref, ...rest] = String(handle || "").split(":");
+  const pin = rest.join(":");
+  const part = (topo.parts || []).find((p) => p.refdes === ref);
+  const p = part && part.pins.find((x) => x.pin === pin);
+  return p ? p.net : null;
+}
+
+// A path_between result has `from`/`to` where a walk has `start`/`start_net`.
+// Give both one shape: `start`, `start_net`, and `marks`, the pins to
+// highlight.
+function normalize(data) {
+  if (data.from === undefined) return { ...data, path: false, marks: [data.start] };
+  return {
+    ...data,
+    path: true,
+    start: data.from,
+    start_net: netOfPin(data.topology, data.from),
+    marks: [data.from, data.to],
+  };
 }
 
 function onToolResult(res) {
@@ -239,8 +264,13 @@ function onToolResult(res) {
     }
   }
   if (res.isError) { showMessage(JSON.stringify(data, null, 2)); return; }
+  if (data && data.connected === false) {
+    showMessage(data.from + " and " + data.to + " are not connected through series parts" +
+      (data.note ? ": " + data.note : "") + ". There is nothing to draw.");
+    return;
+  }
   if (!data || !data.topology) { showMessage("The result has no topology to draw."); return; }
-  render(data);
+  render(normalize(data));
 }
 
 function showMessage(text) {
@@ -522,11 +552,12 @@ function render(data) {
   const wires = el("g", {}, svg);
   const body = el("g", {}, svg);
   const dots = el("g", {}, svg);
-  const startRef = String(data.start || "").includes(":") ? String(data.start).split(":")[0] : null;
-  const startPin = startRef ? String(data.start).split(":").slice(1).join(":") : null;
+  // Pins to highlight: the walk's start pin, or path_between's from and to.
+  const marked = new Set((data.marks || []).filter((m) => String(m || "").includes(":")).map(String));
+  const markedRefs = new Set([...marked].map((m) => m.split(":")[0]));
 
   const partGroup = (part) => {
-    const cls = [part.dnp ? "dnp" : "", part.refdes === startRef || part.role === "start" ? "start" : ""].join(" ").trim();
+    const cls = [part.dnp ? "dnp" : "", markedRefs.has(part.refdes) || part.role === "start" ? "start" : ""].join(" ").trim();
     const g = el("g", { class: cls || undefined }, body);
     title(g, partTitle(part));
     return g;
@@ -597,7 +628,7 @@ function render(data) {
         line(g, busSideX, y, tip, y);
         line(wires, tip, y, busX(e.col), y);
         addAttach(e.col, y);
-        const isStart = part.refdes === startRef && e.pin.pin === startPin;
+        const isStart = marked.has(part.refdes + ":" + e.pin.pin);
         text(g, busSideX + out * 4, y - 4, e.pin.pin, "pnum" + (isStart ? " startpin" : ""), out < 0 ? "end" : "start");
         if (e.pin.name && e.pin.name !== "~" && e.pin.name !== e.pin.pin) {
           text(g, busSideX - out * 5, y + 4, clip(e.pin.name, 13), "pname" + (isStart ? " startpin" : ""), out < 0 ? "start" : "end");
@@ -649,16 +680,19 @@ function render(data) {
   // The planned size; fitDrawing widens it to what was actually drawn.
   drawing = { svg, x1: Math.max(maxX, L.left + 120) + PAD, y1: TOP + L.rowsUsed * ROW + PAD };
   sizeTo(svg, 0, 0, drawing.x1, drawing.y1);
-  title(svg, "Walk topology from " + (data.start || ""));
+  title(svg, data.path ? "Path from " + data.from + " to " + data.to
+    : "Walk topology from " + (data.start || ""));
 
   // Header and notes.
   const topo = data.topology;
   document.getElementById("title").innerHTML = "";
   const h1 = document.getElementById("title");
-  h1.append("Walk from ");
-  const code = document.createElement("code");
-  code.textContent = data.start || "";
-  h1.append(code);
+  const code = (s) => { const c = document.createElement("code"); c.textContent = s || ""; return c; };
+  if (data.path) {
+    h1.append("Path from ", code(data.from), " to ", code(data.to));
+  } else {
+    h1.append("Walk from ", code(data.start));
+  }
   document.getElementById("counts").textContent =
     topo.parts.length + " parts · " + topo.nets.length + " nets";
   const notes = document.getElementById("notes");
@@ -670,6 +704,7 @@ function render(data) {
   }
   if (data.truncated) note("The walk hit its depth or endpoint limit. The endpoint limit cuts only the endpoint " +
     "list in the result, not the drawing. Nets marked \"depth limit\" were not walked past.");
+  if (data.path && data.note) note(data.note);
   if (!topo.parts.length) note("No parts on the walked nets.");
 
   document.getElementById("header").hidden = false;

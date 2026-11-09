@@ -175,6 +175,20 @@ wire("/SENSOUT", ("U3", "14"), ("R30", "2"))
 # An input with no driver anywhere on the net (an audit `undriven_input`).
 wire("/SENSREF", ("U3", "13"), ("C20", "2"))
 
+# path_between's from→to subgraph (issue #39): J3:1 reaches U3:1 over two
+# parallel resistors. C50 is a shunt to GND and TP51 another endpoint on the
+# route; both are kept. R52 leads to TP50 only, so it is pruned.
+comp("J3", "CONN2", "Path_Header", "/Sensor1/")
+comp("R50", "R", "100R", "/Sensor1/")
+comp("R51", "R", "100R", "/Sensor1/")
+comp("R52", "R", "1k", "/Sensor1/")
+comp("C50", "C", "100n", "/Sensor1/")
+comp("TP50", "TP", "TestPoint", "/Sensor1/")
+comp("TP51", "TP", "TestPoint", "/Sensor1/")
+wire("/PATHA", ("J3", "1"), ("R50", "1"), ("R51", "1"), ("R52", "1"))
+wire("/PATHB", ("R50", "2"), ("R51", "2"), ("C50", "1"), ("TP51", "1"), ("U3", "1"))
+wire("/PATHSTUB", ("R52", "2"), ("TP50", "1"))
+
 # Ethernet sheet: RJ45 jack, magnetics and crystal — the endpoint classes the
 # tool does not recognize (issue #13) — plus a net label containing a slash
 # (issue #16) and a genuine stub.
@@ -218,7 +232,8 @@ wire("GND", ("H2", "1"), ("TP1", "1"), ("SW1", "2"),
      ("R3", "2"), ("C11", "2"), ("C12", "2"), ("C20", "2"),
      ("R21", "2"), ("R22", "2"), ("R23", "2"),
      ("U2", "2"), ("U3", "11"), ("X1", "2"), ("X1", "4"),
-     ("C30", "2"), ("C31", "2"), ("C32", "2"), ("R40", "2"), ("TP2", "1"))
+     ("C30", "2"), ("C31", "2"), ("C32", "2"), ("R40", "2"), ("TP2", "1"),
+     ("J3", "2"), ("C50", "2"))
 
 # Every sheet in the schematic, in the order KiCad numbers them — the design
 # header's list, which is authoritative where component sheetpaths are not:

@@ -194,6 +194,20 @@ struct PathBetweenParams {
     from: String,
     /// Destination pin as "REFDES:PIN".
     to: String,
+    /// Also return a `topology` graph when connected (default false), in the
+    /// same shape as `walk`'s, pruned to the from→to subgraph: the series
+    /// parts on any route (parallel routes included), the passive branches
+    /// from a route net down to a rail (shunts), and the other ICs and
+    /// connectors on a route net. Branches that reach neither `to` nor a
+    /// rail are left out.
+    #[serde(default)]
+    include_topology: Option<bool>,
+    /// Max parts in `topology` (default 200, minimum 2: the `from` and `to`
+    /// parts are always kept). Route parts are kept before shunts, shunts
+    /// before other ICs. `topology.truncated` and the `omitted_*` counts
+    /// report the cut.
+    #[serde(default)]
+    max_topology_parts: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -399,9 +413,16 @@ impl NetlistServer {
     #[tool(description = "Report whether two pins are connected and, if so, the \
         parts on the path between them (each with a `dnp` flag — a path through \
         a DNP part is not connected on the built board). Expensive; prefer walk \
-        for open-ended tracing.")]
+        for open-ended tracing. include_topology adds the from→to subgraph \
+        with the pin and net on each side of every part, including parallel \
+        routes and shunts to a rail; check topology.truncated.")]
     fn path_between(&self, Parameters(p): Parameters<PathBetweenParams>) -> String {
-        match self.design.path_between(&p.from, &p.to) {
+        match self.design.path_between(
+            &p.from,
+            &p.to,
+            p.include_topology.unwrap_or(false),
+            p.max_topology_parts.unwrap_or(200),
+        ) {
             Ok(out) => out,
             Err(e) => format!("error: {e:#}"),
         }

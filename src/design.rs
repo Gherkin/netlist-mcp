@@ -1142,7 +1142,8 @@ impl Design {
     /// of every side (see `build_topology`). Without it the output is the flat
     /// endpoint list only, unchanged. `max_topology_parts` caps the parts in
     /// that graph, nearest first (minimum 1); it does not change `endpoints`.
-    /// Endpoint parts that `max_endpoints` dropped are not in the graph either.
+    /// `max_endpoints` caps only the `endpoints` list, not the graph: endpoint
+    /// parts it drops are still graph candidates (issue #35).
     ///
     /// The BFS core lives in `walk_bfs`, shared with `path_between`.
     pub fn walk(
@@ -1438,6 +1439,9 @@ impl Design {
                     }
                     if endpoints.len() >= max_endpoints as usize {
                         truncated = true;
+                        // Still a graph candidate (issue #35): only
+                        // `max_topology_parts` limits the graph.
+                        topo.note_dropped_endpoint(comp_id.0, depth);
                         continue;
                     }
                     endpoints.push(WalkEndpoint {
@@ -1474,7 +1478,8 @@ impl Design {
     /// Build the `walk` topology graph from what `walk_bfs` recorded. Nets are
     /// the nodes the walk touched (expanded, or stopped at). Parts are the
     /// edges: the start part, the series parts traversed (all their pins), and
-    /// the reported endpoint parts, up to the cap below. Start and endpoint
+    /// the endpoint parts the walk reached, up to the cap below. That includes
+    /// endpoint parts `max_endpoints` kept out of `endpoints` (issue #35). Start and endpoint
     /// parts list only the pins that sit on a node net (in any state, rail
     /// and depth_limit included), so a 100-pin IC shows only its pins on nets
     /// in the graph.
@@ -1503,8 +1508,19 @@ impl Design {
         for &(c, d) in &topo.series {
             ranked.push((d, 0, c, "series"));
         }
-        for e in endpoints {
-            ranked.push((e.distance, 1, e.comp_idx, "endpoint"));
+        // Endpoint parts `max_endpoints` dropped from the list are still in
+        // the graph (issue #35). Listed and dropped sort together by distance
+        // and natural refdes, so the graph does not depend on that cap.
+        let mut ends: Vec<(usize, u32)> = endpoints.iter().map(|e| (e.comp_idx, e.distance)).collect();
+        ends.extend(topo.dropped_endpoints.iter().copied());
+        ends.sort_by(|a, b| {
+            a.1.cmp(&b.1).then_with(|| {
+                Self::pin_sort_key(&self.component(&CompId(a.0)).refdes)
+                    .cmp(&Self::pin_sort_key(&self.component(&CompId(b.0)).refdes))
+            })
+        });
+        for (c, d) in ends {
+            ranked.push((d, 1, c, "endpoint"));
         }
         // Stable: series keep BFS order, endpoints keep `walk`'s sort.
         ranked.sort_by_key(|&(d, r, _, _)| (d, r));
@@ -2499,6 +2515,9 @@ struct TopoTrace {
     net_pos: HashMap<usize, usize>,
     /// (series part, depth of the net it was traversed from).
     series: Vec<(usize, u32)>,
+    /// (endpoint part, depth) for endpoint pins past `max_endpoints`, in
+    /// BFS order. A part can appear more than once.
+    dropped_endpoints: Vec<(usize, u32)>,
 }
 
 impl TopoTrace {
@@ -2529,6 +2548,12 @@ impl TopoTrace {
             self.series.push((comp_idx, depth));
         }
     }
+
+    fn note_dropped_endpoint(&mut self, comp_idx: usize, depth: u32) {
+        if self.record {
+            self.dropped_endpoints.push((comp_idx, depth));
+        }
+    }
 }
 
 /// The `walk` topology graph (`include_topology`): nets are nodes, parts are
@@ -2537,8 +2562,9 @@ impl TopoTrace {
 struct Topology {
     /// True when `max_topology_parts` cut parts from the graph. Separate from
     /// the top-level `truncated`, which the depth and endpoint limits set.
-    /// False does not mean complete: endpoint parts that `max_endpoints`
-    /// dropped are missing from the graph and not counted here (issue #35).
+    /// `max_endpoints` does not cut the graph (issue #35), so false means
+    /// every part the walk reached is listed. Parts past the depth limit or a
+    /// rail were never reached and are not counted.
     truncated: bool,
     /// Parts the walk reached but the cap left out.
     omitted_parts: usize,
@@ -2557,9 +2583,8 @@ struct TopoNet {
     /// "expanded", "rail", "large_net", "depth_limit" or "dangling".
     state: &'static str,
     /// Parts with a pin on this net that `max_topology_parts` cut. Above 0,
-    /// this node's edges in the graph are incomplete. Like
-    /// `Topology::truncated`, it does not count `max_endpoints` drops.
-    /// Left out when 0. Absent does not mean complete: a node whose `state`
+    /// this node's edges in the graph are incomplete. `max_endpoints` cuts
+    /// nothing here (issue #35). Left out when 0. Absent does not mean complete: a node whose `state`
     /// is not "expanded" was never walked past, so its other members are
     /// not listed either way.
     #[serde(skip_serializing_if = "is_zero")]
@@ -2577,7 +2602,8 @@ struct TopoPart {
     class: String,
     dnp: bool,
     /// "start" (the part owning the start pin), "series" (a traversed
-    /// passthrough) or "endpoint" (a reported endpoint).
+    /// passthrough) or "endpoint" (an endpoint part the walk reached, listed
+    /// in `endpoints` or not).
     role: &'static str,
     /// Series parts list every pin; start and endpoint parts only the pins on
     /// a net in `nets`.
@@ -5559,6 +5585,32 @@ mod walk_topology_tests {
 
         // The endpoint list is not touched by the topology cap.
         assert_eq!(one["endpoints"], full["endpoints"]);
+    }
+
+    /// Issue #35: `max_endpoints` caps the `endpoints` list only. The graph
+    /// is the same as with no endpoint cap, so an "expanded" net lists every
+    /// part on it, and `max_topology_parts` still applies on top.
+    #[test]
+    fn max_endpoints_does_not_cut_the_graph() {
+        let d = fixture();
+        let run = |start: &str, max_endpoints: u32, max_parts: u32| -> serde_json::Value {
+            let json = d.walk(start, 4, max_endpoints, true, true, max_parts).expect("walk");
+            serde_json::from_str(&json).expect("valid JSON")
+        };
+        for start in ["/SENSIN1", "GND"] {
+            let full = run(start, 50, 200);
+            let n_endpoints = full["endpoints"].as_array().unwrap().len();
+            assert!(n_endpoints > 1, "{start}: fixture needs more than one endpoint");
+            let one = run(start, 1, 200);
+            assert_eq!(one["endpoints"].as_array().unwrap().len(), 1, "{start}");
+            assert_eq!(one["truncated"], true, "{start}");
+            assert_eq!(one["topology"], full["topology"], "{start}");
+            // Both caps at once: the graph cap counts the dropped endpoints.
+            let n_parts = refdes(&full).len();
+            let both = run(start, 1, 1);
+            assert_eq!(refdes(&both).len(), 1, "{start}");
+            assert_eq!(both["topology"]["omitted_parts"], n_parts - 1, "{start}");
+        }
     }
 
     /// The start part is kept first, whatever the cap (0 is read as 1).

@@ -39,14 +39,18 @@ impl Scanner<'_> {
         };
         // Dont push it to skip quotes
 
+        // A file cut off while KiCad is still writing it most likely ends
+        // inside a quoted string, so say so (#58).
+        const EOF_IN_STRING: &str =
+            "unexpected end of netlist inside a quoted string (truncated file?)";
         loop {
             let Some((_, chr)) = self.iter.next() else {
-                return Some(Err(anyhow!("reached EOF in the middle of string!")));
+                return Some(Err(anyhow!(EOF_IN_STRING)));
             };
             match chr {
                 '\\' => {
                     let Some((_, esc)) = self.iter.next() else {
-                        return Some(Err(anyhow!("reached EOF in the middle of string!")));
+                        return Some(Err(anyhow!(EOF_IN_STRING)));
                     };
                     buf.push(esc);
                 },

@@ -25,15 +25,20 @@ fn load_netlist(path: &Path) -> anyhow::Result<String> {
         .with_context(|| format!("netlist {}: cannot read", shown_path(path)))
 }
 
+/// Issue #58: a netlist that does not parse is an error naming the path too.
+fn read_netlist(path: &Path) -> anyhow::Result<parser::netlist::Netlist> {
+    let data = load_netlist(path)?;
+    parser::kicad_parser::parse_netlist(&data)
+        .with_context(|| format!("netlist {}: cannot parse", shown_path(path)))
+}
+
 fn load_design() -> anyhow::Result<Design> {
     let args: Vec<std::ffi::OsString> = env::args_os().collect();
     if args.len() != 2 {
         bail!("usage: kicad-netlist-parser <netlist.net>")
     }
     let path = Path::new(&args[1]);
-    let data = load_netlist(path)?;
-    let netlist = parser::kicad_parser::parse_netlist(&data)
-        .with_context(|| format!("netlist {}: cannot parse", shown_path(path)))?;
+    let netlist = read_netlist(path)?;
     let mut design = design::Design::from_netlist(netlist)
         .with_context(|| format!("netlist {}: cannot parse", shown_path(path)))?;
     // Issue #46: optional enrichment files. A missing project file is
@@ -664,6 +669,19 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("tests"), "path missing from error: {msg}");
         assert!(msg.contains("cannot read"), "unexpected error: {msg}");
+    }
+
+    /// Issue #58: an empty netlist is a parse error naming the path, not a panic.
+    #[test]
+    fn empty_netlist_is_an_error_naming_the_path() {
+        let path = std::env::temp_dir().join(format!("netlist-mcp-empty-{}.net", std::process::id()));
+        fs::write(&path, "").unwrap();
+        let res = read_netlist(&path);
+        fs::remove_file(&path).unwrap();
+        let msg = format!("{:#}", res.expect_err("empty file must be an error"));
+        assert!(msg.contains(&path.display().to_string()), "path missing from error: {msg}");
+        assert!(msg.contains("cannot parse"), "unexpected error: {msg}");
+        assert!(msg.contains("netlist is empty"), "unexpected error: {msg}");
     }
 
     /// The real tool list, not a hand-built one: both drawing tools carry the

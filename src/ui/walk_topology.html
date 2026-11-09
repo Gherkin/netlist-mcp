@@ -163,9 +163,13 @@ function applyHostContext(ctx) {
   if (vars) for (const [k, v] of Object.entries(vars)) if (v) root.style.setProperty(k, v);
   const fonts = ctx.styles && ctx.styles.css && ctx.styles.css.fonts;
   if (fonts) {
-    const s = document.createElement("style");
+    let s = document.getElementById("host-fonts");
+    if (!s) {
+      s = document.createElement("style");
+      s.id = "host-fonts";
+      document.head.appendChild(s);
+    }
     s.textContent = fonts;
-    document.head.appendChild(s);
   }
 }
 
@@ -375,7 +379,8 @@ function layout(data) {
   const rowsUsed = Math.max(1, ...[...cursor.values()]);
   const hasLeft = items.some((it) => it.gap === -1);
   // Room left of the first bus for its boxes and their outer rail labels.
-  const left = hasLeft ? 270 : 40;
+  // A mirrored box's rail names end at left - 191 and can be ~93px long.
+  const left = hasLeft ? 290 : 40;
   return { order, col, netByName, items, rowsUsed, left, startNet };
 }
 
@@ -535,6 +540,7 @@ function render(data) {
       line(g, x, y0, x + 34, y0);
       el("circle", { class: "sym", cx: x + 38, cy: y0, r: 4 }, g);
       text(g, x + 46, y0 + 4, partLabel(it.part), "ref");
+      maxX = Math.max(maxX, x + 110);
       addAttach(it.end.col, y0);
     } else if (it.type === "bank") {
       const g0 = it.gap;
@@ -551,7 +557,9 @@ function render(data) {
         if (it.free) terminal(g, x, y0, sh.top, "up");
         const s = el("g", { transform: `translate(${x},${y0 + 6}) rotate(90)` }, g);
         line(g, x, y0, x, y0 + 6);
-        symbol(s, sh.part.class, isCathode(sh.bot.pin));
+        // An endpoint diode lists only its pins on walked nets, so the bottom
+        // pin can be missing: then orient by the pin on the bus.
+        symbol(s, sh.part.class, sh.bot.pin ? isCathode(sh.bot.pin) : !isCathode(sh.top.pin));
         const yb = y0 + 6 + SYMLEN;
         terminal(g, x, yb, sh.bot, "down");
         text(g, x + 14, y0 + 26, partLabel(sh.part), "ref");
@@ -601,7 +609,8 @@ function render(data) {
           text(g, otherSideX + out * 5, y + 4, pins.length + " pins", "pname", out < 0 ? "end" : "start");
         }
       });
-      maxX = Math.max(maxX, bx + BOXW + 60);
+      // Room for a rail name after the pin stub: 14 mono chars at 11px.
+      maxX = Math.max(maxX, bx + BOXW + 120);
     }
   }
 
@@ -651,7 +660,8 @@ function render(data) {
     note("Drawing cut by max_topology_parts: " + topo.omitted_parts + " parts and " +
       topo.omitted_nets + " nets left out.");
   }
-  if (data.truncated) note("The walk hit its depth or endpoint limit. Nets marked \"depth limit\" were not walked past.");
+  if (data.truncated) note("The walk hit its depth or endpoint limit. The endpoint list in the result may be cut; " +
+    "the drawing is not. Nets marked \"depth limit\" were not walked past.");
   if (!topo.parts.length) note("No parts on the walked nets.");
 
   document.getElementById("header").hidden = false;

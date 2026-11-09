@@ -377,17 +377,15 @@ impl NetlistServer {
         In clients without MCP Apps it is just `walk` with the topology.",
         meta = ui::draw_walk_tool_meta())]
     fn draw_walk(&self, Parameters(p): Parameters<DrawWalkParams>) -> String {
-        match self.design.walk(
-            &p.start,
-            p.max_depth.unwrap_or(4),
-            p.max_endpoints.unwrap_or(50),
-            p.stop_at_power.unwrap_or(true),
-            true,
-            p.max_topology_parts.unwrap_or(200),
-        ) {
-            Ok(out) => out,
-            Err(e) => format!("error: {e:#}"),
-        }
+        // Same defaults and result as `walk`: only include_topology is fixed.
+        self.walk(Parameters(WalkParams {
+            start: p.start,
+            max_depth: p.max_depth,
+            max_endpoints: p.max_endpoints,
+            stop_at_power: p.stop_at_power,
+            include_topology: Some(true),
+            max_topology_parts: p.max_topology_parts,
+        }))
     }
 
     #[tool(description = "List the components one hop away from a component — \

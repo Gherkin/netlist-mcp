@@ -4632,6 +4632,28 @@ mod value_norm_tests {
         assert!(presence_flag(&props, "dnp"));
         assert!(!presence_flag(&props, "exclude_from_bom"));
     }
+
+    /// Every bead value string quoted in the review of PR #27, pinned to its
+    /// agreed reading. A rule change that moves any of them fails here, before
+    /// a push, rather than in the next review round. See the file's header
+    /// for how a row may change.
+    #[test]
+    fn bead_corpus_reads_as_agreed() {
+        let corpus = include_str!("../tests/bead_corpus.tsv");
+        let mut wrong = Vec::new();
+        let mut rows = 0;
+        for line in corpus.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
+            let (raw, want) = line.split_once('\t').unwrap_or_else(|| panic!("no tab in corpus row {line:?}"));
+            let want = (want != "null").then_some(want);
+            let got = normalize_value(raw, "FB").map(|v| v.canonical);
+            if got.as_deref() != want {
+                wrong.push(format!("{raw:?}: want {want:?}, got {got:?}"));
+            }
+            rows += 1;
+        }
+        assert!(rows > 0, "empty corpus");
+        assert!(wrong.is_empty(), "{} of {rows} corpus rows changed:\n{}", wrong.len(), wrong.join("\n"));
+    }
 }
 
 #[cfg(test)]

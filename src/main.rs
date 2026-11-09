@@ -136,7 +136,7 @@ struct WalkParams {
     /// Max passthrough hops before a branch is cut (default 4).
     #[serde(default)]
     max_depth: Option<u32>,
-    /// Max endpoints to return (default 50).
+    /// Max endpoints to return (default 50). Does not cap `topology`.
     #[serde(default)]
     max_endpoints: Option<u32>,
     /// Stop at power/ground rails instead of enumerating them (default true).
@@ -318,9 +318,9 @@ impl NetlistServer {
         'what is actually connected to this?' tool. Every traversed part and \
         endpoint carries a `dnp` flag — a hop through a DNP part exists on the \
         schematic but not on the built board. include_topology adds a \
-        net/part graph, capped at max_topology_parts (default 200); check \
-        topology.truncated, and also the top-level truncated: endpoint parts \
-        that max_endpoints dropped are missing from the graph too.")]
+        net/part graph, capped at max_topology_parts (default 200) and not by \
+        max_endpoints; check topology.truncated. A net whose state is not \
+        expanded was not walked past, so parts beyond it are not listed.")]
     fn walk(&self, Parameters(p): Parameters<WalkParams>) -> String {
         let max_depth = p.max_depth.unwrap_or(4);
         let max_endpoints = p.max_endpoints.unwrap_or(50);

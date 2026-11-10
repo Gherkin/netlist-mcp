@@ -470,7 +470,7 @@ impl NetlistServer {
         schematic but not on the built board. include_topology adds a \
         net/part graph, capped at max_topology_parts (default 200) and not by \
         max_endpoints; check topology.truncated. A net whose state is not \
-        expanded or past_through was not walked past, so parts beyond it are not listed. \
+        expanded was not walked past, so parts beyond it are not listed. \
         A part with a sidecar through-model (`through` pin pairs, e.g. an \
         op-amp channel or a choke winding) is crossed too, either way: its \
         `via` entry names the `pins` crossed and the `pair`, `against` when \
@@ -484,9 +484,12 @@ impl NetlistServer {
         one hop of distance and depth. From a pin, the \
         start part's pairs on the start net are crossed too. At equal depth \
         a route through plain series parts is taken before one through such \
-        a part. The topology graph stops at such a part and lists it in \
-        through_not_drawn (the start part too, once one of its pairs is crossed); a drawn net first walked past one is \
-        in state past_through, and its parts are not drawn.")]
+        a part. In the topology graph each crossed pair is its own part with \
+        role through and a `pair` object (`pins` as declared, input first; \
+        `conditional` and `gate` for a gate-controlled pair); it lists only \
+        the pair's pins and gate, and the graph goes on past it. A pin on \
+        such a pair is left off its part's other entry, which is dropped when \
+        it has no pin left on a drawn net that is not a rail.")]
     fn walk(&self, Parameters(p): Parameters<WalkParams>) -> String {
         let max_depth = p.max_depth.unwrap_or(4);
         let max_endpoints = p.max_endpoints.unwrap_or(50);

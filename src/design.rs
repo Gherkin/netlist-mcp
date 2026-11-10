@@ -98,7 +98,9 @@ const PASSIVE_PAIR: usize = usize::MAX;
 /// The restriction set of a walk route: every (part, pin) its via came out
 /// of a pair on that is not `chain`, sorted. The route never crosses that
 /// part's pairs from that pin (a mux's COM->NO1 and COM->NO2 never join NO1
-/// to NO2), however it got back to the pin's net.
+/// to NO2). On the net it came out on, `is_restricted` stops it. It never
+/// gets back to that net later: its set only grows, so `walk_bfs` drops any
+/// arrival at a net already expanded under a subset of it.
 fn restrictions(via: &[Hop], through: &ThroughModels) -> Vec<(usize, usize)> {
     let mut r: Vec<(usize, usize)> = via
         .iter()
@@ -1558,7 +1560,8 @@ impl Design {
         // for a through-model part, so crossing one channel of a quad op-amp
         // leaves the other three open (issue #47). Routes under different
         // restrictions do not use up each other's parts, so which one is
-        // queued first does not decide what is found.
+        // queued first does not decide which parts are crossed. (It still
+        // decides whether an exit pin is an endpoint; see `endpoint_seen`.)
         let mut layers: HashMap<Vec<(usize, usize)>, HashSet<(usize, usize)>> = HashMap::new();
         // Net -> the restriction sets it was expanded under. A route is
         // dropped when one of them is a subset of its own.
@@ -1567,7 +1570,9 @@ impl Design {
         // reached across the same part under two restriction sets is listed
         // once.
         let mut rail_seen: HashSet<(usize, usize, usize)> = HashSet::new();
-        let mut crossed: Vec<CrossedPin> = Vec::new();
+        // Far pin -> the shortest crossing that came out there. A pair can be
+        // crossed once per restriction set, so keep one entry per pin.
+        let mut crossed: HashMap<String, CrossedPin> = HashMap::new();
         let mut endpoint_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut dead_end_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1776,6 +1781,10 @@ impl Design {
                 // are crossed only when that pair sets `chain`.
                 let exit = Some(pin_id.0) == exit_pin;
                 let blocked = is_restricted(&restrict, comp_id.0, pin_id.0);
+                // A route never gets back to a net it expanded (its set only
+                // grows, so `expanded` drops it), so only the pin it just
+                // came out on can be restricted.
+                debug_assert_eq!(blocked, exit && !via.last().is_some_and(|h| hop_chains(through, h)));
 
                 let comp = self.component(comp_id);
                 let class = Self::refdes_class(&comp.refdes);
@@ -1833,9 +1842,9 @@ impl Design {
                         else {
                             return Vec::new();
                         };
-                        if is_restricted(&restrict, comp_id.0, p.0) {
-                            return Vec::new();
-                        }
+                        // `p` is NC or alone on its net, so no queued route
+                        // came out onto it: never restricted.
+                        debug_assert!(!is_restricted(&restrict, comp_id.0, p.0));
                         pairs_on(pairs, comp_id.0, p.0, visited_comps)
                             .into_iter()
                             .map(|(far, h)| (Some(far), extend(&via_here, h)))
@@ -1894,11 +1903,17 @@ impl Design {
                             return;
                         }
                         if let (Some(_), Some(p)) = (hop.cross, other_pin_id) {
-                            crossed.push(CrossedPin {
-                                pin: self.pin_name(p),
-                                via: self.via_parts(&via_here, through),
-                                distance: dist,
-                            });
+                            let pin = self.pin_name(p);
+                            if crossed.get(&pin).is_none_or(|c| dist < c.distance) {
+                                crossed.insert(
+                                    pin.clone(),
+                                    CrossedPin {
+                                        pin,
+                                        via: self.via_parts(&via_here, through),
+                                        distance: dist,
+                                    },
+                                );
+                            }
                         }
                     };
                     let other_net = self.net(&NetId(other_net_idx));
@@ -1985,7 +2000,7 @@ impl Design {
         }
 
         WalkData {
-            crossed,
+            crossed: crossed.into_values().collect(),
             endpoints,
             rails_reached,
             large_nets,

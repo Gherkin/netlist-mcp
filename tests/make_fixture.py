@@ -80,6 +80,13 @@ LIBPARTS = {
     "NMOS":    ("Device", "Q_NMOS_GSD", "N-channel MOSFET", [
                     ("1", "G", "input"), ("2", "S", "passive"), ("3", "D", "passive")]),
     "SW":      ("Switch", "SW_Push", "Push button", [("1", "1", "passive"), ("2", "2", "passive")]),
+    # A 4-pin `L`: an endpoint, not a passthrough, unless the sidecar
+    # declares its windings (issue #44, #47).
+    "CMC":     ("Device", "L_CMC", "Common mode choke", [
+                    ("1", "1", "passive"), ("2", "2", "passive"),
+                    ("3", "3", "passive"), ("4", "4", "passive")]),
+    "XCVR":    ("Interface", "CAN_Transceiver", "CAN transceiver", [
+                    ("6", "CANL", "bidirectional"), ("7", "CANH", "bidirectional")]),
 }
 
 # KiCad symbols carry keywords distinct from the description, and the two are
@@ -93,6 +100,7 @@ KEYWORDS = {
     "MAGS": "ethernet magnetics transformer", "XTAL": "crystal resonator",
     "CONN2": "connector header", "DIODE": "diode schottky rectifier",
     "NMOS": "mosfet nmos transistor", "SW": "switch button",
+    "CMC": "common mode choke filter", "XCVR": "can transceiver bus",
 }
 
 # --- components ----------------------------------------------------------
@@ -109,13 +117,29 @@ MPN = {"Q1": "2N7002-7-F"}
 # The enrichment sidecar next to fixture.net (issue #46), written as
 # fixture.sidecar.json. Covers each scope, the precedence order, the MPN
 # property winning over value, and a key that matches no component.
+#
+# Through-models (issue #47): U3's four channels (channel A names pin 3,
+# which the fixture leaves off U3, so get_component warns and A is not
+# crossed), Q1's drain-source (gate-controlled, so conditional) and L2's two
+# windings.
 SIDECAR = {
     "lib_id": {
         "Amplifier:TLV9004": {"channels": 4, "note": "from lib_id"},
     },
     "mpn": {
-        "TLV9004": {"note": "from mpn", "family": "TLV900x"},
-        "2N7002-7-F": {"note": "matched by the MPN property"},
+        "TLV9004": {"note": "from mpn", "family": "TLV900x", "through": [
+            {"name": "A", "pins": ["3", "1"]},
+            {"name": "B", "pins": ["5", "7"]},
+            {"name": "C", "pins": ["10", "8"]},
+            {"name": "D", "pins": ["12", "14"]},
+        ]},
+        "2N7002-7-F": {"note": "matched by the MPN property", "through": [
+            {"pins": ["3", "2"], "gate": "1"},
+        ]},
+        "CMC-FIXTURE": {"through": [
+            {"name": "1", "pins": ["1", "2"]},
+            {"name": "2", "pins": ["4", "3"]},
+        ]},
         # Q1's value: must NOT match, since Q1 has an MPN property.
         "2N7002": {"note": "should never match"},
         "NOT-IN-DESIGN": {"note": "unmatched"},
@@ -222,6 +246,18 @@ wire("/PATHB", ("R50", "2"), ("R51", "2"), ("C50", "1"), ("TP51", "1"), ("U3", "
 wire("/PATHSTUB", ("R52", "2"), ("TP50", "1"))
 wire("/PATHC", ("R53", "2"), ("C51", "1"), ("TP52", "1"))
 
+# A buffer chain through two channels of the same quad op-amp (issue #47):
+# J4:1 -> U3 channel B -> R60/C60 RC -> U3 channel C -> TP60. Crossing B must
+# not block C.
+comp("J4", "CONN2", "Buffer_Header", "/Sensor1/")
+comp("R60", "R", "1k", "/Sensor1/")
+comp("C60", "C", "10n", "/Sensor1/")
+comp("TP60", "TP", "TestPoint", "/Sensor1/")
+wire("/BUFIN", ("J4", "1"), ("U3", "5"))
+wire("/BUFMID", ("U3", "7"), ("R60", "1"))
+wire("/BUFRC", ("R60", "2"), ("C60", "1"), ("U3", "10"))
+wire("/BUFOUT", ("U3", "8"), ("TP60", "1"))
+
 # Ethernet sheet: RJ45 jack, magnetics and crystal — the endpoint classes the
 # tool does not recognize (issue #13) — plus a net label containing a slash
 # (issue #16) and a genuine stub.
@@ -257,6 +293,17 @@ wire("/Ethernet/XTAL2", ("U2", "6"), ("X1", "3"), ("C31", "1"))
 wire("/Ethernet/MODE0", ("U2", "4"), ("R41", "1"))
 wire("Net-(R41-Pad2)", ("R41", "2"))                        # single-pin net
 
+# A common-mode choke between a CAN transceiver and its connector (issue
+# #44): path_between U4:7 -> J5:1 stops at L2 unless the sidecar declares
+# its windings (issue #47).
+comp("U4", "XCVR", "CANXCVR", "/Ethernet/")
+comp("L2", "CMC", "CMC-FIXTURE", "/Ethernet/")
+comp("J5", "CONN2", "CAN_Header", "/Ethernet/")
+wire("/CANH", ("U4", "7"), ("L2", "1"))
+wire("/CANL", ("U4", "6"), ("L2", "4"))
+wire("/CANH_J", ("L2", "2"), ("J5", "1"))
+wire("/CANL_J", ("L2", "3"), ("J5", "2"))
+
 # GND touches every sheet, so a subsystem filter matches it everywhere
 # (issue #4).
 wire("GND", ("H2", "1"), ("TP1", "1"), ("SW1", "2"),
@@ -266,7 +313,7 @@ wire("GND", ("H2", "1"), ("TP1", "1"), ("SW1", "2"),
      ("R21", "2"), ("R22", "2"), ("R23", "2"),
      ("U2", "2"), ("U3", "11"), ("X1", "2"), ("X1", "4"),
      ("C30", "2"), ("C31", "2"), ("C32", "2"), ("R40", "2"), ("TP2", "1"),
-     ("J3", "2"), ("C50", "2"), ("C51", "2"))
+     ("J3", "2"), ("C50", "2"), ("C51", "2"), ("C60", "2"), ("J4", "2"))
 
 # Every sheet in the schematic, in the order KiCad numbers them — the design
 # header's list, which is authoritative where component sheetpaths are not:

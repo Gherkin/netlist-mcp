@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context};
 
-use design::Design;
+use design::{Design, DEFAULT_MAX_NET_EXPANSIONS};
 
 mod parser;
 mod design;
@@ -155,6 +155,23 @@ struct GetPinParams {
     pin: String,
 }
 
+/// The `max_net_expansions` parameter doc, shared by the four walk tools.
+macro_rules! max_net_expansions_doc {
+    () => {
+        "Max restriction sets kept per net (default 8, minimum 1; 0 is read \
+        as 1). Only matters with sidecar through-models. A route's \
+        restriction set is the through-model pins it came out of a \
+        non-`chain` pair on; it never crosses that part's pairs from them \
+        again. A net reached under different sets is walked once per set, \
+        and this caps the sets kept so the call stays fast. A route whose \
+        set is a strict subset of a kept set is still walked, so a net can \
+        be walked more times than this. Other routes past the cap are \
+        dropped, so an endpoint or path can be missing or longer; raise it \
+        to search further. walk sets `truncated` and `expansions_capped`; \
+        path_between says so in its `note`."
+    };
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct WalkParams {
     /// Start point: a pin "REFDES:PIN" or a net name.
@@ -185,6 +202,9 @@ struct WalkParams {
     /// own `omitted_parts` counts the cut parts on it (left out when 0).
     #[serde(default)]
     max_topology_parts: Option<u32>,
+    #[doc = max_net_expansions_doc!()]
+    #[serde(default)]
+    max_net_expansions: Option<u32>,
 }
 
 /// `walk` parameters for `draw_walk`, minus `include_topology`: the drawing
@@ -207,6 +227,9 @@ struct DrawWalkParams {
     /// the start first. The drawing says when parts were cut.
     #[serde(default)]
     max_topology_parts: Option<u32>,
+    #[doc = max_net_expansions_doc!()]
+    #[serde(default)]
+    max_net_expansions: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -236,6 +259,9 @@ struct PathBetweenParams {
     /// report the cut.
     #[serde(default)]
     max_topology_parts: Option<u32>,
+    #[doc = max_net_expansions_doc!()]
+    #[serde(default)]
+    max_net_expansions: Option<u32>,
 }
 
 /// `path_between` parameters for `draw_path_between`, minus
@@ -251,6 +277,9 @@ struct DrawPathBetweenParams {
     /// other ICs. The drawing says when parts were cut.
     #[serde(default)]
     max_topology_parts: Option<u32>,
+    #[doc = max_net_expansions_doc!()]
+    #[serde(default)]
+    max_net_expansions: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -441,7 +470,23 @@ impl NetlistServer {
         schematic but not on the built board. include_topology adds a \
         net/part graph, capped at max_topology_parts (default 200) and not by \
         max_endpoints; check topology.truncated. A net whose state is not \
-        expanded was not walked past, so parts beyond it are not listed.")]
+        expanded or past_through was not walked past, so parts beyond it are not listed. \
+        A part with a sidecar through-model (`through` pin pairs, e.g. an \
+        op-amp channel or a choke winding) is crossed too, either way: its \
+        `via` entry names the `pins` crossed and the `pair`, `against` when \
+        crossed second pin to first, and `conditional` with its `gate` for a \
+        gate-controlled pair (not a plain wire). Its entry pin is still an \
+        endpoint; the pin the walk comes out on is not. The walk does not \
+        re-enter the part from that pin on that route, also after going \
+        round (a mux's NO1->COM->NO2 is no path), unless the pair it came \
+        out of has `chain`: true; a different route into that net may still \
+        cross the part from that pin, which stays no endpoint. Each pair crossed is \
+        one hop of distance and depth. From a pin, the \
+        start part's pairs on the start net are crossed too. At equal depth \
+        a route through plain series parts is taken before one through such \
+        a part. The topology graph stops at such a part and lists it in \
+        through_not_drawn (the start part too, once one of its pairs is crossed); a drawn net first walked past one is \
+        in state past_through, and its parts are not drawn.")]
     fn walk(&self, Parameters(p): Parameters<WalkParams>) -> String {
         let max_depth = p.max_depth.unwrap_or(4);
         let max_endpoints = p.max_endpoints.unwrap_or(50);
@@ -455,6 +500,7 @@ impl NetlistServer {
             stop_at_power,
             include_topology,
             max_topology_parts,
+            p.max_net_expansions.unwrap_or(DEFAULT_MAX_NET_EXPANSIONS),
         ) {
             Ok(out) => out,
             Err(e) => format!("error: {e:#}"),
@@ -477,6 +523,7 @@ impl NetlistServer {
             stop_at_power: p.stop_at_power,
             include_topology: Some(true),
             max_topology_parts: p.max_topology_parts,
+            max_net_expansions: p.max_net_expansions,
         }))
     }
 
@@ -494,13 +541,16 @@ impl NetlistServer {
         a DNP part is not connected on the built board). Expensive; prefer walk \
         for open-ended tracing. include_topology adds the from→to subgraph \
         with the pin and net on each side of every part, including parallel \
-        routes and shunts to a rail; check topology.truncated.")]
+        routes and shunts to a rail; check topology.truncated. Crosses \
+        sidecar through-models as walk does; check `conditional` on each \
+        via entry.")]
     fn path_between(&self, Parameters(p): Parameters<PathBetweenParams>) -> String {
         match self.design.path_between(
             &p.from,
             &p.to,
             p.include_topology.unwrap_or(false),
             p.max_topology_parts.unwrap_or(200),
+            p.max_net_expansions.unwrap_or(DEFAULT_MAX_NET_EXPANSIONS),
         ) {
             Ok(out) => out,
             Err(e) => format!("error: {e:#}"),
@@ -524,6 +574,7 @@ impl NetlistServer {
             to: p.to,
             include_topology: Some(true),
             max_topology_parts: p.max_topology_parts,
+            max_net_expansions: p.max_net_expansions,
         }))
     }
 
@@ -619,7 +670,10 @@ TRACE (connectivity — the point of this server):
 - walk: THE tool for \"what is actually connected to this pin?\". From a pin or \
   net it passes THROUGH series parts (resistors, inductors, ferrites, caps) to \
   the real endpoints (ICs, connectors), and stops at power/ground rails instead \
-  of enumerating them. Topological, not electrical.
+  of enumerating them. Topological, not electrical. It also crosses a part \
+  whose sidecar entry declares `through` pin pairs (an op-amp channel, a \
+  choke winding, a MOSFET's source-drain); the `via` entry names the pins \
+  crossed and marks a gate-controlled pair `conditional`.
 - draw_walk: the same walk, shown to the user as a drawn schematic. Listed \
   only to clients that support MCP Apps. Use it when a picture of the circuit \
   helps the user.
@@ -640,7 +694,10 @@ ENRICH (the one tool that writes):
 - write_sidecar: set or remove the facts the netlist lacks (through-models, \
   pin roles, notes) for a part kind (lib_id / mpn) or one refdes. It writes \
   a JSON sidecar file, never the netlist; get_component shows the result. \
-  Every other tool only reads.
+  Every other tool only reads. A through-model is the field `through`: a list \
+  of {\"pins\": [\"<in>\", \"<out>\"], \"name\"?: \"A\", \"gate\"?: \"<pin>\", \"chain\"?: true}. \
+  walk and path_between use it at once; get_component's through_warnings \
+  lists pairs skipped for naming a pin or gate the part does not have.
 
 DNP: every component identity carries a `dnp` boolean — get_component, \
 get_pin's owning component, filter/find rows, get_net members, neighbors (the \

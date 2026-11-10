@@ -713,6 +713,7 @@ function render(data) {
     else if (n.state === "depth_limit") notes.push("depth limit");
     else if (n.state === "dangling") notes.push("dangling");
     else if (n.state === "rail") notes.push("rail");
+    else if (n.state === "past_through") notes.push("reached past a through part, parts not drawn");
     if (n.omitted_parts) notes.push("+" + n.omitted_parts + " parts cut");
     if (notes.length) text(g, x, TOP - 33, notes.join(", "), "note", "middle");
     if (n.state !== "expanded") line(g, x, yBot, x, yBot + 14, "bus cont");
@@ -744,8 +745,13 @@ function render(data) {
     note("Drawing cut by max_topology_parts: " + topo.omitted_parts + " parts and " +
       topo.omitted_nets + " nets left out.");
   }
-  if (data.truncated) note("The walk hit its depth or endpoint limit. The endpoint limit cuts only the endpoint " +
+  // `truncated` is also set by max_net_expansions; then the depth or
+  // endpoint limit may or may not have been hit too.
+  if (data.truncated) note((data.expansions_capped ? "The walk may also have hit" : "The walk hit") +
+    " its depth or endpoint limit. The endpoint limit cuts only the endpoint " +
     "list in the result, not the drawing. Nets marked \"depth limit\" were not walked past.");
+  if (data.expansions_capped) note("Routes past through-model parts were dropped at max_net_expansions, " +
+    "so an endpoint can be missing.");
   if (data.path && data.note) note(data.note);
   if (!topo.parts.length) note("No parts to draw.");
 

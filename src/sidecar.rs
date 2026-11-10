@@ -32,7 +32,10 @@
 //!
 //! `pins` is two pin numbers, first the input side. `name` is optional.
 //! `gate` (optional) names the pin that controls the pair, which makes the
-//! pair conditional. The shape is checked when a file is read or written;
+//! pair conditional. `chain` (optional, `true` or `false`): coming out of
+//! this pair, the walk may cross the part's other pairs on the out pin. Off
+//! by default, so a mux's COM->NO1 and COM->NO2 never join NO1 to NO2. The
+//! shape is checked when a file is read or written;
 //! whether the pins exist on a component is checked by the design.
 //! Every other field is not interpreted here.
 //!
@@ -277,6 +280,9 @@ pub struct ThroughPair {
     /// The pin number that controls the pair (a MOSFET gate). Its presence
     /// makes the pair conditional.
     pub gate: Option<String>,
+    /// Coming out of this pair, the part's other pairs on the out pin may be
+    /// crossed next.
+    pub chain: bool,
 }
 
 /// Read an entry's `through` field: None when absent or null (a null in an
@@ -301,9 +307,9 @@ pub fn through_pairs(entry: &Map<String, Value>) -> Result<Option<Vec<ThroughPai
             return Err(format!("\"{field}\"[{i}] must be an object like {{\"pins\": [\"3\", \"1\"]}}"));
         };
         // A typo ("pin", "gates") would otherwise be dropped without a word.
-        if let Some(k) = item.keys().find(|k| !["pins", "name", "gate"].contains(&k.as_str())) {
+        if let Some(k) = item.keys().find(|k| !["pins", "name", "gate", "chain"].contains(&k.as_str())) {
             return Err(format!(
-                "\"{field}\"[{i}]: unknown key {k:?} (expected \"pins\", \"name\" or \"gate\")"
+                "\"{field}\"[{i}]: unknown key {k:?} (expected \"pins\", \"name\", \"gate\" or \"chain\")"
             ));
         }
         let pins = match item.get("pins") {
@@ -320,7 +326,12 @@ pub fn through_pairs(entry: &Map<String, Value>) -> Result<Option<Vec<ThroughPai
         if gate.as_ref().is_some_and(|g| pins.contains(g)) {
             return Err(format!("\"{field}\"[{i}]: the gate is one of the pair's own pins"));
         }
-        out.push(ThroughPair { name, pins, gate });
+        let chain = match item.get("chain") {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(format!("\"{field}\"[{i}]: \"chain\" must be true or false")),
+        };
+        out.push(ThroughPair { name, pins, gate, chain });
     }
     Ok(Some(out))
 }
@@ -694,11 +705,11 @@ mod tests {
     fn through_pairs_parse() {
         let e = fields(json!({"through": [
             {"name": "A", "pins": [" 3", "1"]},
-            {"pins": ["3", "2"], "gate": "1"}
+            {"pins": ["3", "2"], "gate": "1", "chain": true}
         ]}));
         assert_eq!(through_pairs(&e).unwrap().unwrap(), vec![
-            ThroughPair { name: Some("A".into()), pins: ["3".into(), "1".into()], gate: None },
-            ThroughPair { name: None, pins: ["3".into(), "2".into()], gate: Some("1".into()) },
+            ThroughPair { name: Some("A".into()), pins: ["3".into(), "1".into()], gate: None, chain: false },
+            ThroughPair { name: None, pins: ["3".into(), "2".into()], gate: Some("1".into()), chain: true },
         ]);
         assert_eq!(through_pairs(&fields(json!({"note": 1}))).unwrap(), None);
         assert_eq!(through_pairs(&fields(json!({"through": []}))).unwrap(), Some(vec![]));
@@ -717,6 +728,7 @@ mod tests {
             (json!({"through": [{"pin": ["1", "2"]}]}), "unknown key \"pin\""),
             (json!({"through": [{"pins": ["1", "2"], "gate": "2"}]}), "the gate is one of"),
             (json!({"through": [{"pins": ["1", "2"], "name": ""}]}), "\"name\" must be"),
+            (json!({"through": [{"pins": ["1", "2"], "chain": "yes"}]}), "\"chain\" must be true or false"),
         ];
         for (entry, want) in cases {
             let text = json!({"mpn": {"X": entry}}).to_string();

@@ -447,12 +447,13 @@ impl NetlistServer {
         `via` entry names the `pins` crossed and the `pair`, `against` when \
         crossed second pin to first, and `conditional` with its `gate` for a \
         gate-controlled pair (not a plain wire). Its entry pin is still an \
-        endpoint; the pin the walk comes out on is not, but the part's other \
-        pairs on that pin are crossed from it, also when it is NC or alone on \
-        its net. From a pin, the start part's pairs on the start net are \
-        crossed too. At equal depth a route through plain series parts is \
-        taken before one through such a part. The topology graph stops at such a part and \
-        lists it in through_not_drawn; a drawn net first walked past one is \
+        endpoint; the pin the walk comes out on is not. The walk does not \
+        re-enter the part from that pin (a mux's NO1->COM->NO2 is no path), \
+        unless the pair it came out of has `chain`: true. From a pin, the \
+        start part's pairs on the start net are crossed too. At equal depth \
+        a route through plain series parts is taken before one through such \
+        a part. The topology graph stops at such a part and lists it in \
+        through_not_drawn (the start part, being drawn, is not listed); a drawn net first walked past one is \
         in state past_through, and its parts are not drawn.")]
     fn walk(&self, Parameters(p): Parameters<WalkParams>) -> String {
         let max_depth = p.max_depth.unwrap_or(4);
@@ -658,7 +659,7 @@ ENRICH (the one tool that writes):
   pin roles, notes) for a part kind (lib_id / mpn) or one refdes. It writes \
   a JSON sidecar file, never the netlist; get_component shows the result. \
   Every other tool only reads. A through-model is the field `through`: a list \
-  of {\"pins\": [\"<in>\", \"<out>\"], \"name\"?: \"A\", \"gate\"?: \"<pin>\"}. \
+  of {\"pins\": [\"<in>\", \"<out>\"], \"name\"?: \"A\", \"gate\"?: \"<pin>\", \"chain\"?: true}. \
   walk and path_between use it at once; get_component's through_warnings \
   lists pairs skipped for naming a pin or gate the part does not have.
 

@@ -73,6 +73,10 @@ struct ResolvedPair {
     pins: [PinId; 2],
     /// The controlling pin, as "REFDES:PIN".
     gate: Option<String>,
+    /// Coming out of this pair, the part's other pairs on the out pin may
+    /// be crossed next. Off by default: a mux's COM->NO1 and COM->NO2 never
+    /// join NO1 to NO2.
+    chain: bool,
 }
 
 /// Every component's through-model pairs, plus the problems found while
@@ -103,6 +107,14 @@ fn pop_shallowest(
         (Some(_), _) => drawn.pop_front(),
         (None, _) => past.pop_front(),
     }
+}
+
+/// Whether the walk may go on from where `hop` came out, across the same
+/// part's other pairs: only out of a pair with `chain` set.
+fn hop_chains(through: &ThroughModels, hop: &Hop) -> bool {
+    hop.cross
+        .and_then(|c| through.pairs.get(&hop.comp)?.get(c.pair))
+        .is_some_and(|p| p.chain)
 }
 
 /// The pairs of part `comp` on pin `pin` not crossed yet, each as (far
@@ -195,6 +207,7 @@ impl Design {
                     name: d.name,
                     pins: [PinId(a.0), PinId(b.0)],
                     gate: d.gate.map(|g| format!("{}:{}", comp.refdes, g)),
+                    chain: d.chain,
                 });
             }
             if !pairs.is_empty() {
@@ -1579,6 +1592,8 @@ impl Design {
                 let pair = through.pairs.get(&h.comp)?.get(c.pair)?;
                 Some(pair.pins[if c.against { 0 } else { 1 }].0)
             });
+            // Whether the part's other pairs are crossed from `exit_pin`.
+            let exit_chains = via.last().is_some_and(|h| hop_chains(through, h));
 
             // Terminal checks apply to every net except the start net, which is
             // always expanded once.
@@ -1715,7 +1730,10 @@ impl Design {
                     ));
                 } else if let Some(pairs) = through.pairs.get(&comp_id.0) {
                     // Every declared pair this pin is on, either way round
-                    // (issue #47). Each pair is crossed once per walk.
+                    // (issue #47). Each pair is crossed once per walk. Where
+                    // the walk came out of the part, only out of a `chain`
+                    // pair.
+                    let pairs: &[ResolvedPair] = if exit && !exit_chains { &[] } else { pairs };
                     for (far, hop) in pairs_on(pairs, comp_id.0, pin_id.0, &mut visited_comps) {
                         crossings.push((Some(far), extend(&via, hop)));
                     }
@@ -1727,12 +1745,12 @@ impl Design {
                     let via_here = std::mem::take(&mut crossings[k].1);
                     k += 1;
                     let hop = *via_here.last().expect("a crossing ends in its hop");
-                    // A far pin that leads nowhere on its own (NC, or alone
-                    // on its net) is crossed on from, across the part's
-                    // other pairs on it, so shared-pin models chain there too.
+                    // Out of a `chain` pair onto a far pin that leads nowhere
+                    // on its own (NC, or alone on its net), the walk goes on
+                    // across the part's other pairs on that pin.
                     let mut chain_on = || {
-                        let (Some(_), Some(p), Some(pairs)) =
-                            (hop.cross, other_pin_id, through.pairs.get(&comp_id.0))
+                        let (true, Some(p), Some(pairs)) =
+                            (hop_chains(through, &hop), other_pin_id, through.pairs.get(&comp_id.0))
                         else {
                             return Vec::new();
                         };
@@ -1753,6 +1771,8 @@ impl Design {
                     if drawn {
                         match hop.cross {
                             None => topo.note_series(comp_id.0, depth),
+                            // The start part is drawn, so it is not listed.
+                            Some(_) if Some(comp_id.0) == start_comp_idx => {}
                             Some(_) => topo.note_through(comp_id.0),
                         }
                     }
@@ -6758,10 +6778,11 @@ mod through_tests {
         assert!(ends.contains(&"TP60:1"), "{ends:?}");
     }
 
-    // Pairs sharing a pin chain: 5->7, then 7->8 from the exit pin.
+    // Pairs sharing a pin chain when the first opts in: 5->7, then 7->8
+    // from the exit pin.
     #[test]
     fn shared_pin_pairs_chain() {
-        let design = with_refdes_model("U3", json!([{"pins": ["5", "7"]}, {"pins": ["7", "8"]}]));
+        let design = with_refdes_model("U3", json!([{"pins": ["5", "7"], "chain": true}, {"pins": ["7", "8"]}]));
         let v = path(&design, "J4:1", "U3:8");
         assert_eq!(v["connected"], true, "{v}");
         let pins: Vec<&Value> = v["via"].as_array().unwrap().iter().map(|p| &p["pins"]).collect();
@@ -6803,7 +6824,7 @@ mod through_tests {
     // the only pin on /SENSREF.
     #[test]
     fn pairs_chain_across_lone_pin() {
-        let design = with_refdes_model("U3", json!([{"pins": ["5", "13"]}, {"pins": ["13", "8"]}]));
+        let design = with_refdes_model("U3", json!([{"pins": ["5", "13"], "chain": true}, {"pins": ["13", "8"]}]));
         let v = path(&design, "J4:1", "U3:8");
         assert_eq!(v["connected"], true, "{v}");
         let pins: Vec<&Value> = v["via"].as_array().unwrap().iter().map(|p| &p["pins"]).collect();
@@ -6812,6 +6833,29 @@ mod through_tests {
         let w = walk(&design, "/BUFIN", false);
         let dead = w["dead_ends"].as_array().unwrap().iter().any(|d| d["net"] == "/SENSREF");
         assert!(!dead, "{w}");
+    }
+
+    // Without `chain`, the walk never re-enters a part from the pin it came
+    // out on: a mux's NO1->COM->NO2 is no path. Shapes as above: COM on a
+    // wired net (U3:7) and alone on its net (U3:13).
+    #[test]
+    fn pairs_do_not_chain_by_default() {
+        for com in ["7", "13"] {
+            let design = with_refdes_model("U3", json!([{"pins": [com, "5"]}, {"pins": [com, "8"]}]));
+            let v = path(&design, "J4:1", "U3:8");
+            assert_eq!(v["connected"], false, "COM {com}: {v}");
+            // From COM's side both pairs are still crossed.
+            let v = path(&design, &format!("U3:{com}"), "J4:1");
+            assert_eq!(v["connected"], true, "COM {com}: {v}");
+        }
+    }
+
+    // A walk from a through part's pin draws the part as the start, so it
+    // is not also listed in through_not_drawn.
+    #[test]
+    fn start_part_not_in_through_not_drawn() {
+        let v = walk(&with_sidecar(), "U3:5", true);
+        assert!(v["topology"].get("through_not_drawn").is_none(), "{}", v["topology"]);
     }
 
     // A gate pin the part lacks skips the pair, like a missing pair pin.

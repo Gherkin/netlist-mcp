@@ -90,9 +90,39 @@ struct ThroughModels {
     warnings: HashMap<usize, Vec<String>>,
 }
 
-/// Marks a 2-pin passive in `walk_bfs`'s visited set; a through-model part is
-/// keyed by its pair index instead, so each pair is crossed once (issue #47).
+/// Marks a 2-pin passive in `walk_bfs`'s visited sets; a through-model part is
+/// keyed by its pair index instead, so each pair is crossed once per
+/// restriction set (issue #47).
 const PASSIVE_PAIR: usize = usize::MAX;
+
+/// The restriction set of a walk route: every (part, pin) its via came out
+/// of a pair on that is not `chain`, sorted. The route never crosses that
+/// part's pairs from that pin (a mux's COM->NO1 and COM->NO2 never join NO1
+/// to NO2), however it got back to the pin's net.
+fn restrictions(via: &[Hop], through: &ThroughModels) -> Vec<(usize, usize)> {
+    let mut r: Vec<(usize, usize)> = via
+        .iter()
+        .filter_map(|h| {
+            let c = h.cross?;
+            let pair = through.pairs.get(&h.comp)?.get(c.pair)?;
+            (!pair.chain).then(|| (h.comp, c.ends(pair).1 .0))
+        })
+        .collect();
+    r.sort_unstable();
+    r.dedup();
+    r
+}
+
+/// Whether sorted `a` is a subset of sorted `b`.
+fn is_subset(a: &[(usize, usize)], b: &[(usize, usize)]) -> bool {
+    a.iter().all(|x| b.binary_search(x).is_ok())
+}
+
+/// Whether a route under `restrict` may not cross part `comp`'s pairs from
+/// pin `pin`.
+fn is_restricted(restrict: &[(usize, usize)], comp: usize, pin: usize) -> bool {
+    restrict.binary_search(&(comp, pin)).is_ok()
+}
 
 /// Pops the shallowest queued route; at equal depth a drawn one (no
 /// through-model hop) before one past a through part.
@@ -115,7 +145,7 @@ fn hop_chains(through: &ThroughModels, hop: &Hop) -> bool {
         .is_some_and(|p| p.chain)
 }
 
-/// The pairs of part `comp` on pin `pin` not crossed yet, each as (far
+/// The pairs of part `comp` on pin `pin` not in `visited` yet, each as (far
 /// pin, hop), either way round. Marks them crossed.
 fn pairs_on<'a>(
     pairs: &'a [ResolvedPair],
@@ -1500,7 +1530,8 @@ impl Design {
     /// BFS traversal core shared by `walk` and `path_between`. Alternates
     /// net -> pins -> owning component -> (through a passthrough?) -> other net.
     /// Rails (`RAIL_THRESHOLD` when `stop_at_power`) and large nets (fanout > 40) are
-    /// terminal. Cycles are cut by `popped` / `visited_comps`.
+    /// terminal. Cycles are cut by `expanded` and the per-restriction-set
+    /// visited parts in `layers` (see `restrictions`).
     ///
     /// Also surfaces `dead_ends`: branches that fizzle out through a passthrough
     /// (never the start net itself) instead of reaching a real endpoint — a
@@ -1522,11 +1553,20 @@ impl Design {
 
         let enrich = self.sidecar();
         let through = &enrich.through;
-        // (part, pair) crossed so far: `PASSIVE_PAIR` for a 2-pin passive, the
-        // pair index for a through-model part, so crossing one channel of a
-        // quad op-amp leaves the other three open (issue #47).
-        let mut visited_comps: std::collections::HashSet<(usize, usize)> =
-            std::collections::HashSet::new();
+        // (part, pair) crossed so far, per restriction set (see
+        // `restrictions`): `PASSIVE_PAIR` for a 2-pin passive, the pair index
+        // for a through-model part, so crossing one channel of a quad op-amp
+        // leaves the other three open (issue #47). Routes under different
+        // restrictions do not use up each other's parts, so which one is
+        // queued first does not decide what is found.
+        let mut layers: HashMap<Vec<(usize, usize)>, HashSet<(usize, usize)>> = HashMap::new();
+        // Net -> the restriction sets it was expanded under. A route is
+        // dropped when one of them is a subset of its own.
+        let mut expanded: HashMap<usize, Vec<Vec<(usize, usize)>>> = HashMap::new();
+        // (rail net, last part, pair) already in `rails_reached`, so a rail
+        // reached across the same part under two restriction sets is listed
+        // once.
+        let mut rail_seen: HashSet<(usize, usize, usize)> = HashSet::new();
         let mut crossed: Vec<CrossedPin> = Vec::new();
         let mut endpoint_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut dead_end_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1559,45 +1599,40 @@ impl Design {
         // is in the topology. A rail or large net keeps its state; an
         // expanded one is `PastThrough`, as its parts were not drawn.
         let mut popped: HashMap<usize, NetState> = HashMap::new();
-        // Expanded net -> the pin its route came out of a non-`chain` pair
-        // on. That part's other pairs were not crossed from the pin; a later
-        // route into the net that did not come out there crosses them.
-        let mut blocked_exit: HashMap<usize, usize> = HashMap::new();
 
         while let Some((net_idx, via, depth)) = pop_shallowest(&mut queue, &mut past_through) {
             // The topology graph stops at a through-model part: nothing past
             // one is recorded for it (drawing it is a follow-up to #47).
-            let drawn = via.iter().all(|h| h.cross.is_none());
+            let mut drawn = via.iter().all(|h| h.cross.is_none());
             debug_assert_eq!(via.len() as u32, depth, "depth is the via length");
-            // The pin this route came out on, when its last hop crossed a
-            // through pair, and whether that pair chains (the part's other
-            // pairs are crossed from it). The pin is no endpoint here (issue
-            // #47). Only the popped route counts: a net reached first by a
-            // plain part keeps the pin an endpoint.
-            let (exit_pin, exit_chains) = via
+            let restrict = restrictions(&via, through);
+            // The key of the last part crossed, for `rail_seen`.
+            let last_part = via
                 .last()
-                .and_then(|h| {
-                    let c = h.cross?;
-                    let pair = through.pairs.get(&h.comp)?.get(c.pair)?;
-                    Some((Some(c.ends(pair).1 .0), pair.chain))
-                })
-                .unwrap_or((None, false));
-            // On a repeat arrival that did not come out on the net's blocked
-            // exit pin: only that pin is expanded, crossing its part's pairs.
-            let mut reexpand: Option<usize> = None;
-            if popped.contains_key(&net_idx) {
+                .map(|h| (h.comp, h.cross.map_or(PASSIVE_PAIR, |c| c.pair)));
+            // The pin this route came out on, when its last hop crossed a
+            // through pair. The pin is no endpoint (issue #47). Only the
+            // popped route counts: a net reached first by a plain part keeps
+            // the pin an endpoint.
+            let exit_pin = via.last().and_then(|h| {
+                let c = h.cross?;
+                Some(c.ends(through.pairs.get(&h.comp)?.get(c.pair)?).1 .0)
+            });
+            let first_pop = !popped.contains_key(&net_idx);
+            if !first_pop {
                 if let (true, Some(&state)) = (drawn, popped.get(&net_idx)) {
                     topo.note_net(net_idx, state);
                 }
                 if let Some(&score) = rail_scores.get(&net_idx) {
-                    // A repeat arrival. Each part is traversed once, so the
-                    // via chain is new. A repeat is kept only while the whole
-                    // `rails_reached` list (first arrivals included) is under
-                    // `max_endpoints`. First arrivals are never cut, so the
-                    // list can still end up longer than the cap.
-                    if rails_reached.len() >= max_endpoints as usize {
+                    // A repeat arrival. Listed once per last part crossed, so
+                    // the via chain is new. A repeat is kept only while the
+                    // whole `rails_reached` list (first arrivals included) is
+                    // under `max_endpoints`. First arrivals are never cut, so
+                    // the list can still end up longer than the cap.
+                    let new = last_part.is_none_or(|(c, p)| rail_seen.insert((net_idx, c, p)));
+                    if new && rails_reached.len() >= max_endpoints as usize {
                         truncated = true;
-                    } else {
+                    } else if new {
                         rails_reached.push(RailReached {
                             net: self.net(&NetId(net_idx)).name.clone(),
                             score,
@@ -1605,23 +1640,22 @@ impl Design {
                         });
                     }
                 }
-                // The first route came out of a pair on this net and did not
-                // cross the part's other pairs from that pin. Another route
-                // into the net reaches the pin too, so it crosses them now,
-                // as does one that came out on the pin of a `chain` pair.
-                match blocked_exit.get(&net_idx) {
-                    Some(&p) if exit_pin != Some(p) || exit_chains => {
-                        blocked_exit.remove(&net_idx);
-                        reexpand = Some(p);
-                    }
-                    _ => continue,
+                // A rail or large net is never expanded. Another net is
+                // expanded again only under fewer restrictions than every
+                // time before, and that expansion is not drawn.
+                let Some(seen) = expanded.get(&net_idx) else {
+                    continue;
+                };
+                if seen.iter().any(|r| is_subset(r, &restrict)) {
+                    continue;
                 }
+                drawn = false;
             }
             let net = self.net(&NetId(net_idx));
 
             // Terminal checks apply to every net except the start net, which is
-            // always expanded once. A re-expansion already passed them.
-            if net_idx != start_net_idx && reexpand.is_none() {
+            // always expanded once. A later expansion already passed them.
+            if net_idx != start_net_idx && first_pop {
                 if stop_at_power {
                     let (score, _evidence) = self.rail_score(net);
                     if score >= RAIL_THRESHOLD {
@@ -1631,6 +1665,9 @@ impl Design {
                         }
                         let score = (score * 100.0).round() / 100.0;
                         rail_scores.insert(net_idx, score);
+                        if let Some((c, p)) = last_part {
+                            rail_seen.insert((net_idx, c, p));
+                        }
                         rails_reached.push(RailReached {
                             net: net.name.clone(),
                             score,
@@ -1706,20 +1743,22 @@ impl Design {
                     });
                 }
             }
-            if reexpand.is_none() {
+            if first_pop {
                 popped.insert(net_idx, if drawn { NetState::Expanded } else { NetState::PastThrough });
                 if drawn {
                     topo.note_net(net_idx, NetState::Expanded);
                 }
-                if let (Some(p), false) = (exit_pin, exit_chains) {
-                    blocked_exit.insert(net_idx, p);
-                }
             }
+            expanded.entry(net_idx).or_default().push(restrict.clone());
+            // The exit pin is no endpoint, on this route nor on a later
+            // expansion of the net. A plain route that got here first has
+            // already listed it.
+            if let Some(p) = exit_pin {
+                endpoint_seen.insert(self.pin_name(&PinId(p)));
+            }
+            let visited_comps = layers.entry(restrict.clone()).or_default();
 
             for pin_id in &net.pins {
-                if reexpand.is_some_and(|p| p != pin_id.0) {
-                    continue;
-                }
                 let pin = self.pin(pin_id);
                 let comp_id = &pin.comp;
 
@@ -1733,9 +1772,10 @@ impl Design {
                     continue;
                 }
                 // Where the walk came out of a through-model pair: no
-                // endpoint, and the part's other pairs on this pin are
-                // crossed from it only when that pair sets `chain`.
+                // endpoint. The part's pairs on a pin this route came out on
+                // are crossed only when that pair sets `chain`.
                 let exit = Some(pin_id.0) == exit_pin;
+                let blocked = is_restricted(&restrict, comp_id.0, pin_id.0);
 
                 let comp = self.component(comp_id);
                 let class = Self::refdes_class(&comp.refdes);
@@ -1762,11 +1802,11 @@ impl Design {
                     ));
                 } else if let Some(pairs) = through.pairs.get(&comp_id.0) {
                     // Every declared pair this pin is on, either way round
-                    // (issue #47). Each pair is crossed once per walk. Where
-                    // the walk came out of the part, only out of a `chain`
-                    // pair.
-                    let pairs: &[ResolvedPair] = if exit && !exit_chains { &[] } else { pairs };
-                    for (far, hop) in pairs_on(pairs, comp_id.0, pin_id.0, &mut visited_comps) {
+                    // (issue #47). Each pair is crossed once per restriction
+                    // set. None from a pin this route came out on, unless
+                    // out of a `chain` pair.
+                    let pairs: &[ResolvedPair] = if blocked { &[] } else { pairs };
+                    for (far, hop) in pairs_on(pairs, comp_id.0, pin_id.0, visited_comps) {
                         crossings.push((Some(far), extend(&via, hop)));
                     }
                 }
@@ -1793,7 +1833,10 @@ impl Design {
                         else {
                             return Vec::new();
                         };
-                        pairs_on(pairs, comp_id.0, p.0, &mut visited_comps)
+                        if is_restricted(&restrict, comp_id.0, p.0) {
+                            return Vec::new();
+                        }
+                        pairs_on(pairs, comp_id.0, p.0, visited_comps)
                             .into_iter()
                             .map(|(far, h)| (Some(far), extend(&via_here, h)))
                             .collect::<Vec<_>>()
@@ -1902,10 +1945,8 @@ impl Design {
 
                 if !is_passthrough {
                     // Endpoint. A through-model part is one too, on the pin
-                    // the walk arrived on. Never report the start component,
-                    // nor a re-expanded exit pin, which the first route
-                    // already did not report.
-                    if exit || reexpand.is_some() || Some(comp_id.0) == start_comp_idx {
+                    // the walk arrived on. Never report the start component.
+                    if exit || Some(comp_id.0) == start_comp_idx {
                         continue;
                     }
                     let pin_key = self.pin_name(pin_id);
@@ -6936,17 +6977,61 @@ mod through_tests {
         assert!(!u3_10, "{w}");
     }
 
-    // 5->10 (no chain) reaches /BUFRC first and blocks U3:10. R60 and the
-    // `chain` pair 7->10 reach /BUFRC again out of U3:10 itself; the chain
-    // still crosses 10->8 from there.
+    // The same mux as above in either pair order: 5->10 reaching /BUFRC
+    // and using up R60 toward /BUFMID does not cut 5->7, R60, 10->8.
     #[test]
-    fn chain_pair_onto_blocked_exit_crosses_its_pairs() {
+    fn blocked_exit_route_found_in_either_pair_order() {
+        for pairs in [
+            json!([{"pins": ["5", "7"]}, {"pins": ["5", "10"]}, {"pins": ["10", "8"]}]),
+            json!([{"pins": ["5", "10"]}, {"pins": ["5", "7"]}, {"pins": ["10", "8"]}]),
+        ] {
+            let v = path(&with_refdes_model("U3", pairs), "J4:1", "U3:8");
+            assert_eq!(v["connected"], true, "{v}");
+            assert_eq!(via_refdes(&v["via"]), ["U3", "R60", "U3"], "{v}");
+            assert_eq!(v["distance"], 3, "{v}");
+        }
+    }
+
+    // Only 5->10 and 10->8, no chain. U3:8 is reached only by crossing U3
+    // again from pin 10, which this route came out on, also after going
+    // round through R60 and back: no path.
+    #[test]
+    fn blocked_exit_stays_blocked_on_its_own_route() {
+        let design =
+            with_refdes_model("U3", json!([{"pins": ["5", "10"]}, {"pins": ["10", "8"]}]));
+        let v = path(&design, "J4:1", "U3:8");
+        assert_eq!(v["connected"], false, "{v}");
+    }
+
+    // 5->10 (no chain) blocks U3:10. The only way to pin 7 is that route on
+    // through R60, so the `chain` pair 7->10 brings it back to /BUFRC still
+    // blocked: a chain pair does not lift a block from earlier on the route.
+    #[test]
+    fn chain_pair_does_not_lift_an_earlier_block() {
         let design = with_refdes_model(
             "U3",
             json!([{"pins": ["5", "10"]}, {"pins": ["7", "10"], "chain": true}, {"pins": ["10", "8"]}]),
         );
         let v = path(&design, "J4:1", "U3:8");
+        assert_eq!(v["connected"], false, "{v}");
+    }
+
+    // 5->10 (no chain) blocks U3:10. The chain pairs 5->7->10 reach /BUFRC
+    // by a route that never came out on U3:10, so 10->8 is crossed.
+    #[test]
+    fn chain_route_onto_blocked_exit_crosses_its_pairs() {
+        let design = with_refdes_model(
+            "U3",
+            json!([
+                {"pins": ["5", "10"]},
+                {"pins": ["5", "7"], "chain": true},
+                {"pins": ["7", "10"], "chain": true},
+                {"pins": ["10", "8"]}
+            ]),
+        );
+        let v = path(&design, "J4:1", "U3:8");
         assert_eq!(v["connected"], true, "{v}");
+        assert_eq!(v["distance"], 3, "{v}");
     }
 
     // A gate pin the part lacks skips the pair, like a missing pair pin.

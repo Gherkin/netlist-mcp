@@ -448,10 +448,10 @@ impl NetlistServer {
         crossed second pin to first, and `conditional` with its `gate` for a \
         gate-controlled pair (not a plain wire). Its entry pin is still an \
         endpoint; the pin the walk comes out on is not. The walk does not \
-        re-enter the part from that pin (a mux's NO1->COM->NO2 is no path), \
-        unless the pair it came out of has `chain`: true; another route into \
-        that net still crosses the part from that pin, which stays no \
-        endpoint. Each pair crossed is \
+        re-enter the part from that pin on that route, also after going \
+        round (a mux's NO1->COM->NO2 is no path), unless the pair it came \
+        out of has `chain`: true; a different route into that net may still \
+        cross the part from that pin, which stays no endpoint. Each pair crossed is \
         one hop of distance and depth. From a pin, the \
         start part's pairs on the start net are crossed too. At equal depth \
         a route through plain series parts is taken before one through such \

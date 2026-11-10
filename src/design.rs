@@ -1559,11 +1559,32 @@ impl Design {
         // is in the topology. A rail or large net keeps its state; an
         // expanded one is `PastThrough`, as its parts were not drawn.
         let mut popped: HashMap<usize, NetState> = HashMap::new();
+        // Expanded net -> the pin its route came out of a non-`chain` pair
+        // on. That part's other pairs were not crossed from the pin; a later
+        // route into the net that did not come out there crosses them.
+        let mut blocked_exit: HashMap<usize, usize> = HashMap::new();
 
         while let Some((net_idx, via, depth)) = pop_shallowest(&mut queue, &mut past_through) {
             // The topology graph stops at a through-model part: nothing past
             // one is recorded for it (drawing it is a follow-up to #47).
             let drawn = via.iter().all(|h| h.cross.is_none());
+            debug_assert_eq!(via.len() as u32, depth, "depth is the via length");
+            // The pin this route came out on, when its last hop crossed a
+            // through pair, and whether that pair chains (the part's other
+            // pairs are crossed from it). The pin is no endpoint here (issue
+            // #47). Only the popped route counts: a net reached first by a
+            // plain part keeps the pin an endpoint.
+            let (exit_pin, exit_chains) = via
+                .last()
+                .and_then(|h| {
+                    let c = h.cross?;
+                    let pair = through.pairs.get(&h.comp)?.get(c.pair)?;
+                    Some((Some(c.ends(pair).1 .0), pair.chain))
+                })
+                .unwrap_or((None, false));
+            // On a repeat arrival that did not come out on the net's blocked
+            // exit pin: only that pin is expanded, crossing its part's pairs.
+            let mut reexpand: Option<usize> = None;
             if popped.contains_key(&net_idx) {
                 if let (true, Some(&state)) = (drawn, popped.get(&net_idx)) {
                     topo.note_net(net_idx, state);
@@ -1584,26 +1605,22 @@ impl Design {
                         });
                     }
                 }
-                continue;
+                // The first route came out of a pair on this net and did not
+                // cross the part's other pairs from that pin. Another route
+                // into the net reaches the pin too, so it crosses them now.
+                match blocked_exit.get(&net_idx) {
+                    Some(&p) if exit_pin != Some(p) => {
+                        blocked_exit.remove(&net_idx);
+                        reexpand = Some(p);
+                    }
+                    _ => continue,
+                }
             }
             let net = self.net(&NetId(net_idx));
-            // The pin this route came out on, when its last hop crossed a
-            // through pair, and whether that pair chains (the part's other
-            // pairs are crossed from it). The pin is no endpoint here (issue
-            // #47). Only the popped route counts: a net reached first by a
-            // plain part keeps the pin an endpoint.
-            let (exit_pin, exit_chains) = via
-                .last()
-                .and_then(|h| {
-                    let c = h.cross?;
-                    let pair = through.pairs.get(&h.comp)?.get(c.pair)?;
-                    Some((Some(c.ends(pair).1 .0), pair.chain))
-                })
-                .unwrap_or((None, false));
 
             // Terminal checks apply to every net except the start net, which is
-            // always expanded once.
-            if net_idx != start_net_idx {
+            // always expanded once. A re-expansion already passed them.
+            if net_idx != start_net_idx && reexpand.is_none() {
                 if stop_at_power {
                     let (score, _evidence) = self.rail_score(net);
                     if score >= RAIL_THRESHOLD {
@@ -1688,12 +1705,20 @@ impl Design {
                     });
                 }
             }
-            popped.insert(net_idx, if drawn { NetState::Expanded } else { NetState::PastThrough });
-            if drawn {
-                topo.note_net(net_idx, NetState::Expanded);
+            if reexpand.is_none() {
+                popped.insert(net_idx, if drawn { NetState::Expanded } else { NetState::PastThrough });
+                if drawn {
+                    topo.note_net(net_idx, NetState::Expanded);
+                }
+                if let (Some(p), false) = (exit_pin, exit_chains) {
+                    blocked_exit.insert(net_idx, p);
+                }
             }
 
             for pin_id in &net.pins {
+                if reexpand.is_some_and(|p| p != pin_id.0) {
+                    continue;
+                }
                 let pin = self.pin(pin_id);
                 let comp_id = &pin.comp;
 
@@ -1751,6 +1776,9 @@ impl Design {
                     let via_here = std::mem::take(&mut crossings[k].1);
                     k += 1;
                     let hop = *via_here.last().expect("a crossing ends in its hop");
+                    // Every hop counts, a chained one too, so the depth of
+                    // the far net is the length of its via.
+                    let d = via_here.len() as u32;
                     // Out of a `chain` pair onto a far pin that leads nowhere
                     // on its own (NC, or alone on its net), the walk goes on
                     // across the part's other pairs on that pin.
@@ -1777,8 +1805,8 @@ impl Design {
                     if drawn {
                         match hop.cross {
                             None => topo.note_series(comp_id.0, depth),
-                            // The start part is drawn, so it is not listed.
-                            Some(_) if Some(comp_id.0) == start_comp_idx => {}
+                            // Also the start part: it is drawn, but what lies
+                            // past its pairs is not.
                             Some(_) => topo.note_through(comp_id.0),
                         }
                     }
@@ -1826,7 +1854,7 @@ impl Design {
                     if other_net.pins.len() == 1 {
                         // Far pin's net has fanout 1 (only that pin) ->
                         // dangling, goes nowhere.
-                        record_crossed(depth + 1);
+                        record_crossed(d);
                         let more = chain_on();
                         if !more.is_empty() {
                             crossings.extend(more);
@@ -1848,10 +1876,13 @@ impl Design {
                         }
                         continue;
                     }
-                    if depth < max_depth {
-                        record_crossed(depth + 1);
+                    if d <= max_depth {
+                        record_crossed(d);
                         let q = if next_drawn { &mut queue } else { &mut past_through };
-                        q.push_back((other_net_idx, via_here, depth + 1));
+                        // A chained route is deeper than the ones queued
+                        // after it, so insert in depth order.
+                        let at = q.partition_point(|e| e.2 <= d);
+                        q.insert(at, (other_net_idx, via_here, d));
                     } else {
                         // Depth-limited branch.
                         if next_drawn {
@@ -1863,8 +1894,10 @@ impl Design {
 
                 if !is_passthrough {
                     // Endpoint. A through-model part is one too, on the pin
-                    // the walk arrived on. Never report the start component.
-                    if exit || Some(comp_id.0) == start_comp_idx {
+                    // the walk arrived on. Never report the start component,
+                    // nor a re-expanded exit pin, which the first route
+                    // already did not report.
+                    if exit || reexpand.is_some() || Some(comp_id.0) == start_comp_idx {
                         continue;
                     }
                     let pin_key = self.pin_name(pin_id);
@@ -6835,6 +6868,8 @@ mod through_tests {
         assert_eq!(v["connected"], true, "{v}");
         let pins: Vec<&Value> = v["via"].as_array().unwrap().iter().map(|p| &p["pins"]).collect();
         assert_eq!(pins, [&json!(["U3:5", "U3:13"]), &json!(["U3:13", "U3:8"])], "{v}");
+        // The chained hop counts: distance is the via length.
+        assert_eq!(v["distance"], 2, "{v}");
         // The lone pin led on, so it is no dead end.
         let w = walk(&design, "/BUFIN", false);
         let dead = w["dead_ends"].as_array().unwrap().iter().any(|d| d["net"] == "/SENSREF");
@@ -6856,12 +6891,34 @@ mod through_tests {
         }
     }
 
-    // A walk from a through part's pin draws the part as the start, so it
-    // is not also listed in through_not_drawn.
+    // A walk from a through part's pin draws the part as the start, and
+    // lists it in through_not_drawn too: what lies past its pairs (TP60
+    // here) is not drawn.
     #[test]
-    fn start_part_not_in_through_not_drawn() {
+    fn start_part_in_through_not_drawn() {
         let v = walk(&with_sidecar(), "U3:5", true);
-        assert!(v["topology"].get("through_not_drawn").is_none(), "{}", v["topology"]);
+        assert_eq!(v["topology"]["through_not_drawn"], json!(["U3"]), "{}", v["topology"]);
+    }
+
+    // A mux on U3: COM 10, NO1 5, NO2 8, no chain. From /BUFIN, pair 5->10
+    // reaches /BUFRC at depth 1 and leaves U3:10 blocked. The route 5->7,
+    // R60 reaches /BUFRC again at depth 2, not out of U3:10, so it crosses
+    // 10->8 from there. 5->7 is listed first so /BUFMID is popped before
+    // /BUFRC and R60 is crossed toward /BUFRC.
+    #[test]
+    fn later_route_into_blocked_exit_crosses_its_pairs() {
+        let design = with_refdes_model(
+            "U3",
+            json!([{"pins": ["5", "7"]}, {"pins": ["5", "10"]}, {"pins": ["10", "8"]}]),
+        );
+        let v = path(&design, "J4:1", "U3:8");
+        assert_eq!(v["connected"], true, "{v}");
+        assert_eq!(via_refdes(&v["via"]), ["U3", "R60", "U3"], "{v}");
+        assert_eq!(v["distance"], 3, "{v}");
+        // U3:10 stays no endpoint.
+        let w = walk(&design, "/BUFIN", false);
+        let u3_10 = w["endpoints"].as_array().unwrap().iter().any(|e| e["pin"] == "U3:10");
+        assert!(!u3_10, "{w}");
     }
 
     // A gate pin the part lacks skips the pair, like a missing pair pin.

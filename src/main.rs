@@ -449,11 +449,13 @@ impl NetlistServer {
         gate-controlled pair (not a plain wire). Its entry pin is still an \
         endpoint; the pin the walk comes out on is not. The walk does not \
         re-enter the part from that pin (a mux's NO1->COM->NO2 is no path), \
-        unless the pair it came out of has `chain`: true. From a pin, the \
+        unless the pair it came out of has `chain`: true; another route into \
+        that net still crosses the part from that pin. Each pair crossed is \
+        one hop of distance and depth. From a pin, the \
         start part's pairs on the start net are crossed too. At equal depth \
         a route through plain series parts is taken before one through such \
         a part. The topology graph stops at such a part and lists it in \
-        through_not_drawn (the start part, being drawn, is not listed); a drawn net first walked past one is \
+        through_not_drawn (the start part too, once one of its pairs is crossed); a drawn net first walked past one is \
         in state past_through, and its parts are not drawn.")]
     fn walk(&self, Parameters(p): Parameters<WalkParams>) -> String {
         let max_depth = p.max_depth.unwrap_or(4);

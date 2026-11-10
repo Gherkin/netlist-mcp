@@ -47,17 +47,22 @@ pub struct Design {
     // slash that is part of a label (issue #16).
     sheet_paths: HashSet<String>,
     // Enrichment entries (issue #46), joined per component in
-    // `comp_details`. Empty unless `attach_sidecar` is called. Behind a lock
-    // because `write_sidecar` (issue #48) reloads it while the design is
-    // shared.
-    sidecar: RwLock<Sidecar>,
+    // `comp_details`, and their through-models. Empty unless
+    // `attach_sidecar` is called. Behind a lock because `write_sidecar`
+    // (issue #48) reloads it while the design is shared.
+    sidecar: RwLock<Enrichment>,
     // Held for a whole `write_sidecar` (file lock, disk I/O, reload), so two
     // writes in this server cannot reload out of order. `sidecar` itself is
     // write-locked only for the swap, so readers never wait on the file lock.
     sidecar_write: Mutex<()>,
-    // The sidecar's through-models resolved to pins (issue #47), rebuilt
-    // whenever `sidecar` is replaced.
-    through: RwLock<ThroughModels>,
+}
+
+/// The sidecar and its through-models resolved to pins (issue #47). One
+/// value under one lock, so a reader never sees one without the other.
+#[derive(Debug, Default)]
+struct Enrichment {
+    sidecar: Sidecar,
+    through: ThroughModels,
 }
 
 /// One through-model pair resolved to this design's pins (issue #47).
@@ -104,12 +109,8 @@ struct Cross {
 impl Design {
     /// Attach the enrichment sidecar loaded at startup (issue #46).
     pub fn attach_sidecar(&mut self, sidecar: Sidecar) {
-        self.through = RwLock::new(self.resolve_through(&sidecar));
-        self.sidecar = RwLock::new(sidecar);
-    }
-
-    fn through_models(&self) -> std::sync::RwLockReadGuard<'_, ThroughModels> {
-        self.through.read().unwrap_or_else(PoisonError::into_inner)
+        let through = self.resolve_through(&sidecar);
+        self.sidecar = RwLock::new(Enrichment { sidecar, through });
     }
 
     /// Resolve each component's joined `through` field to its pins (issue
@@ -168,7 +169,7 @@ impl Design {
     /// The sidecar for reading. A writer that panicked left the old,
     /// complete value in place (it is only ever replaced whole), so a
     /// poisoned lock is still safe to read.
-    fn sidecar(&self) -> std::sync::RwLockReadGuard<'_, Sidecar> {
+    fn sidecar(&self) -> std::sync::RwLockReadGuard<'_, Enrichment> {
         self.sidecar.read().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -183,16 +184,16 @@ impl Design {
         // what a refdes-to-library write hears, set library or not.
         edit.check()?;
         let _order = self.sidecar_write.lock().unwrap_or_else(PoisonError::into_inner);
-        let path = self.sidecar().path_for(edit.origin)?.to_path_buf();
+        let path = self.sidecar().sidecar.path_for(edit.origin)?.to_path_buf();
         let written = crate::sidecar::write_file(&path, edit)?;
         // The write is on disk whatever happens next. If a reload fails (a
         // person broke the other file by hand), keep the old entries and say so.
-        let reloaded = self.sidecar().reload();
+        let reloaded = self.sidecar().sidecar.reload();
         let reload_error = match reloaded {
             Ok(fresh) => {
                 let through = self.resolve_through(&fresh);
-                *self.sidecar.write().unwrap_or_else(PoisonError::into_inner) = fresh;
-                *self.through.write().unwrap_or_else(PoisonError::into_inner) = through;
+                *self.sidecar.write().unwrap_or_else(PoisonError::into_inner) =
+                    Enrichment { sidecar: fresh, through };
                 None
             }
             Err(e) => Some(format!("{e:#}")),
@@ -263,6 +264,7 @@ impl Design {
         });
 
         let pin_count = pin_ids.len();
+        let enrich = self.sidecar();
         let pins: Vec<ComponentPinRow> = pin_ids
             .into_iter()
             .skip(offset as usize)
@@ -290,8 +292,8 @@ impl Design {
             dnp: comp.dnp,
             exclude_from_bom: comp.exclude_from_bom,
             properties: comp.properties.clone(),
-            sidecar: self.sidecar().join(&Self::sidecar_keys(comp)),
-            through_warnings: self.through_models().warnings.get(&comp.id.0).cloned().unwrap_or_default(),
+            sidecar: enrich.sidecar.join(&Self::sidecar_keys(comp)),
+            through_warnings: enrich.through.warnings.get(&comp.id.0).cloned().unwrap_or_default(),
             pin_count,
             offset,
             limit,
@@ -1276,7 +1278,7 @@ impl Design {
             connectors,
             subsystems,
             top_nets_by_fanout,
-            sidecar: self.sidecar().summary(self.components.iter().map(Self::sidecar_keys)),
+            sidecar: self.sidecar().sidecar.summary(self.components.iter().map(Self::sidecar_keys)),
         };
         return Ok(serde_json::to_string_pretty(&envelope)
             .context("error serializing design_overview")?);
@@ -1462,8 +1464,8 @@ impl Design {
         let start_net_idx = start_net.0;
         let start_comp_idx = start_comp.map(|c| c.0);
 
-        let through = self.through_models();
-        let through = &*through;
+        let enrich = self.sidecar();
+        let through = &enrich.through;
         let mut visited_nets: std::collections::HashSet<usize> = std::collections::HashSet::new();
         // (part, pair) crossed so far: `PASSIVE_PAIR` for a 2-pin passive, the
         // pair index for a through-model part, so crossing one channel of a
@@ -1493,12 +1495,19 @@ impl Design {
         // cut by `visited_nets` and lost (issue #31). Each such arrival gets
         // its own `rails_reached` entry instead.
         let mut rail_scores: HashMap<usize, f32> = HashMap::new();
+        // The state each net was popped in. A net first popped past a
+        // through part is not noted then; a later drawn arrival notes it,
+        // so every net a drawn series part reaches is in the topology.
+        let mut popped: HashMap<usize, NetState> = HashMap::new();
 
         while let Some((net_idx, via, depth)) = queue.pop_front() {
             // The topology graph stops at a through-model part: nothing past
             // one is recorded for it (drawing it is a follow-up to #47).
             let drawn = via.iter().all(|h| h.cross.is_none());
             if !visited_nets.insert(net_idx) {
+                if let (true, Some(&state)) = (drawn, popped.get(&net_idx)) {
+                    topo.note_net(net_idx, state);
+                }
                 if let Some(&score) = rail_scores.get(&net_idx) {
                     // A repeat arrival. Each part is traversed once, so the
                     // via chain is new. A repeat is kept only while the whole
@@ -1525,6 +1534,7 @@ impl Design {
                 if stop_at_power {
                     let (score, _evidence) = self.rail_score(net);
                     if score >= RAIL_THRESHOLD {
+                        popped.insert(net_idx, NetState::Rail);
                         if drawn {
                             topo.note_net(net_idx, NetState::Rail);
                         }
@@ -1539,6 +1549,7 @@ impl Design {
                     }
                 }
                 if net.pins.len() > 40 {
+                    popped.insert(net_idx, NetState::LargeNet);
                     if drawn {
                         topo.note_net(net_idx, NetState::LargeNet);
                     }
@@ -1563,6 +1574,11 @@ impl Design {
                     std::collections::HashSet::new();
                 let mut inert_parts: Vec<ViaPart> = Vec::new();
                 for pin_id in &net.pins {
+                    // Where the walk came out of a through pair: not an
+                    // endpoint, so it does not make the net active.
+                    if crossed_pins.contains(&pin_id.0) {
+                        continue;
+                    }
                     let pin = self.pin(pin_id);
                     let comp = self.component(&pin.comp);
                     let class = Self::refdes_class(&comp.refdes);
@@ -1599,6 +1615,7 @@ impl Design {
                     });
                 }
             }
+            popped.insert(net_idx, NetState::Expanded);
             if drawn {
                 topo.note_net(net_idx, NetState::Expanded);
             }
@@ -1645,7 +1662,6 @@ impl Design {
                             continue;
                         }
                         let far = &pair.pins[if against { 0 } else { 1 }];
-                        crossed_pins.insert(far.0);
                         crossings.push((
                             Some(far),
                             Hop { comp: comp_id.0, cross: Some(Cross { pair: i, against }) },
@@ -1695,9 +1711,12 @@ impl Design {
                         continue;
                     };
                     // A through pair's far pin is no endpoint; record how it
-                    // was reached, for `path_between` (issue #47).
+                    // was reached, for `path_between` (issue #47). Only once
+                    // the walk comes out there: a depth-limited crossing or
+                    // one onto the same net leaves the pin an endpoint.
                     let mut record_crossed = |dist: u32| {
                         if let (Some(_), Some(p)) = (hop.cross, other_pin_id) {
+                            crossed_pins.insert(p.0);
                             crossed.push(CrossedPin {
                                 pin: self.pin_name(p),
                                 via: self.via_parts(&via_here, through),
@@ -2216,7 +2235,13 @@ impl Design {
             .collect();
         let nets: Vec<(usize, NetState)> =
             topo.nets.iter().copied().filter(|(n, _)| kept_nets.contains(n)).collect();
-        let mut out = self.build_topology(&nets, order, &[from_net, to_net], max_parts);
+        // A `to` net reached only past a through part is not drawn (#47);
+        // its part is then drawn with its pins off the drawing.
+        let fixed: Vec<usize> = [from_net, to_net]
+            .into_iter()
+            .filter(|n| topo.net_pos.contains_key(n))
+            .collect();
+        let mut out = self.build_topology(&nets, order, &fixed, max_parts);
         out.through_not_drawn = self.through_not_drawn(topo);
         out
     }
@@ -2406,7 +2431,6 @@ impl Design {
             sheet_paths,
             sidecar: Default::default(),
             sidecar_write: Default::default(),
-            through: Default::default(),
         });
     }
 }
@@ -4993,7 +5017,6 @@ mod subsystem_filter_seam_tests {
             sheet_paths,
             sidecar: Default::default(),
             sidecar_write: Default::default(),
-            through: Default::default(),
         }
     }
 
@@ -6078,7 +6101,6 @@ mod filter_nets_rail_tests {
             sheet_paths: HashSet::new(),
             sidecar: Default::default(),
             sidecar_write: Default::default(),
-            through: Default::default(),
         };
 
         for (code, (name, members)) in nets.iter().enumerate() {
@@ -6590,6 +6612,28 @@ mod through_tests {
         design.write_sidecar(&edit).expect("writes");
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(path(&design, "U4:7", "J5:1")["connected"], true);
+    }
+
+    // A net first reached past a through part and then by a drawn series
+    // part is still in the topology's nets: U3.D reaches +VSENS before R30
+    // does. This tripped the `build_topology` debug_assert.
+    #[test]
+    fn net_reached_past_through_part_is_still_noted() {
+        let v = walk(&with_sidecar(), "/SENSOUT", true);
+        let nets: Vec<&str> = v["topology"]["nets"].as_array().unwrap().iter()
+            .map(|n| n["name"].as_str().unwrap()).collect();
+        assert!(nets.contains(&"+VSENS"), "{nets:?}");
+    }
+
+    // path_between with topology across a through part: the `to` net is
+    // past the part, so it is not drawn. This tripped the same assert.
+    #[test]
+    fn path_topology_across_through_part() {
+        let design = with_sidecar();
+        let v: Value =
+            serde_json::from_str(&design.path_between("U4:7", "J5:1", true, 50).unwrap()).unwrap();
+        assert_eq!(v["connected"], true, "{v}");
+        assert_eq!(v["topology"]["through_not_drawn"], json!(["L2"]), "{v}");
     }
 }
 

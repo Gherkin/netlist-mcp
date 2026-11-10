@@ -114,9 +114,9 @@ impl Design {
     }
 
     /// Resolve each component's joined `through` field to its pins (issue
-    /// #47). A pair naming a pin the part does not have is skipped with a
-    /// warning; so is any model on a 2-pin passive, which a walk always
-    /// crosses anyway.
+    /// #47). A pair naming a pin or gate the part does not have is skipped
+    /// with a warning; so is any model on a 2-pin passive, which a walk
+    /// always crosses anyway.
     fn resolve_through(&self, sidecar: &Sidecar) -> ThroughModels {
         let mut out = ThroughModels::default();
         for comp in &self.components {
@@ -148,10 +148,10 @@ impl Design {
                     ));
                     continue;
                 };
-                if let Some(g) = &d.gate {
-                    if pin(g).is_none() {
-                        warn(format!("through pair {label}: gate pin {g} is not on {}", comp.refdes));
-                    }
+                // A gate the part lacks would be named in every via entry.
+                if let Some(g) = d.gate.as_deref().filter(|g| pin(g).is_none()) {
+                    warn(format!("through pair {label} skipped: gate pin {g} is not on {}", comp.refdes));
+                    continue;
                 }
                 pairs.push(ResolvedPair {
                     name: d.name,
@@ -1369,17 +1369,17 @@ impl Design {
     ) -> anyhow::Result<String> {
         // Resolve the start: "REFDES:PIN" is a pin (start_comp excluded from
         // endpoints), otherwise a net name.
-        let (start_net_id, start_comp): (NetId, Option<CompId>) = if start.contains(':') {
+        let (start_net_id, start_pin): (NetId, Option<&PinId>) = if start.contains(':') {
             let pin_id = self
                 .pin_map
                 .get(start)
                 .with_context(|| format!("no pin named '{}'", start))?;
-            let pin = self.pin(pin_id);
-            let net_id = pin
+            let net_id = self
+                .pin(pin_id)
                 .net
                 .as_ref()
                 .with_context(|| format!("pin '{}' has no net", start))?;
-            (NetId(net_id.0), Some(CompId(pin.comp.0)))
+            (NetId(net_id.0), Some(pin_id))
         } else {
             let net_id = self
                 .net_map
@@ -1387,12 +1387,13 @@ impl Design {
                 .with_context(|| format!("no net called '{}'", start))?;
             (NetId(net_id.0), None)
         };
+        let start_comp = start_pin.map(|p| CompId(self.pin(p).comp.0));
 
         let start_net_name = self.net(&start_net_id).name.clone();
 
         let mut data = self.walk_bfs(
             &start_net_id,
-            start_comp.as_ref(),
+            start_pin,
             max_depth,
             max_endpoints,
             stop_at_power,
@@ -1455,14 +1456,15 @@ impl Design {
     fn walk_bfs(
         &self,
         start_net: &NetId,
-        start_comp: Option<&CompId>,
+        start_pin: Option<&PinId>,
         max_depth: u32,
         max_endpoints: u32,
         stop_at_power: bool,
         record_topology: bool,
     ) -> WalkData {
         let start_net_idx = start_net.0;
-        let start_comp_idx = start_comp.map(|c| c.0);
+        let start_pin_idx = start_pin.map(|p| p.0);
+        let start_comp_idx = start_pin.map(|p| self.pin(p).comp.0);
 
         let enrich = self.sidecar();
         let through = &enrich.through;
@@ -1495,9 +1497,11 @@ impl Design {
         // cut by `visited_nets` and lost (issue #31). Each such arrival gets
         // its own `rails_reached` entry instead.
         let mut rail_scores: HashMap<usize, f32> = HashMap::new();
-        // The state each net was popped in. A net first popped past a
-        // through part is not noted then; a later drawn arrival notes it,
-        // so every net a drawn series part reaches is in the topology.
+        // The state to note a popped net in when a later arrival is drawn.
+        // A net first popped past a through part is not noted then; a later
+        // drawn arrival notes it, so every net a drawn series part reaches
+        // is in the topology. A rail or large net keeps its state; an
+        // expanded one is `PastThrough`, as its parts were not drawn.
         let mut popped: HashMap<usize, NetState> = HashMap::new();
 
         while let Some((net_idx, via, depth)) = queue.pop_front() {
@@ -1615,7 +1619,7 @@ impl Design {
                     });
                 }
             }
-            popped.insert(net_idx, NetState::Expanded);
+            popped.insert(net_idx, if drawn { NetState::Expanded } else { NetState::PastThrough });
             if drawn {
                 topo.note_net(net_idx, NetState::Expanded);
             }
@@ -1624,14 +1628,19 @@ impl Design {
                 let pin = self.pin(pin_id);
                 let comp_id = &pin.comp;
 
-                // At the start net, never walk back into the start component.
-                if via.is_empty() && Some(comp_id.0) == start_comp_idx {
+                // At the start net, never walk back into the start component,
+                // except across a through pair on the start pin itself, so a
+                // path is found in both directions (issue #47).
+                if via.is_empty()
+                    && Some(comp_id.0) == start_comp_idx
+                    && !(Some(pin_id.0) == start_pin_idx && through.pairs.contains_key(&comp_id.0))
+                {
                     continue;
                 }
-                // Where the walk came out of a through-model pair.
-                if crossed_pins.contains(&pin_id.0) {
-                    continue;
-                }
+                // Where the walk came out of a through-model pair: no
+                // endpoint, but the part's other pairs on this pin are
+                // crossed from it, so shared-pin models chain.
+                let exit = crossed_pins.contains(&pin_id.0);
 
                 let comp = self.component(comp_id);
                 let class = Self::refdes_class(&comp.refdes);
@@ -1760,7 +1769,7 @@ impl Design {
                 if !is_passthrough {
                     // Endpoint. A through-model part is one too, on the pin
                     // the walk arrived on. Never report the start component.
-                    if Some(comp_id.0) == start_comp_idx {
+                    if exit || Some(comp_id.0) == start_comp_idx {
                         continue;
                     }
                     let pin_key = self.pin_name(pin_id);
@@ -2060,7 +2069,7 @@ impl Design {
         // max_endpoints is effectively unbounded here: we need to search the
         // whole reachable set for `to`, not stop at the first handful.
         let data =
-            self.walk_bfs(&from_net_id, Some(&from_comp), 6, 100_000, true, include_topology);
+            self.walk_bfs(&from_net_id, Some(from_pin_id), 6, 100_000, true, include_topology);
         let topology = |to_net: usize| {
             include_topology.then(|| {
                 self.path_topology(
@@ -3049,6 +3058,10 @@ enum NetState {
     DepthLimit,
     /// The far net of a series part, with fanout 1; never popped.
     Dangling,
+    /// Popped first on a route past a through-model part (issue #47), then
+    /// reached by a drawn route. The parts the first pop found are not
+    /// drawn, so the graph stops here.
+    PastThrough,
 }
 
 impl NetState {
@@ -3059,6 +3072,7 @@ impl NetState {
             NetState::LargeNet => "large_net",
             NetState::DepthLimit => "depth_limit",
             NetState::Dangling => "dangling",
+            NetState::PastThrough => "past_through",
         }
     }
 
@@ -3066,7 +3080,10 @@ impl NetState {
     /// non-popped one is replaced if the net is popped later from another
     /// branch.
     fn popped(self) -> bool {
-        matches!(self, NetState::Expanded | NetState::Rail | NetState::LargeNet)
+        matches!(
+            self,
+            NetState::Expanded | NetState::Rail | NetState::LargeNet | NetState::PastThrough
+        )
     }
 }
 
@@ -6634,6 +6651,68 @@ mod through_tests {
             serde_json::from_str(&design.path_between("U4:7", "J5:1", true, 50).unwrap()).unwrap();
         assert_eq!(v["connected"], true, "{v}");
         assert_eq!(v["topology"]["through_not_drawn"], json!(["L2"]), "{v}");
+    }
+
+    fn with_refdes_model(refdes: &str, through: Value) -> super::Design {
+        let mut design = fixture();
+        let file = crate::sidecar::SidecarFile::parse(
+            &json!({"refdes": {refdes: {"through": through}}}).to_string(),
+            "t.json",
+            crate::sidecar::Origin::Project,
+        ).unwrap();
+        design.attach_sidecar(crate::sidecar::Sidecar::from_files(vec![file], vec![]));
+        design
+    }
+
+    // From a pin, the pair on that pin is crossed, so a path is found in
+    // both directions.
+    #[test]
+    fn start_pin_pair_is_crossed() {
+        let design = with_sidecar();
+        assert_eq!(path(&design, "J4:1", "U3:7")["connected"], true);
+        let v = path(&design, "U3:7", "J4:1");
+        assert_eq!(v["connected"], true, "{v}");
+        assert_eq!(v["via"][0]["pins"], json!(["U3:7", "U3:5"]), "{v}");
+        assert_eq!(path(&design, "L2:1", "J5:1")["connected"], true);
+        // walk too: from U3:5 it crosses pair B, then R60 and pair C.
+        let v = walk(&design, "U3:5", false);
+        let ends: Vec<&str> = v["endpoints"].as_array().unwrap().iter()
+            .map(|e| e["pin"].as_str().unwrap()).collect();
+        assert!(ends.contains(&"TP60:1"), "{ends:?}");
+    }
+
+    // Pairs sharing a pin chain: 5->7, then 7->8 from the exit pin.
+    #[test]
+    fn shared_pin_pairs_chain() {
+        let design = with_refdes_model("U3", json!([{"pins": ["5", "7"]}, {"pins": ["7", "8"]}]));
+        let v = path(&design, "J4:1", "U3:8");
+        assert_eq!(v["connected"], true, "{v}");
+        let pins: Vec<&Value> = v["via"].as_array().unwrap().iter().map(|p| &p["pins"]).collect();
+        assert_eq!(pins, [&json!(["U3:5", "U3:7"]), &json!(["U3:7", "U3:8"])], "{v}");
+    }
+
+    // U3:7 comes before R60 on /BUFMID, so pair 7->10 reaches /BUFRC before
+    // R60 does. The net is then drawn as past_through, not expanded.
+    #[test]
+    fn net_walked_past_through_part_is_past_through() {
+        let design = with_refdes_model("U3", json!([{"pins": ["7", "10"]}]));
+        let v = walk(&design, "/BUFMID", true);
+        let net = v["topology"]["nets"].as_array().unwrap().iter()
+            .find(|n| n["name"] == "/BUFRC")
+            .unwrap_or_else(|| panic!("/BUFRC: {v}"));
+        assert_eq!(net["state"], "past_through", "{net}");
+    }
+
+    // A gate pin the part lacks skips the pair, like a missing pair pin.
+    #[test]
+    fn missing_gate_skips_the_pair() {
+        let design = with_refdes_model("Q1", json!([{"pins": ["3", "2"], "gate": "9"}]));
+        let v: Value = serde_json::from_str(&design.comp_details("Q1", 10, 0).unwrap()).unwrap();
+        assert_eq!(v["through_warnings"], json!(["through pair #0 skipped: gate pin 9 is not on Q1"]));
+        let v = walk(&design, "EN", false);
+        let via_q1 = v["rails_reached"].as_array().unwrap().iter()
+            .any(|r| r["via"].as_array().unwrap().iter().any(|p| p["refdes"] == "Q1"));
+        assert!(!via_q1, "{v}");
     }
 }
 

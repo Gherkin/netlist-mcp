@@ -1966,10 +1966,16 @@ impl Design {
                         });
                     // Queued as a loose pin at its depth, not crossed now, so
                     // a shallower route still gets to those pairs first.
+                    // Every push is at the popped depth + 1 and pops come
+                    // in depth order, so a push at the back keeps each queue
+                    // in depth order.
+                    let push = |q: &mut std::collections::VecDeque<Queued>, e: Queued| {
+                        debug_assert!(q.back().is_none_or(|b| b.2 <= e.2));
+                        q.push_back(e);
+                    };
                     let queue_loose = |past: &mut std::collections::VecDeque<Queued>, via: Vec<Hop>| {
                         let p = other_pin_id.expect("a chained far pin");
-                        let at = past.partition_point(|e| e.2 <= d);
-                        past.insert(at, (At::Loose(p.0), via, d));
+                        push(past, (At::Loose(p.0), via, d));
                     };
                     let other_pin_has_no_net = other_pin_id
                         .map(|p| self.pin(p).net.is_none())
@@ -2064,8 +2070,7 @@ impl Design {
                     if d <= max_depth {
                         record_crossed(d);
                         let q = if next_drawn { &mut queue } else { &mut past_through };
-                        let at = q.partition_point(|e| e.2 <= d);
-                        q.insert(at, (At::Net(other_net_idx), via_here, d));
+                        push(q, (At::Net(other_net_idx), via_here, d));
                     } else {
                         // Depth-limited branch.
                         if next_drawn {
@@ -2414,9 +2419,10 @@ impl Design {
             );
         }
 
-        // A dropped route may have been shorter than the one found.
-        let capped_note = || {
-            data.expansions_capped.then(|| {
+        // A dropped route may have been shorter than the one found. At
+        // distance 1 none can be: distance 0 was answered above.
+        let capped_note = |distance: u32| {
+            (data.expansions_capped && distance > 1).then(|| {
                 "some routes were dropped at max_net_expansions, so a shorter path may exist"
                     .to_string()
             })
@@ -2429,18 +2435,21 @@ impl Design {
                 true,
                 Some(ep.distance),
                 ep.via.to_vec(),
-                capped_note(),
+                capped_note(ep.distance),
                 None,
                 topology(to_net),
             );
         }
         // `to` is reached, though not an endpoint: the far pin of a
         // through-model pair the walk crossed (an op-amp output, issue #47),
-        // or a pin of the start part itself. Take the shortest.
+        // or a pin of the start part itself. Take the shortest. `start_part`
+        // goes first: `min_by_key` keeps the first of equal depth, and a
+        // `crossed` route always ends in a through hop, so a drawn route
+        // wins a tie (rule 6).
         if let Some(c) = data
-            .crossed
+            .start_part
             .iter()
-            .chain(&data.start_part)
+            .chain(&data.crossed)
             .filter(|c| c.pin == to_canonical)
             .min_by_key(|c| c.distance)
         {
@@ -2451,7 +2460,7 @@ impl Design {
                 true,
                 Some(c.distance),
                 c.via.to_vec(),
-                capped_note(),
+                capped_note(c.distance),
                 None,
                 topology(to_net),
             );
@@ -2462,16 +2471,20 @@ impl Design {
         if let Some(to_net_id) = &to_pin.net {
             let to_net_name = &self.net(to_net_id).name;
             if let Some(rail) = data.rails_reached.iter().find(|r| &r.net == to_net_name) {
+                let mut note =
+                    format!("only via rail {} (shared power/ground, not a signal path)", rail.net);
+                if data.expansions_capped {
+                    note.push_str(
+                        "; some routes were dropped at max_net_expansions, so a signal path may be missing",
+                    );
+                }
                 return Self::path_between_envelope(
                     from,
                     to,
                     true,
                     Some(rail.via.len() as u32),
                     rail.via.to_vec(),
-                    Some(format!(
-                        "only via rail {} (shared power/ground, not a signal path)",
-                        rail.net
-                    )),
+                    Some(note),
                     None,
                     topology(to_net_id.0),
                 );
@@ -7074,10 +7087,18 @@ mod through_tests {
     #[test]
     fn start_part_pairs_on_start_net_are_crossed() {
         let design = with_refdes_model("X1", json!([{"pins": ["4", "1"]}]));
-        // X1:1 is on the start part, so only the pair can reach it.
+        let p = &design.pin_map["X1:2"];
+        let net = design.pin(p).net.as_ref().unwrap();
+        let data = design.walk_bfs(net, Some(p), 6, 100, true, false, 8);
+        let c = data.crossed.iter().find(|c| c.pin == "X1:1").expect("X1:1 crossed");
+        assert_eq!(c.distance, 1);
+        assert_eq!(c.via[0].pins, Some(["X1:4".to_string(), "X1:1".to_string()]));
+        // C30 reaches X1:1 at the same depth, and a drawn route is reported
+        // first (rule 6).
         let v = path(&design, "X1:2", "X1:1");
         assert_eq!(v["connected"], true, "{v}");
-        assert_eq!(v["via"][0]["pins"], json!(["X1:4", "X1:1"]), "{v}");
+        assert_eq!(v["distance"], 1, "{v}");
+        assert_eq!(v["via"][0]["refdes"], "C30", "{v}");
     }
 
     // Pairs chain across a shared pin that is alone on its net: U3:13 is
@@ -8245,6 +8266,25 @@ mod walk_oracle_tests {
     #[test]
     fn path_between_two_pins_of_one_part() {
         let d = design_of(&[("U1", &[1, 2]), ("R1", &[1, 2])], &["/A", "/B"]);
+        let v: serde_json::Value =
+            serde_json::from_str(&d.path_between("U1:1", "U1:2", false, 50, 8).unwrap()).unwrap();
+        assert_eq!(v["connected"], true, "{v}");
+        assert_eq!(v["distance"], 1, "{v}");
+        assert_eq!(v["via"][0]["refdes"], "R1", "{v}");
+    }
+
+    // A start-part pin reached at equal depth through the part's own pair
+    // and through a resistor: the drawn route (R1) is reported (rule 6).
+    #[test]
+    fn path_between_prefers_drawn_route_at_equal_depth() {
+        let mut d = design_of(&[("U1", &[1, 2, 1]), ("R1", &[1, 2])], &["/A", "/B"]);
+        let file = crate::sidecar::SidecarFile::parse(
+            &serde_json::json!({"refdes": {"U1": {"through": [{"pins": ["3", "2"]}]}}}).to_string(),
+            "t.json",
+            crate::sidecar::Origin::Project,
+        )
+        .unwrap();
+        d.attach_sidecar(crate::sidecar::Sidecar::from_files(vec![file], vec![]));
         let v: serde_json::Value =
             serde_json::from_str(&d.path_between("U1:1", "U1:2", false, 50, 8).unwrap()).unwrap();
         assert_eq!(v["connected"], true, "{v}");

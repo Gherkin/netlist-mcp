@@ -159,10 +159,12 @@ struct GetPinParams {
 macro_rules! max_net_expansions_doc {
     () => {
         "Max restriction sets kept per net (default 8, minimum 1; 0 is read \
-        as 1). Only matters with sidecar through-models: a net reached by \
-        routes that came out of different through pairs is walked once per \
-        such route, and this caps it so the call stays fast. A route with a \
-        subset of a kept route's restrictions is still walked, so a net can \
+        as 1). Only matters with sidecar through-models. A route's \
+        restriction set is the through-model pins it came out of a \
+        non-`chain` pair on; it never crosses that part's pairs from them \
+        again. A net reached under different sets is walked once per set, \
+        and this caps the sets kept so the call stays fast. A route whose \
+        set is a strict subset of a kept set is still walked, so a net can \
         be walked more times than this. Other routes past the cap are \
         dropped, so an endpoint or path can be missing or longer; raise it \
         to search further. walk sets `truncated` and `expansions_capped`; \

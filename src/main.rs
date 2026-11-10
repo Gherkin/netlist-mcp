@@ -448,8 +448,10 @@ impl NetlistServer {
         crossed second pin to first, and `conditional` with its `gate` for a \
         gate-controlled pair (not a plain wire). Its entry pin is still an \
         endpoint; the pin the walk comes out on is not, but the part's other \
-        pairs on that pin are crossed from it. From a pin, the pairs on that \
-        pin are crossed too. The topology graph stops at such a part and \
+        pairs on that pin are crossed from it, also when it is NC or alone on \
+        its net. From a pin, the start part's pairs on the start net are \
+        crossed too. At equal depth a route through plain series parts is \
+        taken before one through such a part. The topology graph stops at such a part and \
         lists it in through_not_drawn; a drawn net first walked past one is \
         in state past_through, and its parts are not drawn.")]
     fn walk(&self, Parameters(p): Parameters<WalkParams>) -> String {

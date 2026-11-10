@@ -94,8 +94,6 @@ struct ThroughModels {
 /// keyed by its pair index instead, so each pair is crossed once (issue #47).
 const PASSIVE_PAIR: usize = usize::MAX;
 
-/// One part crossed on a walk path. `cross` is set for a through-model pair
-/// (issue #47), unset for a 2-pin passive.
 /// Pops the shallowest queued route; at equal depth a drawn one (no
 /// through-model hop) before one past a through part.
 fn pop_shallowest(
@@ -133,15 +131,14 @@ fn pairs_on<'a>(
         if !visited.insert((comp, i)) {
             continue;
         }
-        let against = side == 1;
-        out.push((
-            &pair.pins[if against { 0 } else { 1 }],
-            Hop { comp, cross: Some(Cross { pair: i, against }) },
-        ));
+        let cross = Cross { pair: i, against: side == 1 };
+        out.push((cross.ends(pair).1, Hop { comp, cross: Some(cross) }));
     }
     out
 }
 
+/// One part crossed on a walk path. `cross` is set for a through-model pair
+/// (issue #47), unset for a 2-pin passive.
 #[derive(Debug, Clone, Copy)]
 struct Hop {
     comp: usize,
@@ -154,6 +151,14 @@ struct Cross {
     pair: usize,
     /// Crossed from the second declared pin to the first.
     against: bool,
+}
+
+impl Cross {
+    /// The pair's pins in crossing order: (entry pin, exit pin).
+    fn ends<'a>(&self, pair: &'a ResolvedPair) -> (&'a PinId, &'a PinId) {
+        let [a, b] = &pair.pins;
+        if self.against { (b, a) } else { (a, b) }
+    }
 }
 
 impl Design {
@@ -1381,8 +1386,7 @@ impl Design {
                 };
                 if let Some(cross) = hop.cross {
                     let pair = &through.pairs[&hop.comp][cross.pair];
-                    let [a, b] = &pair.pins;
-                    let (from, to) = if cross.against { (b, a) } else { (a, b) };
+                    let (from, to) = cross.ends(pair);
                     part.pins = Some([self.pin_name(from), self.pin_name(to)]);
                     part.pair = pair.name.clone();
                     part.against = cross.against;
@@ -1584,16 +1588,18 @@ impl Design {
             }
             let net = self.net(&NetId(net_idx));
             // The pin this route came out on, when its last hop crossed a
-            // through pair. It is no endpoint here (issue #47). Only the
-            // popped route counts: a net reached first by a plain part keeps
-            // the pin an endpoint.
-            let exit_pin = via.last().and_then(|h| {
-                let c = h.cross?;
-                let pair = through.pairs.get(&h.comp)?.get(c.pair)?;
-                Some(pair.pins[if c.against { 0 } else { 1 }].0)
-            });
-            // Whether the part's other pairs are crossed from `exit_pin`.
-            let exit_chains = via.last().is_some_and(|h| hop_chains(through, h));
+            // through pair, and whether that pair chains (the part's other
+            // pairs are crossed from it). The pin is no endpoint here (issue
+            // #47). Only the popped route counts: a net reached first by a
+            // plain part keeps the pin an endpoint.
+            let (exit_pin, exit_chains) = via
+                .last()
+                .and_then(|h| {
+                    let c = h.cross?;
+                    let pair = through.pairs.get(&h.comp)?.get(c.pair)?;
+                    Some((Some(c.ends(pair).1 .0), pair.chain))
+                })
+                .unwrap_or((None, false));
 
             // Terminal checks apply to every net except the start net, which is
             // always expanded once.
@@ -1701,8 +1707,8 @@ impl Design {
                     continue;
                 }
                 // Where the walk came out of a through-model pair: no
-                // endpoint, but the part's other pairs on this pin are
-                // crossed from it, so shared-pin models chain.
+                // endpoint, and the part's other pairs on this pin are
+                // crossed from it only when that pair sets `chain`.
                 let exit = Some(pin_id.0) == exit_pin;
 
                 let comp = self.component(comp_id);

@@ -450,7 +450,8 @@ impl NetlistServer {
         endpoint; the pin the walk comes out on is not. The walk does not \
         re-enter the part from that pin (a mux's NO1->COM->NO2 is no path), \
         unless the pair it came out of has `chain`: true; another route into \
-        that net still crosses the part from that pin. Each pair crossed is \
+        that net still crosses the part from that pin, which stays no \
+        endpoint. Each pair crossed is \
         one hop of distance and depth. From a pin, the \
         start part's pairs on the start net are crossed too. At equal depth \
         a route through plain series parts is taken before one through such \

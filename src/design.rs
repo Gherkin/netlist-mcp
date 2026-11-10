@@ -1607,9 +1607,10 @@ impl Design {
                 }
                 // The first route came out of a pair on this net and did not
                 // cross the part's other pairs from that pin. Another route
-                // into the net reaches the pin too, so it crosses them now.
+                // into the net reaches the pin too, so it crosses them now,
+                // as does one that came out on the pin of a `chain` pair.
                 match blocked_exit.get(&net_idx) {
-                    Some(&p) if exit_pin != Some(p) => {
+                    Some(&p) if exit_pin != Some(p) || exit_chains => {
                         blocked_exit.remove(&net_idx);
                         reexpand = Some(p);
                     }
@@ -1782,9 +1783,13 @@ impl Design {
                     // Out of a `chain` pair onto a far pin that leads nowhere
                     // on its own (NC, or alone on its net), the walk goes on
                     // across the part's other pairs on that pin.
+                    // Not past `max_depth`: a chained hop counts as depth.
                     let mut chain_on = || {
-                        let (true, Some(p), Some(pairs)) =
-                            (hop_chains(through, &hop), other_pin_id, through.pairs.get(&comp_id.0))
+                        let (true, Some(p), Some(pairs)) = (
+                            hop_chains(through, &hop) && d <= max_depth,
+                            other_pin_id,
+                            through.pairs.get(&comp_id.0),
+                        )
                         else {
                             return Vec::new();
                         };
@@ -1842,6 +1847,9 @@ impl Design {
                     // out there: not for a depth-limited crossing or one
                     // onto the same net.
                     let mut record_crossed = |dist: u32| {
+                        if dist > max_depth {
+                            return;
+                        }
                         if let (Some(_), Some(p)) = (hop.cross, other_pin_id) {
                             crossed.push(CrossedPin {
                                 pin: self.pin_name(p),
@@ -2238,8 +2246,15 @@ impl Design {
             );
         }
         // `to` is the far pin of a through-model pair the walk crossed (an
-        // op-amp output): reached, though not an endpoint (issue #47).
-        if let Some(c) = data.crossed.iter().find(|c| c.pin == to_canonical) {
+        // op-amp output): reached, though not an endpoint (issue #47). A
+        // chained crossing is recorded before a shorter one queued after it,
+        // so take the shortest.
+        if let Some(c) = data
+            .crossed
+            .iter()
+            .filter(|c| c.pin == to_canonical)
+            .min_by_key(|c| c.distance)
+        {
             let to_net = to_pin.net.as_ref().expect("a crossed pin has a net").0;
             return Self::path_between_envelope(
                 from,
@@ -6919,6 +6934,19 @@ mod through_tests {
         let w = walk(&design, "/BUFIN", false);
         let u3_10 = w["endpoints"].as_array().unwrap().iter().any(|e| e["pin"] == "U3:10");
         assert!(!u3_10, "{w}");
+    }
+
+    // 5->10 (no chain) reaches /BUFRC first and blocks U3:10. R60 and the
+    // `chain` pair 7->10 reach /BUFRC again out of U3:10 itself; the chain
+    // still crosses 10->8 from there.
+    #[test]
+    fn chain_pair_onto_blocked_exit_crosses_its_pairs() {
+        let design = with_refdes_model(
+            "U3",
+            json!([{"pins": ["5", "10"]}, {"pins": ["7", "10"], "chain": true}, {"pins": ["10", "8"]}]),
+        );
+        let v = path(&design, "J4:1", "U3:8");
+        assert_eq!(v["connected"], true, "{v}");
     }
 
     // A gate pin the part lacks skips the pair, like a missing pair pin.

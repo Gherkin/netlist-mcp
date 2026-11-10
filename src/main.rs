@@ -441,7 +441,7 @@ impl NetlistServer {
         schematic but not on the built board. include_topology adds a \
         net/part graph, capped at max_topology_parts (default 200) and not by \
         max_endpoints; check topology.truncated. A net whose state is not \
-        expanded was not walked past, so parts beyond it are not listed. \
+        expanded or past_through was not walked past, so parts beyond it are not listed. \
         A part with a sidecar through-model (`through` pin pairs, e.g. an \
         op-amp channel or a choke winding) is crossed too, either way: its \
         `via` entry names the `pins` crossed and the `pair`, `against` when \

@@ -1445,7 +1445,7 @@ impl Design {
     /// BFS traversal core shared by `walk` and `path_between`. Alternates
     /// net -> pins -> owning component -> (through a passthrough?) -> other net.
     /// Rails (`RAIL_THRESHOLD` when `stop_at_power`) and large nets (fanout > 40) are
-    /// terminal. Cycles are cut by `visited_nets` / `visited_comps`.
+    /// terminal. Cycles are cut by `popped` / `visited_comps`.
     ///
     /// Also surfaces `dead_ends`: branches that fizzle out through a passthrough
     /// (never the start net itself) instead of reaching a real endpoint — a
@@ -1468,7 +1468,6 @@ impl Design {
 
         let enrich = self.sidecar();
         let through = &enrich.through;
-        let mut visited_nets: std::collections::HashSet<usize> = std::collections::HashSet::new();
         // (part, pair) crossed so far: `PASSIVE_PAIR` for a 2-pin passive, the
         // pair index for a through-model part, so crossing one channel of a
         // quad op-amp leaves the other three open (issue #47).
@@ -1494,10 +1493,11 @@ impl Design {
 
         // Rails already stopped at, with their rounded score. A rail is never
         // expanded, so a later arrival over a different series part would be
-        // cut by `visited_nets` and lost (issue #31). Each such arrival gets
+        // cut by `popped` and lost (issue #31). Each such arrival gets
         // its own `rails_reached` entry instead.
         let mut rail_scores: HashMap<usize, f32> = HashMap::new();
-        // The state to note a popped net in when a later arrival is drawn.
+        // Every net popped so far (the visited set), with the state to note
+        // it in when a later arrival is drawn.
         // A net first popped past a through part is not noted then; a later
         // drawn arrival notes it, so every net a drawn series part reaches
         // is in the topology. A rail or large net keeps its state; an
@@ -1508,7 +1508,7 @@ impl Design {
             // The topology graph stops at a through-model part: nothing past
             // one is recorded for it (drawing it is a follow-up to #47).
             let drawn = via.iter().all(|h| h.cross.is_none());
-            if !visited_nets.insert(net_idx) {
+            if popped.contains_key(&net_idx) {
                 if let (true, Some(&state)) = (drawn, popped.get(&net_idx)) {
                     topo.note_net(net_idx, state);
                 }
@@ -1814,7 +1814,7 @@ impl Design {
             large_nets,
             dead_ends,
             truncated,
-            reached_net_count: visited_nets.len(),
+            reached_net_count: popped.len(),
             topo,
         }
     }
@@ -3029,7 +3029,7 @@ struct WalkData {
     large_nets: Vec<LargeNet>,
     dead_ends: Vec<DeadEnd>,
     truncated: bool,
-    /// Count of distinct nets `walk_bfs` visited (its `visited_nets` set size)
+    /// Count of distinct nets `walk_bfs` visited (its `popped` map size)
     /// — the size of the connected component reached from the start, used by
     /// `path_between`'s negative-result diagnosis. Does not affect walk/BFS
     /// behavior.
@@ -3348,12 +3348,14 @@ struct TopoNet {
     fanout: usize,
     /// Rail score at or above the rail threshold, whatever `state` is.
     rail: bool,
-    /// "expanded", "rail", "large_net", "depth_limit" or "dangling".
+    /// "expanded", "past_through", "rail", "large_net", "depth_limit" or
+    /// "dangling". "past_through": walked past, but first reached past a
+    /// through-model part, so its parts are not drawn.
     state: &'static str,
     /// Parts with a pin on this net that `max_topology_parts` cut. Above 0,
     /// this node's edges in the graph are incomplete. `max_endpoints` cuts
     /// nothing here (issue #35). Left out when 0. Absent does not mean complete: a node whose `state`
-    /// is not "expanded" was never walked past, so its other members are
+    /// is not "expanded" or "past_through" was never walked past, so its other members are
     /// not listed either way.
     #[serde(skip_serializing_if = "is_zero")]
     omitted_parts: usize,

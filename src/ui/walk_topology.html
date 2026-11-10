@@ -713,7 +713,7 @@ function render(data) {
     else if (n.state === "depth_limit") notes.push("depth limit");
     else if (n.state === "dangling") notes.push("dangling");
     else if (n.state === "rail") notes.push("rail");
-    else if (n.state === "past_through") notes.push("past a through part, not drawn");
+    else if (n.state === "past_through") notes.push("reached past a through part, parts not drawn");
     if (n.omitted_parts) notes.push("+" + n.omitted_parts + " parts cut");
     if (notes.length) text(g, x, TOP - 33, notes.join(", "), "note", "middle");
     if (n.state !== "expanded") line(g, x, yBot, x, yBot + 14, "bus cont");

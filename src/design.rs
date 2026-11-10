@@ -115,11 +115,14 @@ fn restrictions(via: &[Hop], through: &ThroughModels) -> Vec<(usize, usize)> {
     r
 }
 
-/// Default for `max_net_expansions`: the most times `walk_bfs` expands one
-/// net, once per restriction set none of the earlier ones is a subset of.
-/// Each set has its own visited parts, so without a cap the work can grow
-/// exponentially with the through parts on a route. A route past the cap is
-/// dropped and the walk is `truncated`.
+/// Default for `max_net_expansions`: the most restriction sets `walk_bfs`
+/// keeps for one net, sets that no other kept set is a subset of. Each set
+/// has its own visited parts, so without a cap the work can grow
+/// exponentially with the through parts on a route. A route under a strict
+/// subset of a kept set is always walked and replaces it, so the route with
+/// the fewest restrictions is never dropped; this is bounded, as each such
+/// walk shrinks a kept set. Any other new route past the cap is dropped and
+/// the walk is `truncated`.
 pub const DEFAULT_MAX_NET_EXPANSIONS: u32 = 8;
 
 /// What a repeat arrival at a net expanded under `seen` does under `restrict`.
@@ -127,7 +130,7 @@ pub const DEFAULT_MAX_NET_EXPANSIONS: u32 = 8;
 enum Reexpand {
     /// One of `seen` is a subset of `restrict`: nothing new to find.
     Skip,
-    /// New, but the net was expanded `cap` times already.
+    /// New and no seen set covers it, but `seen` is at the cap.
     Capped,
     Yes,
 }
@@ -135,6 +138,9 @@ enum Reexpand {
 fn reexpand(seen: &[Vec<(usize, usize)>], restrict: &[(usize, usize)], cap: usize) -> Reexpand {
     if seen.iter().any(|r| is_subset(r, restrict)) {
         Reexpand::Skip
+    } else if seen.iter().any(|r| is_subset(restrict, r)) {
+        // A strict subset (equal sets were skipped above): never capped.
+        Reexpand::Yes
     } else if seen.len() >= cap {
         Reexpand::Capped
     } else {
@@ -1553,6 +1559,7 @@ impl Design {
             large_nets: data.large_nets,
             dead_ends: data.dead_ends,
             truncated: data.truncated,
+            expansions_capped: data.expansions_capped,
             topology,
         };
         return Ok(serde_json::to_string_pretty(&envelope).context("error serializing walk")?);
@@ -1680,8 +1687,8 @@ impl Design {
                 }
                 // A rail or large net is never expanded. Another net is
                 // expanded again only under fewer restrictions than every
-                // time before, at most `max_net_expansions` times in all, and
-                // that expansion is not drawn.
+                // time before, within `max_net_expansions` (see `reexpand`),
+                // and that expansion is not drawn.
                 let Some(seen) = expanded.get(&net_idx) else {
                     continue;
                 };
@@ -1794,7 +1801,11 @@ impl Design {
                     topo.note_net(net_idx, NetState::Expanded);
                 }
             }
-            expanded.entry(net_idx).or_default().push(restrict.clone());
+            // A kept set that this one is a subset of covers nothing more,
+            // so it is replaced and stops counting toward the cap.
+            let seen = expanded.entry(net_idx).or_default();
+            seen.retain(|r| !is_subset(&restrict, r));
+            seen.push(restrict.clone());
             // The exit pin is no endpoint, on this route nor on a later
             // expansion of the net. A plain route that got here first has
             // already listed it.
@@ -3772,6 +3783,10 @@ struct WalkEnvelope {
     large_nets: Vec<LargeNet>,
     dead_ends: Vec<DeadEnd>,
     truncated: bool,
+    /// A route was dropped at `max_net_expansions` (also sets `truncated`),
+    /// so an endpoint can be missing. Left out when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    expansions_capped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     topology: Option<Topology>,
 }
@@ -7078,9 +7093,9 @@ mod through_tests {
         assert_eq!(reexpand(&[a.clone()], &b, 8), Reexpand::Yes);
         assert_eq!(reexpand(&[a.clone()], &b, 1), Reexpand::Capped);
         assert_eq!(reexpand(&[a.clone(), b.clone()], &[(5, 6)], 2), Reexpand::Capped);
-        // A set no seen set is a subset of is capped, also when it is a
-        // strict subset of one of them.
-        assert_eq!(reexpand(&[vec![(1, 2), (3, 4)]], &a, 1), Reexpand::Capped);
+        // A strict subset of a seen set is walked, also at the cap.
+        assert_eq!(reexpand(&[vec![(1, 2), (3, 4)]], &a, 1), Reexpand::Yes);
+        assert_eq!(reexpand(&[vec![(1, 2)]], &[], 1), Reexpand::Yes);
     }
 
     // Order B of the mux above needs /BUFMID walked twice. With
@@ -7114,8 +7129,12 @@ mod through_tests {
             serde_json::from_str(&design.walk("J4:1", 6, 50, true, false, 200, cap).expect("walk"))
                 .unwrap()
         };
-        assert_eq!(run(1)["truncated"], true);
-        assert_eq!(run(super::DEFAULT_MAX_NET_EXPANSIONS)["truncated"], false);
+        let capped = run(1);
+        assert_eq!(capped["truncated"], true, "{capped}");
+        assert_eq!(capped["expansions_capped"], true, "{capped}");
+        let full = run(super::DEFAULT_MAX_NET_EXPANSIONS);
+        assert_eq!(full["truncated"], false, "{full}");
+        assert!(full.get("expansions_capped").is_none(), "{full}");
     }
 
     // Only 5->10 and 10->8, no chain. U3:8 is reached only by crossing U3

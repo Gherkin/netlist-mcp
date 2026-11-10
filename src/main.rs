@@ -163,8 +163,8 @@ macro_rules! max_net_expansions_doc {
         that came out of different through pairs is walked once per such \
         route, and this caps it so the call stays fast. Past the cap routes \
         are dropped, so an endpoint or path can be missing; raise it to \
-        search further. walk sets `truncated`; path_between has no \
-        `truncated` and says so in its `note` when not connected."
+        search further. walk sets `truncated` and `expansions_capped`; \
+        path_between says so in its `note` when not connected."
     };
 }
 

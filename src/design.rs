@@ -95,12 +95,11 @@ struct ThroughModels {
 /// restriction set (issue #47).
 const PASSIVE_PAIR: usize = usize::MAX;
 
-/// The restriction set of a walk route: every (part, pin) its via came out
-/// of a pair on that is not `chain`, sorted. The route never crosses that
-/// part's pairs from that pin (a mux's COM->NO1 and COM->NO2 never join NO1
-/// to NO2). On the net it came out on, `is_restricted` stops it. It never
-/// gets back to that net later: its set only grows, so `walk_bfs` drops any
-/// arrival at a net already expanded under a subset of it.
+/// The restriction set of a walk route (rule 4b in `walk_bfs`): every
+/// (part, pin) its via came out of a pair on that is not `chain`, sorted.
+/// On the net it came out on, `is_restricted` stops it. It never gets back
+/// to that net later: its set only grows, so `walk_bfs` drops any arrival
+/// at a net already expanded under a subset of it.
 fn restrictions(via: &[Hop], through: &ThroughModels) -> Vec<(usize, usize)> {
     let mut r: Vec<(usize, usize)> = via
         .iter()
@@ -161,12 +160,25 @@ fn is_restricted(restrict: &[(usize, usize)], comp: usize, pin: usize) -> bool {
     restrict.binary_search(&(comp, pin)).is_ok()
 }
 
+/// Where a queued walk route is.
+#[derive(Debug, Clone, Copy)]
+enum At {
+    /// On a net, to be walked.
+    Net(usize),
+    /// On a pin that is NC or alone on its net, out of a `chain` pair (rule
+    /// 4c): only its part's other pairs on it are crossed. Queued like a
+    /// net, so its crossings happen in depth order.
+    Loose(usize),
+}
+
+type Queued = (At, Vec<Hop>, u32);
+
 /// Pops the shallowest queued route; at equal depth a drawn one (no
 /// through-model hop) before one past a through part.
 fn pop_shallowest(
-    drawn: &mut std::collections::VecDeque<(usize, Vec<Hop>, u32)>,
-    past: &mut std::collections::VecDeque<(usize, Vec<Hop>, u32)>,
-) -> Option<(usize, Vec<Hop>, u32)> {
+    drawn: &mut std::collections::VecDeque<Queued>,
+    past: &mut std::collections::VecDeque<Queued>,
+) -> Option<Queued> {
     match (drawn.front(), past.front()) {
         (Some(a), Some(b)) if b.2 < a.2 => past.pop_front(),
         (Some(_), _) => drawn.pop_front(),
@@ -1567,11 +1579,49 @@ impl Design {
         return Ok(serde_json::to_string_pretty(&envelope).context("error serializing walk")?);
     }
 
-    /// BFS traversal core shared by `walk` and `path_between`. Alternates
-    /// net -> pins -> owning component -> (through a passthrough?) -> other net.
-    /// Rails (`RAIL_THRESHOLD` when `stop_at_power`) and large nets (fanout > 40) are
-    /// terminal. Cycles are cut by `expanded` and the per-restriction-set
-    /// visited parts in `layers` (see `restrictions`).
+    /// BFS traversal core shared by `walk` and `path_between`.
+    ///
+    /// # Walk rules
+    ///
+    /// The one statement of what a walk finds. Comments elsewhere name a
+    /// rule by number instead of saying it again, and `walk_oracle_tests`
+    /// checks the code against these rules by brute force.
+    ///
+    /// 1. A route starts on the start net and crosses one part per hop:
+    ///    a 2-pin passive, pin to pin, or a through-model pair (issue #47),
+    ///    either way round. A route crosses each passive and each pair at
+    ///    most once, and is at most `max_depth` hops.
+    /// 2. A rail (`RAIL_THRESHOLD`, when `stop_at_power`) or a net with more
+    ///    than 40 pins is reached but never walked past. The start net is
+    ///    always walked.
+    /// 3. From the start net, the start part is crossed only across its
+    ///    through pairs.
+    /// 4. Where a route came out of a pair, on pin p of part U:
+    ///    a. p is not an endpoint on that route;
+    ///    b. the route never crosses U's pairs from p again, unless the pair
+    ///       it came out of sets `chain` (its restriction set, see
+    ///       `restrictions`);
+    ///    c. out of a `chain` pair onto a pin alone on its net, the route
+    ///       goes on across U's other pairs on that pin.
+    /// 5. Results, each at the depth of the shortest route to it:
+    ///    endpoints (every pin on a walked net that is not a passive's, not
+    ///    the start part's, and not excluded by 4a), `crossed` (every far
+    ///    pin of a crossed pair), `start_part` (every start-part pin on a
+    ///    walked net other than the start net, not excluded by 4a; for
+    ///    `path_between` only) and `rails_reached`.
+    /// 6. Route order decides only: whether a through part's pin is listed
+    ///    as an endpoint or only as `crossed` (4a for one route, not for
+    ///    another); and which route of equal depth is reported, a drawn one
+    ///    (no through hop) first.
+    /// 7. `max_net_expansions` limits the restriction sets kept per net (see
+    ///    `DEFAULT_MAX_NET_EXPANSIONS`). A route it drops sets
+    ///    `expansions_capped`, and results can then be missing or deeper.
+    ///
+    /// How: a BFS over (net, restriction set). A net is walked again only
+    /// under a set that no kept set is a subset of (`reexpand`), as a
+    /// larger set can only do less. Parts crossed are kept per set
+    /// (`layers`), not per route; that equals rule 1 as long as routes are
+    /// crossed in depth order.
     ///
     /// Also surfaces `dead_ends`: branches that fizzle out through a passthrough
     /// (never the start net itself) instead of reaching a real endpoint — a
@@ -1597,13 +1647,10 @@ impl Design {
 
         let enrich = self.sidecar();
         let through = &enrich.through;
-        // (part, pair) crossed so far, per restriction set (see
-        // `restrictions`): `PASSIVE_PAIR` for a 2-pin passive, the pair index
+        // (part, pair) crossed so far, per restriction set (rule 1, and the
+        // "How" note): `PASSIVE_PAIR` for a 2-pin passive, the pair index
         // for a through-model part, so crossing one channel of a quad op-amp
-        // leaves the other three open (issue #47). Routes under different
-        // restrictions do not use up each other's parts, so which one is
-        // queued first does not decide which parts are crossed. (It still
-        // decides whether an exit pin is an endpoint; see `endpoint_seen`.)
+        // leaves the other three open.
         let mut layers: HashMap<Vec<(usize, usize)>, HashSet<(usize, usize)>> = HashMap::new();
         // Net -> the kept restriction sets it was expanded under: none is a
         // subset of another, as a set replaces the kept sets it is a subset
@@ -1616,6 +1663,8 @@ impl Design {
         // Far pin -> the shortest crossing that came out there. A pair can be
         // crossed once per restriction set, so keep one entry per pin.
         let mut crossed: HashMap<String, CrossedPin> = HashMap::new();
+        // Start-part pin -> the shortest route that reached it.
+        let mut start_part: HashMap<String, CrossedPin> = HashMap::new();
         let mut endpoint_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut dead_end_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1629,11 +1678,9 @@ impl Design {
         // Drawn routes (no through-model hop) and routes past a through
         // part. At equal depth a drawn route is popped first, so a net that
         // a plain series part reaches is drawn, and its via is the plain one.
-        let mut queue: std::collections::VecDeque<(usize, Vec<Hop>, u32)> =
-            std::collections::VecDeque::new();
-        let mut past_through: std::collections::VecDeque<(usize, Vec<Hop>, u32)> =
-            std::collections::VecDeque::new();
-        queue.push_back((start_net_idx, Vec::new(), 0));
+        let mut queue: std::collections::VecDeque<Queued> = std::collections::VecDeque::new();
+        let mut past_through: std::collections::VecDeque<Queued> = std::collections::VecDeque::new();
+        queue.push_back((At::Net(start_net_idx), Vec::new(), 0));
 
         // Rails already stopped at, with their rounded score. A rail is never
         // expanded, so a later arrival over a different series part would be
@@ -1648,7 +1695,13 @@ impl Design {
         // expanded one is `PastThrough`, as its parts were not drawn.
         let mut popped: HashMap<usize, NetState> = HashMap::new();
 
-        while let Some((net_idx, via, depth)) = pop_shallowest(&mut queue, &mut past_through) {
+        while let Some((at, via, depth)) = pop_shallowest(&mut queue, &mut past_through) {
+            // A loose pin (rule 4c) is no net: only that pin is walked, and
+            // nothing below that keeps per-net state applies to it.
+            let (net_idx, loose) = match at {
+                At::Net(n) => (n, None),
+                At::Loose(p) => (usize::MAX, Some(PinId(p))),
+            };
             // The topology graph stops at a through-model part: nothing past
             // one is recorded for it (drawing it is a follow-up to #47).
             let mut drawn = via.iter().all(|h| h.cross.is_none());
@@ -1666,8 +1719,8 @@ impl Design {
                 let c = h.cross?;
                 Some(c.ends(through.pairs.get(&h.comp)?.get(c.pair)?).1 .0)
             });
-            let first_pop = !popped.contains_key(&net_idx);
-            if !first_pop {
+            let first_pop = loose.is_none() && !popped.contains_key(&net_idx);
+            if loose.is_none() && !first_pop {
                 if let (true, Some(&state)) = (drawn, popped.get(&net_idx)) {
                     topo.note_net(net_idx, state);
                 }
@@ -1707,11 +1760,12 @@ impl Design {
                 }
                 drawn = false;
             }
-            let net = self.net(&NetId(net_idx));
+            let net = loose.is_none().then(|| self.net(&NetId(net_idx)));
 
             // Terminal checks apply to every net except the start net, which is
             // always expanded once. A later expansion already passed them.
             if net_idx != start_net_idx && first_pop {
+                let net = net.expect("only a net is first popped");
                 if stop_at_power {
                     let (score, _evidence) = self.rail_score(net);
                     if score >= RAIL_THRESHOLD {
@@ -1805,35 +1859,50 @@ impl Design {
                     topo.note_net(net_idx, NetState::Expanded);
                 }
             }
-            // A kept set that this one is a subset of covers nothing more,
-            // so it is replaced and stops counting toward the cap.
-            let seen = expanded.entry(net_idx).or_default();
-            seen.retain(|r| !is_subset(&restrict, r));
-            seen.push(restrict.clone());
-            // The exit pin is no endpoint, on this route nor on a later
-            // expansion of the net. A plain route that got here first has
-            // already listed it.
-            if let Some(p) = exit_pin {
-                endpoint_seen.insert(self.pin_name(&PinId(p)));
-            }
+            let walk_pins: &[PinId] = match (&loose, net) {
+                (Some(p), _) => std::slice::from_ref(p),
+                (None, Some(net)) => {
+                    // A kept set that this one is a subset of covers nothing
+                    // more, so it is replaced and stops counting toward the cap.
+                    let seen = expanded.entry(net_idx).or_default();
+                    seen.retain(|r| !is_subset(&restrict, r));
+                    seen.push(restrict.clone());
+                    // The exit pin is no endpoint, on this route nor on a
+                    // later expansion of the net. A plain route that got here
+                    // first has already listed it.
+                    if let Some(p) = exit_pin {
+                        endpoint_seen.insert(self.pin_name(&PinId(p)));
+                    }
+                    &net.pins
+                }
+                (None, None) => unreachable!("a net route has a net"),
+            };
             let visited_comps = layers.entry(restrict.clone()).or_default();
 
-            for pin_id in &net.pins {
+            for pin_id in walk_pins {
                 let pin = self.pin(pin_id);
                 let comp_id = &pin.comp;
 
-                // At the start net, never walk back into the start component,
-                // except across its through pairs on the start net, so a path
-                // is found in both directions (issue #47).
+                // A start-part pin a route reaches is no endpoint (rule 5),
+                // but `path_between` can end on it.
+                if Some(comp_id.0) == start_comp_idx && !via.is_empty() && Some(pin_id.0) != exit_pin {
+                    let name = self.pin_name(pin_id);
+                    if start_part.get(&name).is_none_or(|c| depth < c.distance) {
+                        start_part.insert(
+                            name.clone(),
+                            CrossedPin { pin: name, via: self.via_parts(&via, through), distance: depth },
+                        );
+                    }
+                }
+
+                // Rule 3.
                 if via.is_empty()
                     && Some(comp_id.0) == start_comp_idx
                     && !through.pairs.contains_key(&comp_id.0)
                 {
                     continue;
                 }
-                // Where the walk came out of a through-model pair: no
-                // endpoint. The part's pairs on a pin this route came out on
-                // are crossed only when that pair sets `chain`.
+                // Rules 4a and 4b.
                 let exit = Some(pin_id.0) == exit_pin;
                 let blocked = is_restricted(&restrict, comp_id.0, pin_id.0);
                 // A route never gets back to a net it expanded (its set only
@@ -1866,9 +1935,7 @@ impl Design {
                     ));
                 } else if let Some(pairs) = through.pairs.get(&comp_id.0) {
                     // Every declared pair this pin is on, either way round
-                    // (issue #47). Each pair is crossed once per restriction
-                    // set. None from a pin this route came out on, unless
-                    // out of a `chain` pair.
+                    // (rule 1), none when 4b blocks the pin.
                     let pairs: &[ResolvedPair] = if blocked { &[] } else { pairs };
                     for (far, hop) in pairs_on(pairs, comp_id.0, pin_id.0, visited_comps) {
                         crossings.push((Some(far), extend(&via, hop)));
@@ -1884,26 +1951,25 @@ impl Design {
                     // Every hop counts, a chained one too, so the depth of
                     // the far net is the length of its via.
                     let d = via_here.len() as u32;
-                    // Out of a `chain` pair onto a far pin that leads nowhere
-                    // on its own (NC, or alone on its net), the walk goes on
-                    // across the part's other pairs on that pin.
-                    // Not past `max_depth`: a chained hop counts as depth.
-                    let mut chain_on = || {
-                        let (true, Some(p), Some(pairs)) = (
-                            hop_chains(through, &hop) && d <= max_depth,
-                            other_pin_id,
-                            through.pairs.get(&comp_id.0),
-                        )
-                        else {
-                            return Vec::new();
-                        };
-                        // `p` is NC or alone on its net, so no queued route
-                        // came out onto it: never restricted.
-                        debug_assert!(!is_restricted(&restrict, comp_id.0, p.0));
-                        pairs_on(pairs, comp_id.0, p.0, visited_comps)
-                            .into_iter()
-                            .map(|(far, h)| (Some(far), extend(&via_here, h)))
-                            .collect::<Vec<_>>()
+                    // Rule 4c (also for an NC far pin): whether the part has
+                    // another pair on the far pin not crossed yet. Not past
+                    // `max_depth`: a chained hop counts as depth.
+                    let chains_on = hop_chains(through, &hop)
+                        && d <= max_depth
+                        && other_pin_id.is_some_and(|p| {
+                            through.pairs.get(&comp_id.0).is_some_and(|pairs| {
+                                pairs.iter().enumerate().any(|(i, pair)| {
+                                    pair.pins.iter().any(|x| x.0 == p.0)
+                                        && !visited_comps.contains(&(comp_id.0, i))
+                                })
+                            })
+                        });
+                    // Queued as a loose pin at its depth, not crossed now, so
+                    // a shallower route still gets to those pairs first.
+                    let queue_loose = |past: &mut std::collections::VecDeque<Queued>, via: Vec<Hop>| {
+                        let p = other_pin_id.expect("a chained far pin");
+                        let at = past.partition_point(|e| e.2 <= d);
+                        past.insert(at, (At::Loose(p.0), via, d));
                     };
                     let other_pin_has_no_net = other_pin_id
                         .map(|p| self.pin(p).net.is_none())
@@ -1923,9 +1989,8 @@ impl Design {
                         }
                     }
                     if other_pin_has_no_net {
-                        let more = chain_on();
-                        if !more.is_empty() {
-                            crossings.extend(more);
+                        if chains_on {
+                            queue_loose(&mut past_through, via_here);
                             continue;
                         }
                         // Far pin is NC -> dangling, goes nowhere.
@@ -1976,9 +2041,8 @@ impl Design {
                         // Far pin's net has fanout 1 (only that pin) ->
                         // dangling, goes nowhere.
                         record_crossed(d);
-                        let more = chain_on();
-                        if !more.is_empty() {
-                            crossings.extend(more);
+                        if chains_on {
+                            queue_loose(&mut past_through, via_here);
                             continue;
                         }
                         if next_drawn {
@@ -2000,10 +2064,8 @@ impl Design {
                     if d <= max_depth {
                         record_crossed(d);
                         let q = if next_drawn { &mut queue } else { &mut past_through };
-                        // A chained route is deeper than the ones queued
-                        // after it, so insert in depth order.
                         let at = q.partition_point(|e| e.2 <= d);
-                        q.insert(at, (other_net_idx, via_here, d));
+                        q.insert(at, (At::Net(other_net_idx), via_here, d));
                     } else {
                         // Depth-limited branch.
                         if next_drawn {
@@ -2014,8 +2076,7 @@ impl Design {
                 }
 
                 if !is_passthrough {
-                    // Endpoint. A through-model part is one too, on the pin
-                    // the walk arrived on. Never report the start component.
+                    // Endpoint (rule 5).
                     if exit || Some(comp_id.0) == start_comp_idx {
                         continue;
                     }
@@ -2056,6 +2117,7 @@ impl Design {
 
         WalkData {
             crossed: crossed.into_values().collect(),
+            start_part: start_part.into_values().collect(),
             endpoints,
             rails_reached,
             large_nets,
@@ -2372,17 +2434,17 @@ impl Design {
                 topology(to_net),
             );
         }
-        // `to` is the far pin of a through-model pair the walk crossed (an
-        // op-amp output): reached, though not an endpoint (issue #47). A
-        // chained crossing is recorded before a shorter one queued after it,
-        // so take the shortest.
+        // `to` is reached, though not an endpoint: the far pin of a
+        // through-model pair the walk crossed (an op-amp output, issue #47),
+        // or a pin of the start part itself. Take the shortest.
         if let Some(c) = data
             .crossed
             .iter()
+            .chain(&data.start_part)
             .filter(|c| c.pin == to_canonical)
             .min_by_key(|c| c.distance)
         {
-            let to_net = to_pin.net.as_ref().expect("a crossed pin has a net").0;
+            let to_net = to_pin.net.as_ref().expect("a reached pin has a net").0;
             return Self::path_between_envelope(
                 from,
                 to,
@@ -3300,6 +3362,9 @@ struct WalkData {
     /// The far pins of through-model pairs the walk crossed (issue #47).
     /// They are not endpoints, but `path_between` can end on one.
     crossed: Vec<CrossedPin>,
+    /// The start part's pins a route reached, off the start net. They are
+    /// not endpoints (rule 5), but `path_between` can end on one.
+    start_part: Vec<CrossedPin>,
     endpoints: Vec<WalkEndpoint>,
     rails_reached: Vec<RailReached>,
     large_nets: Vec<LargeNet>,
@@ -7769,5 +7834,449 @@ mod walk_topology_tests {
         t.note_net(8, NetState::Rail);
         t.note_net(8, NetState::DepthLimit);
         assert_eq!(t.nets, [(7, NetState::Expanded), (8, NetState::Rail)]);
+    }
+}
+
+/// Brute-force check of `walk_bfs` against the walk rules in its doc. The
+/// oracle is a plain BFS over route states (where the route is, its
+/// restriction set, the pin it came out on), with none of the walk's
+/// pruning (`expanded`, `layers`, `reexpand`), run on many small random
+/// designs with through-models.
+#[cfg(test)]
+mod walk_oracle_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+    /// xorshift64, so a failing seed reproduces.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        fn chance(&mut self, pct: u64) -> bool {
+            self.next() % 100 < pct
+        }
+    }
+
+    /// Nets /N0.. (sometimes GND too), 2-pin resistors, plain parts J and
+    /// U parts with random through pairs. A pin is sometimes alone on its
+    /// net, as KiCad exports an unconnected pin.
+    fn random_design(rng: &mut Rng) -> Design {
+        let shared = 3 + rng.below(6);
+        let mut nets: Vec<netlist::Net> =
+            (0..shared).map(|i| netlist::Net { code: i + 1, name: format!("/N{i}") }).collect();
+        if rng.chance(30) {
+            nets.push(netlist::Net { code: nets.len() + 1, name: "GND".into() });
+        }
+        let shared = nets.len();
+        let mut parts: Vec<(String, usize)> = Vec::new();
+        for i in 0..rng.below(6) {
+            parts.push((format!("R{}", i + 1), 2));
+        }
+        for i in 0..rng.below(3) {
+            parts.push((format!("J{}", i + 1), 1 + rng.below(2)));
+        }
+        for i in 0..1 + rng.below(3) {
+            parts.push((format!("U{}", i + 1), 2 + rng.below(4)));
+        }
+        let mut components = Vec::new();
+        let mut models = serde_json::Map::new();
+        for (refdes, pin_count) in parts {
+            let mut comp = netlist::Component::new();
+            comp.refdes = refdes.clone();
+            comp.value = "x".into();
+            comp.lib_id = "L:P".into();
+            for n in 1..=pin_count {
+                let code = if rng.chance(15) {
+                    nets.push(netlist::Net { code: nets.len() + 1, name: format!("/L_{refdes}_{n}") });
+                    nets.len()
+                } else {
+                    1 + rng.below(shared)
+                };
+                let mut pin = netlist::Pin::new();
+                pin.number = n.to_string();
+                pin.net = Some(code);
+                pin.pin_type = Some("passive".into());
+                comp.pins.push(pin);
+            }
+            if refdes.starts_with('U') {
+                let mut seen: HashSet<(usize, usize)> = HashSet::new();
+                let mut through = Vec::new();
+                for _ in 0..rng.below(4) {
+                    let a = 1 + rng.below(pin_count);
+                    let b = 1 + rng.below(pin_count);
+                    if a == b || !seen.insert((a.min(b), a.max(b))) {
+                        continue;
+                    }
+                    through.push(serde_json::json!({
+                        "pins": [a.to_string(), b.to_string()],
+                        "chain": rng.chance(40),
+                    }));
+                }
+                if !through.is_empty() {
+                    models.insert(refdes.clone(), serde_json::json!({"through": through}));
+                }
+            }
+            components.push(comp);
+        }
+        let mut design =
+            Design::from_netlist(netlist::Netlist { components, nets, sheets: Vec::new() })
+                .expect("random design builds");
+        let file = crate::sidecar::SidecarFile::parse(
+            &serde_json::json!({"refdes": models}).to_string(),
+            "t.json",
+            crate::sidecar::Origin::Project,
+        )
+        .expect("random models parse");
+        design.attach_sidecar(crate::sidecar::Sidecar::from_files(vec![file], vec![]));
+        design
+    }
+
+    /// Every part, its pins' nets and its pairs, for a failure message.
+    fn describe(d: &Design) -> String {
+        let enrich = d.sidecar();
+        let mut s = String::new();
+        for c in &d.components {
+            let pins: Vec<String> = c
+                .pins
+                .iter()
+                .map(|p| {
+                    let pin = d.pin(p);
+                    format!("{}={}", pin.number, pin.net.as_ref().map_or("-", |n| d.net(n).name.as_str()))
+                })
+                .collect();
+            s += &format!("{}: {}", c.refdes, pins.join(" "));
+            for pair in enrich.through.pairs.get(&c.id.0).into_iter().flatten() {
+                s += &format!(
+                    " | {}->{}{}",
+                    d.pin(&pair.pins[0]).number,
+                    d.pin(&pair.pins[1]).number,
+                    if pair.chain { " chain" } else { "" }
+                );
+            }
+            s += "\n";
+        }
+        s
+    }
+
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    enum Pos {
+        Net(usize),
+        /// A pin alone on its net, reached out of a `chain` pair: only the
+        /// part's other pairs on it can be crossed from here.
+        Loose(usize),
+    }
+
+    #[derive(Default, Debug)]
+    struct Expect {
+        /// Pin -> least depth at which it sits on an expanded net, is not
+        /// the pin the route came out on, and is no passive or start part.
+        arrival: BTreeMap<String, u32>,
+        /// Far pin of a through pair -> least depth of a crossing onto it.
+        crossed: BTreeMap<String, u32>,
+        /// Start-part pin off the start net -> least depth at which it sits
+        /// on an expanded net and is not the pin the route came out on.
+        start_part: BTreeMap<String, u32>,
+        rails: BTreeSet<String>,
+    }
+
+    fn keep_min(m: &mut BTreeMap<String, u32>, k: String, v: u32) {
+        let e = m.entry(k).or_insert(v);
+        *e = (*e).min(v);
+    }
+
+    fn oracle(d: &Design, start_net: usize, start_pin: Option<usize>, max_depth: u32) -> Expect {
+        let enrich = d.sidecar();
+        let pairs = &enrich.through.pairs;
+        let start_comp = start_pin.map(|p| d.pins[p].comp.0);
+        let passive = |c: usize| {
+            let comp = &d.components[c];
+            is_passive_passthrough(&Design::refdes_class(&comp.refdes), comp.pins.len())
+        };
+        let mut out = Expect::default();
+        // Where, restriction set, exit pin, and the (part, pair) this route
+        // has crossed (`PASSIVE_PAIR` for a passive): a route crosses each
+        // at most once.
+        type State = (Pos, Vec<(usize, usize)>, Option<usize>, BTreeSet<(usize, usize)>);
+        let mut seen: HashSet<State> = HashSet::new();
+        let mut queue: VecDeque<(State, u32)> = VecDeque::new();
+        let s0: State = (Pos::Net(start_net), Vec::new(), None, BTreeSet::new());
+        seen.insert(s0.clone());
+        queue.push_back((s0, 0));
+        while let Some(((pos, restrict, exit, used), depth)) = queue.pop_front() {
+            let mut from: Vec<usize> = Vec::new();
+            let cur_net = match pos {
+                Pos::Net(n) => {
+                    let net = &d.nets[n];
+                    if n != start_net && d.rail_score(net).0 >= RAIL_THRESHOLD {
+                        out.rails.insert(net.name.clone());
+                        continue;
+                    }
+                    for p in &net.pins {
+                        let c = d.pins[p.0].comp.0;
+                        if !passive(c) && Some(c) != start_comp && Some(p.0) != exit {
+                            keep_min(&mut out.arrival, d.pin_name(p), depth);
+                        }
+                        if Some(c) == start_comp && n != start_net && Some(p.0) != exit {
+                            keep_min(&mut out.start_part, d.pin_name(p), depth);
+                        }
+                        if n == start_net && Some(c) == start_comp && !pairs.contains_key(&c) {
+                            continue;
+                        }
+                        from.push(p.0);
+                    }
+                    Some(n)
+                }
+                Pos::Loose(p) => {
+                    from.push(p);
+                    None
+                }
+            };
+            let nd = depth + 1;
+            for p in from {
+                let c = d.pins[p].comp.0;
+                // (far pin, `chain` for a through pair, None for a passive,
+                // the used key)
+                let mut moves: Vec<(usize, Option<bool>, (usize, usize))> = Vec::new();
+                if passive(c) {
+                    if let Some(f) = d.components[c].pins.iter().find(|x| x.0 != p) {
+                        moves.push((f.0, None, (c, PASSIVE_PAIR)));
+                    }
+                } else if let Some(ps) = pairs.get(&c) {
+                    if restrict.binary_search(&(c, p)).is_ok() {
+                        continue;
+                    }
+                    for (i, pair) in ps.iter().enumerate() {
+                        if let Some(side) = pair.pins.iter().position(|x| x.0 == p) {
+                            moves.push((pair.pins[1 - side].0, Some(pair.chain), (c, i)));
+                        }
+                    }
+                }
+                for (f, chain, key) in moves {
+                    if used.contains(&key) {
+                        continue;
+                    }
+                    let m = d.pins[f].net.as_ref().expect("generated pins have nets").0;
+                    if Some(m) == cur_net {
+                        continue;
+                    }
+                    if chain.is_some() && nd <= max_depth {
+                        keep_min(&mut out.crossed, d.pin_name(&PinId(f)), nd);
+                    }
+                    if nd > max_depth {
+                        continue;
+                    }
+                    let next = if d.nets[m].pins.len() == 1 {
+                        if chain != Some(true) {
+                            continue;
+                        }
+                        Pos::Loose(f)
+                    } else {
+                        Pos::Net(m)
+                    };
+                    let mut r = restrict.clone();
+                    if chain == Some(false) {
+                        r.push((c, f));
+                        r.sort_unstable();
+                        r.dedup();
+                    }
+                    let mut u = used.clone();
+                    u.insert(key);
+                    let s: State = (next, r, chain.map(|_| f), u);
+                    if seen.insert(s.clone()) {
+                        queue.push_back((s, nd));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Compares one walk with the oracle. `cap` None: uncapped, must match
+    /// exactly. Some: what the walk finds is a subset, at no less depth,
+    /// and anything missing sets `expansions_capped`.
+    fn check(d: &Design, start: &str, max_depth: u32, cap: Option<u32>) -> Result<(), String> {
+        let (net, pin) = match d.pin_map.get(start) {
+            Some(p) => (d.pin(p).net.as_ref().unwrap().0, Some(p.0)),
+            None => (d.net_map[start].0, None),
+        };
+        let want = oracle(d, net, pin, max_depth);
+        let got = d.walk_bfs(
+            &NetId(net),
+            pin.map(PinId).as_ref(),
+            max_depth,
+            100_000,
+            true,
+            false,
+            cap.unwrap_or(u32::MAX),
+        );
+        let enrich = d.sidecar();
+        let is_through = |name: &str| {
+            let p = &d.pins[d.pin_map[name].0];
+            enrich.through.pairs.contains_key(&p.comp.0)
+        };
+        let plain = |m: &BTreeMap<String, u32>| -> BTreeMap<String, u32> {
+            m.iter().filter(|(k, _)| !is_through(k)).map(|(k, v)| (k.clone(), *v)).collect()
+        };
+        let mut eps: BTreeMap<String, u32> = BTreeMap::new();
+        for e in &got.endpoints {
+            if eps.insert(e.pin.clone(), e.distance).is_some() {
+                return Err(format!("endpoint {} listed twice", e.pin));
+            }
+        }
+        let crossed: BTreeMap<String, u32> =
+            got.crossed.iter().map(|c| (c.pin.clone(), c.distance)).collect();
+        // A through part's pin -> least depth it is reached at, as an
+        // endpoint or as a crossed far pin: what `path_between` reports.
+        // Whether it is listed as an endpoint depends on route order (an
+        // exit pin is no endpoint), so the two lists are not compared apart.
+        // A pin on the start net is left out: `path_between` answers it
+        // before walking, and a crossing back onto it finds nothing new.
+        // So is a start part's pin: it is never an endpoint, and the walk
+        // lists it as crossed only by chance of route order.
+        let start_comp = pin.map(|p| d.pins[p].comp.0);
+        let skip = |name: &str| {
+            let p = d.pin(&d.pin_map[name]);
+            p.net.as_ref().map(|n| n.0) == Some(net) || Some(p.comp.0) == start_comp
+        };
+        let reached = |a: &BTreeMap<String, u32>, b: &BTreeMap<String, u32>| {
+            let mut m: BTreeMap<String, u32> = BTreeMap::new();
+            for (k, v) in a.iter().filter(|(k, _)| is_through(k)).chain(b) {
+                if skip(k) {
+                    continue;
+                }
+                keep_min(&mut m, k.clone(), *v);
+            }
+            m
+        };
+        // A start-part pin off the start net -> least depth, from
+        // `start_part` or `crossed`: what `path_between` reports for it.
+        let start_pins = |a: &BTreeMap<String, u32>, b: &BTreeMap<String, u32>| {
+            let mut m = a.clone();
+            for (k, v) in b {
+                let p = d.pin(&d.pin_map[k.as_str()]);
+                if Some(p.comp.0) == start_comp && p.net.as_ref().map(|n| n.0) != Some(net) {
+                    keep_min(&mut m, k.clone(), *v);
+                }
+            }
+            m
+        };
+        let got_start: BTreeMap<String, u32> =
+            got.start_part.iter().map(|c| (c.pin.clone(), c.distance)).collect();
+        let rails: BTreeSet<String> = got.rails_reached.iter().map(|r| r.net.clone()).collect();
+        let got_all = (plain(&eps), reached(&eps, &crossed), rails, start_pins(&got_start, &crossed));
+        let want_all = (
+            plain(&want.arrival),
+            reached(&want.arrival, &want.crossed),
+            want.rails.clone(),
+            start_pins(&want.start_part, &want.crossed),
+        );
+        let ctx = |what: &str, g: &dyn std::fmt::Debug, w: &dyn std::fmt::Debug| {
+            format!(
+                "start {start} max_depth {max_depth} cap {cap:?}: {what}\n  walk:   {g:?}\n  oracle: {w:?}\n{}",
+                describe(d)
+            )
+        };
+        let Some(_) = cap else {
+            let names = ["plain endpoints", "through-part pins reached", "rails", "start-part pins reached"];
+            let pairs: [(&dyn std::fmt::Debug, &dyn std::fmt::Debug, bool); 4] = [
+                (&got_all.0, &want_all.0, got_all.0 == want_all.0),
+                (&got_all.1, &want_all.1, got_all.1 == want_all.1),
+                (&got_all.2, &want_all.2, got_all.2 == want_all.2),
+                (&got_all.3, &want_all.3, got_all.3 == want_all.3),
+            ];
+            for (name, (g, w, ok)) in names.iter().zip(pairs) {
+                if !ok {
+                    return Err(ctx(name, g, w));
+                }
+            }
+            if got.expansions_capped {
+                return Err(ctx("expansions_capped while uncapped", &true, &false));
+            }
+            return Ok(());
+        };
+        let sub = |g: &BTreeMap<String, u32>, w: &BTreeMap<String, u32>| {
+            g.iter().all(|(k, v)| w.get(k).is_some_and(|x| x <= v))
+        };
+        if !sub(&got_all.0, &want_all.0) || !sub(&got_all.1, &want_all.1) || !sub(&got_all.3, &want_all.3) {
+            return Err(ctx("capped walk found more or shallower", &(&got_all.0, &got_all.1), &(&want_all.0, &want_all.1)));
+        }
+        let same = got_all == want_all;
+        if !same && !got.expansions_capped {
+            return Err(ctx("capped walk lost results without expansions_capped", &got_all, &want_all));
+        }
+        Ok(())
+    }
+
+    /// A design from (refdes, net code per pin) and net names, code 1 first.
+    fn design_of(parts: &[(&str, &[usize])], nets: &[&str]) -> Design {
+        let components = parts
+            .iter()
+            .map(|(refdes, codes)| {
+                let mut comp = netlist::Component::new();
+                comp.refdes = refdes.to_string();
+                comp.value = "x".into();
+                comp.lib_id = "L:P".into();
+                for (i, code) in codes.iter().enumerate() {
+                    let mut pin = netlist::Pin::new();
+                    pin.number = (i + 1).to_string();
+                    pin.net = Some(*code);
+                    comp.pins.push(pin);
+                }
+                comp
+            })
+            .collect();
+        let nets = nets
+            .iter()
+            .enumerate()
+            .map(|(i, name)| netlist::Net { code: i + 1, name: name.to_string() })
+            .collect();
+        Design::from_netlist(netlist::Netlist { components, nets, sheets: Vec::new() }).unwrap()
+    }
+
+    // Two pins of one part joined outside it: the path ends on a start-part
+    // pin, which is never an endpoint.
+    #[test]
+    fn path_between_two_pins_of_one_part() {
+        let d = design_of(&[("U1", &[1, 2]), ("R1", &[1, 2])], &["/A", "/B"]);
+        let v: serde_json::Value =
+            serde_json::from_str(&d.path_between("U1:1", "U1:2", false, 50, 8).unwrap()).unwrap();
+        assert_eq!(v["connected"], true, "{v}");
+        assert_eq!(v["distance"], 1, "{v}");
+        assert_eq!(v["via"][0]["refdes"], "R1", "{v}");
+    }
+
+    #[test]
+    fn walk_matches_brute_force_on_random_designs() {
+        let mut failures = Vec::new();
+        for seed in 1..=2000u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let d = random_design(&mut rng);
+            let max_depth = 2 + rng.below(4) as u32;
+            let mut starts: Vec<String> = d
+                .nets
+                .iter()
+                .filter(|n| n.pins.len() > 1)
+                .map(|n| n.name.clone())
+                .collect();
+            starts.extend(d.pins.iter().map(|p| d.pin_name(&p.id)));
+            for start in &starts {
+                for cap in [None, Some(1), Some(2)] {
+                    if let Err(e) = check(&d, start, max_depth, cap) {
+                        failures.push(format!("seed {seed}: {e}"));
+                    }
+                }
+            }
+            if failures.len() >= 3 {
+                break;
+            }
+        }
+        assert!(failures.is_empty(), "{} failures, first:\n{}", failures.len(), failures.join("\n\n"));
     }
 }

@@ -626,8 +626,13 @@ function render(data) {
     if (pin && marked.has(part.refdes + ":" + pin.pin)) el("circle", { class: "dot startpin", cx: x, cy: y, r: 3 }, dots);
   };
 
+  // A pair box is highlighted only when it holds a marked pin, so the
+  // start channel of a multi-channel part stands out from its others.
+  const isMarked = (part) => part.pair
+    ? part.pins.some((p) => marked.has(part.refdes + ":" + p.pin))
+    : markedRefs.has(part.refdes) || part.role === "start";
   const partGroup = (part) => {
-    const cls = [part.dnp ? "dnp" : "", markedRefs.has(part.refdes) || part.role === "start" ? "start" : ""].join(" ").trim();
+    const cls = [part.dnp ? "dnp" : "", isMarked(part) ? "start" : ""].join(" ").trim();
     const g = el("g", { class: cls || undefined }, body);
     title(g, partTitle(part));
     return g;

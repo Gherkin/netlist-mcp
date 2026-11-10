@@ -115,6 +115,33 @@ fn restrictions(via: &[Hop], through: &ThroughModels) -> Vec<(usize, usize)> {
     r
 }
 
+/// Default for `max_net_expansions`: the most times `walk_bfs` expands one
+/// net, once per restriction set none of the earlier ones is a subset of.
+/// Each set has its own visited parts, so without a cap the work can grow
+/// exponentially with the through parts on a route. A route past the cap is
+/// dropped and the walk is `truncated`.
+pub const DEFAULT_MAX_NET_EXPANSIONS: u32 = 8;
+
+/// What a repeat arrival at a net expanded under `seen` does under `restrict`.
+#[derive(Debug, PartialEq)]
+enum Reexpand {
+    /// One of `seen` is a subset of `restrict`: nothing new to find.
+    Skip,
+    /// New, but the net was expanded `cap` times already.
+    Capped,
+    Yes,
+}
+
+fn reexpand(seen: &[Vec<(usize, usize)>], restrict: &[(usize, usize)], cap: usize) -> Reexpand {
+    if seen.iter().any(|r| is_subset(r, restrict)) {
+        Reexpand::Skip
+    } else if seen.len() >= cap {
+        Reexpand::Capped
+    } else {
+        Reexpand::Yes
+    }
+}
+
 /// Whether sorted `a` is a subset of sorted `b`.
 fn is_subset(a: &[(usize, usize)], b: &[(usize, usize)]) -> bool {
     a.iter().all(|x| b.binary_search(x).is_ok())
@@ -1453,6 +1480,7 @@ impl Design {
         stop_at_power: bool,
         include_topology: bool,
         max_topology_parts: u32,
+        max_net_expansions: u32,
     ) -> anyhow::Result<String> {
         // Resolve the start: "REFDES:PIN" is a pin (start_comp excluded from
         // endpoints), otherwise a net name.
@@ -1485,6 +1513,7 @@ impl Design {
             max_endpoints,
             stop_at_power,
             include_topology,
+            max_net_expansions,
         );
 
         // Order endpoints: distance asc, then natural refdes (R2 before R10),
@@ -1549,7 +1578,11 @@ impl Design {
         max_endpoints: u32,
         stop_at_power: bool,
         record_topology: bool,
+        max_net_expansions: u32,
     ) -> WalkData {
+        // The first expansion of a net always happens.
+        let max_net_expansions = max_net_expansions.max(1) as usize;
+        let mut expansions_capped = false;
         let start_net_idx = start_net.0;
         let start_comp_idx = start_pin.map(|p| self.pin(p).comp.0);
 
@@ -1647,12 +1680,19 @@ impl Design {
                 }
                 // A rail or large net is never expanded. Another net is
                 // expanded again only under fewer restrictions than every
-                // time before, and that expansion is not drawn.
+                // time before, at most `max_net_expansions` times in all, and
+                // that expansion is not drawn.
                 let Some(seen) = expanded.get(&net_idx) else {
                     continue;
                 };
-                if seen.iter().any(|r| is_subset(r, &restrict)) {
-                    continue;
+                match reexpand(seen, &restrict, max_net_expansions) {
+                    Reexpand::Skip => continue,
+                    Reexpand::Capped => {
+                        truncated = true;
+                        expansions_capped = true;
+                        continue;
+                    }
+                    Reexpand::Yes => {}
                 }
                 drawn = false;
             }
@@ -2006,6 +2046,7 @@ impl Design {
             large_nets,
             dead_ends,
             truncated,
+            expansions_capped,
             reached_net_count: popped.len(),
             topo,
         }
@@ -2207,6 +2248,7 @@ impl Design {
         to: &str,
         include_topology: bool,
         max_topology_parts: u32,
+        max_net_expansions: u32,
     ) -> anyhow::Result<String> {
         let from_pin_id = self
             .pin_map
@@ -2260,8 +2302,15 @@ impl Design {
 
         // max_endpoints is effectively unbounded here: we need to search the
         // whole reachable set for `to`, not stop at the first handful.
-        let data =
-            self.walk_bfs(&from_net_id, Some(from_pin_id), 6, 100_000, true, include_topology);
+        let data = self.walk_bfs(
+            &from_net_id,
+            Some(from_pin_id),
+            6,
+            100_000,
+            true,
+            include_topology,
+            max_net_expansions,
+        );
         let topology = |to_net: usize| {
             include_topology.then(|| {
                 self.path_topology(
@@ -2346,13 +2395,19 @@ impl Design {
         }
 
         let diagnosis = self.path_diagnosis(to_pin_id, &data);
+        let mut reason = "no passthrough path within depth 6 (rails are not crossed)".to_string();
+        if data.expansions_capped {
+            reason.push_str(
+                "; some routes were dropped at max_net_expansions, so a path may be missing",
+            );
+        }
         Self::path_between_envelope(
             from,
             to,
             false,
             None,
             Vec::new(),
-            Some("no passthrough path within depth 6 (rails are not crossed)".to_string()),
+            Some(reason),
             Some(diagnosis),
             None,
         )
@@ -3228,6 +3283,9 @@ struct WalkData {
     large_nets: Vec<LargeNet>,
     dead_ends: Vec<DeadEnd>,
     truncated: bool,
+    /// A route was dropped at `max_net_expansions` (also sets `truncated`),
+    /// so a path can be missing.
+    expansions_capped: bool,
     /// Count of distinct nets `walk_bfs` visited (its `popped` map size)
     /// — the size of the connected component reached from the start, used by
     /// `path_between`'s negative-result diagnosis. Does not affect walk/BFS
@@ -6683,11 +6741,11 @@ mod through_tests {
     }
 
     fn path(design: &super::Design, from: &str, to: &str) -> Value {
-        serde_json::from_str(&design.path_between(from, to, false, 50).expect("path")).unwrap()
+        serde_json::from_str(&design.path_between(from, to, false, 50, super::DEFAULT_MAX_NET_EXPANSIONS).expect("path")).unwrap()
     }
 
     fn walk(design: &super::Design, start: &str, topology: bool) -> Value {
-        serde_json::from_str(&design.walk(start, 6, 50, true, topology, 200).expect("walk")).unwrap()
+        serde_json::from_str(&design.walk(start, 6, 50, true, topology, 200, super::DEFAULT_MAX_NET_EXPANSIONS).expect("walk")).unwrap()
     }
 
     fn via_refdes(v: &Value) -> Vec<&str> {
@@ -6855,7 +6913,7 @@ mod through_tests {
     fn path_topology_across_through_part() {
         let design = with_sidecar();
         let v: Value =
-            serde_json::from_str(&design.path_between("U4:7", "J5:1", true, 50).unwrap()).unwrap();
+            serde_json::from_str(&design.path_between("U4:7", "J5:1", true, 50, super::DEFAULT_MAX_NET_EXPANSIONS).unwrap()).unwrap();
         assert_eq!(v["connected"], true, "{v}");
         assert_eq!(v["topology"]["through_not_drawn"], json!(["L2"]), "{v}");
     }
@@ -7007,6 +7065,39 @@ mod through_tests {
         }
     }
 
+    // A repeat arrival is skipped when an earlier set is a subset of its
+    // own, capped once the net was walked `cap` times, else walked again.
+    #[test]
+    fn reexpand_skips_subsets_and_stops_at_the_cap() {
+        use super::{reexpand, Reexpand};
+        let a = vec![(1, 2)];
+        let b = vec![(3, 4)];
+        assert_eq!(reexpand(&[vec![]], &a, 8), Reexpand::Skip);
+        assert_eq!(reexpand(&[a.clone()], &[(1, 2), (3, 4)], 8), Reexpand::Skip);
+        assert_eq!(reexpand(&[a.clone()], &b, 8), Reexpand::Yes);
+        assert_eq!(reexpand(&[a.clone()], &b, 1), Reexpand::Capped);
+        assert_eq!(reexpand(&[a.clone(), b.clone()], &[(5, 6)], 2), Reexpand::Capped);
+    }
+
+    // Order B of the mux above needs /BUFMID walked twice. With
+    // max_net_expansions 1 the second walk is dropped: no path, and the
+    // note says routes were dropped.
+    #[test]
+    fn max_net_expansions_one_drops_the_second_walk() {
+        let design = with_refdes_model(
+            "U3",
+            json!([{"pins": ["5", "10"]}, {"pins": ["5", "7"]}, {"pins": ["10", "8"]}]),
+        );
+        let v: Value = serde_json::from_str(
+            &design.path_between("J4:1", "U3:8", false, 50, 1).expect("path"),
+        )
+        .unwrap();
+        assert_eq!(v["connected"], false, "{v}");
+        assert!(v["note"].as_str().unwrap().contains("max_net_expansions"), "{v}");
+        let v = path(&design, "J4:1", "U3:8");
+        assert_eq!(v["connected"], true, "{v}");
+    }
+
     // Only 5->10 and 10->8, no chain. U3:8 is reached only by crossing U3
     // again from pin 10, which this route came out on, also after going
     // round through R60 and back: no path.
@@ -7083,7 +7174,7 @@ mod walk_topology_tests {
         topology: bool,
         max_parts: u32,
     ) -> serde_json::Value {
-        let json = design.walk(start, max_depth, 50, true, topology, max_parts).expect("walk");
+        let json = design.walk(start, max_depth, 50, true, topology, max_parts, DEFAULT_MAX_NET_EXPANSIONS).expect("walk");
         serde_json::from_str(&json).expect("valid JSON")
     }
 
@@ -7151,7 +7242,7 @@ mod walk_topology_tests {
     fn max_endpoints_does_not_cut_the_graph() {
         let d = fixture();
         let run = |start: &str, max_endpoints: u32, max_parts: u32| -> serde_json::Value {
-            let json = d.walk(start, 4, max_endpoints, true, true, max_parts).expect("walk");
+            let json = d.walk(start, 4, max_endpoints, true, true, max_parts, DEFAULT_MAX_NET_EXPANSIONS).expect("walk");
             serde_json::from_str(&json).expect("valid JSON")
         };
         for start in ["/SENSIN1", "GND"] {
@@ -7323,7 +7414,7 @@ mod walk_topology_tests {
     #[test]
     fn max_endpoints_cuts_repeat_rail_arrivals_only() {
         let run = |cap| {
-            let json = fixture().walk("J2:1", 4, cap, true, false, 200).expect("walk");
+            let json = fixture().walk("J2:1", 4, cap, true, false, 200, DEFAULT_MAX_NET_EXPANSIONS).expect("walk");
             serde_json::from_str::<serde_json::Value>(&json).unwrap()
         };
         let cut = run(1);
@@ -7407,7 +7498,7 @@ mod walk_topology_tests {
     }
 
     fn path(design: &Design, from: &str, to: &str, topology: bool, cap: u32) -> serde_json::Value {
-        let json = design.path_between(from, to, topology, cap).expect("path_between");
+        let json = design.path_between(from, to, topology, cap, DEFAULT_MAX_NET_EXPANSIONS).expect("path_between");
         serde_json::from_str(&json).expect("valid JSON")
     }
 

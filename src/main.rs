@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context};
 
-use design::Design;
+use design::{Design, DEFAULT_MAX_NET_EXPANSIONS};
 
 mod parser;
 mod design;
@@ -155,6 +155,19 @@ struct GetPinParams {
     pin: String,
 }
 
+/// The `max_net_expansions` parameter doc, shared by the four walk tools.
+macro_rules! max_net_expansions_doc {
+    () => {
+        "Max times one net is walked (default 8, minimum 1; 0 is read as 1). \
+        Only matters with sidecar through-models: a net reached by routes \
+        that came out of different through pairs is walked once per such \
+        route, and this caps it so the call stays fast. Past the cap routes \
+        are dropped and `truncated` is set (path_between says so in its \
+        `note`), so an endpoint or path can be missing; raise it to search \
+        further."
+    };
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct WalkParams {
     /// Start point: a pin "REFDES:PIN" or a net name.
@@ -185,6 +198,9 @@ struct WalkParams {
     /// own `omitted_parts` counts the cut parts on it (left out when 0).
     #[serde(default)]
     max_topology_parts: Option<u32>,
+    #[doc = max_net_expansions_doc!()]
+    #[serde(default)]
+    max_net_expansions: Option<u32>,
 }
 
 /// `walk` parameters for `draw_walk`, minus `include_topology`: the drawing
@@ -207,6 +223,9 @@ struct DrawWalkParams {
     /// the start first. The drawing says when parts were cut.
     #[serde(default)]
     max_topology_parts: Option<u32>,
+    #[doc = max_net_expansions_doc!()]
+    #[serde(default)]
+    max_net_expansions: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -236,6 +255,9 @@ struct PathBetweenParams {
     /// report the cut.
     #[serde(default)]
     max_topology_parts: Option<u32>,
+    #[doc = max_net_expansions_doc!()]
+    #[serde(default)]
+    max_net_expansions: Option<u32>,
 }
 
 /// `path_between` parameters for `draw_path_between`, minus
@@ -251,6 +273,9 @@ struct DrawPathBetweenParams {
     /// other ICs. The drawing says when parts were cut.
     #[serde(default)]
     max_topology_parts: Option<u32>,
+    #[doc = max_net_expansions_doc!()]
+    #[serde(default)]
+    max_net_expansions: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -471,6 +496,7 @@ impl NetlistServer {
             stop_at_power,
             include_topology,
             max_topology_parts,
+            p.max_net_expansions.unwrap_or(DEFAULT_MAX_NET_EXPANSIONS),
         ) {
             Ok(out) => out,
             Err(e) => format!("error: {e:#}"),
@@ -493,6 +519,7 @@ impl NetlistServer {
             stop_at_power: p.stop_at_power,
             include_topology: Some(true),
             max_topology_parts: p.max_topology_parts,
+            max_net_expansions: p.max_net_expansions,
         }))
     }
 
@@ -519,6 +546,7 @@ impl NetlistServer {
             &p.to,
             p.include_topology.unwrap_or(false),
             p.max_topology_parts.unwrap_or(200),
+            p.max_net_expansions.unwrap_or(DEFAULT_MAX_NET_EXPANSIONS),
         ) {
             Ok(out) => out,
             Err(e) => format!("error: {e:#}"),
@@ -542,6 +570,7 @@ impl NetlistServer {
             to: p.to,
             include_topology: Some(true),
             max_topology_parts: p.max_topology_parts,
+            max_net_expansions: p.max_net_expansions,
         }))
     }
 

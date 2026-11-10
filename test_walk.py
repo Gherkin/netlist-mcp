@@ -92,7 +92,8 @@ def summarize(text):
         print("  (non-JSON result):", text)
         return
     print(f"  start={obj['start']!r} start_net={obj['start_net']!r} "
-          f"truncated={obj['truncated']}")
+          f"truncated={obj['truncated']} "
+          f"expansions_capped={obj.get('expansions_capped', False)}")
     eps = obj.get("endpoints", [])
     print(f"  endpoints: {len(eps)}")
     for e in eps[:12]:

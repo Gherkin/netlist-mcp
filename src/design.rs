@@ -118,11 +118,13 @@ fn restrictions(via: &[Hop], through: &ThroughModels) -> Vec<(usize, usize)> {
 /// Default for `max_net_expansions`: the most restriction sets `walk_bfs`
 /// keeps for one net, sets that no other kept set is a subset of. Each set
 /// has its own visited parts, so without a cap the work can grow
-/// exponentially with the through parts on a route. A route under a strict
-/// subset of a kept set is always walked and replaces it, so the route with
-/// the fewest restrictions is never dropped; this is bounded, as each such
-/// walk shrinks a kept set. Any other new route past the cap is dropped and
-/// the walk is `truncated`.
+/// exponentially with the through parts on a route. The cap limits kept
+/// sets, not walks: a route under a strict subset of a kept set is always
+/// walked and replaces every kept set it is a subset of, so a net can be
+/// walked more than `max_net_expansions` times. That stays finite, as a set
+/// is never walked twice and no walked set is a superset of an earlier one.
+/// Any other new route past the cap is dropped, even one with fewer
+/// restrictions than the kept sets, and the walk is `truncated`.
 pub const DEFAULT_MAX_NET_EXPANSIONS: u32 = 8;
 
 /// What a repeat arrival at a net expanded under `seen` does under `restrict`.
@@ -1603,8 +1605,9 @@ impl Design {
         // queued first does not decide which parts are crossed. (It still
         // decides whether an exit pin is an endpoint; see `endpoint_seen`.)
         let mut layers: HashMap<Vec<(usize, usize)>, HashSet<(usize, usize)>> = HashMap::new();
-        // Net -> the restriction sets it was expanded under. A route is
-        // dropped when one of them is a subset of its own.
+        // Net -> the kept restriction sets it was expanded under: none is a
+        // subset of another, as a set replaces the kept sets it is a subset
+        // of. A route is dropped when one of them is a subset of its own.
         let mut expanded: HashMap<usize, Vec<Vec<(usize, usize)>>> = HashMap::new();
         // (rail net, last part, pair) already in `rails_reached`, so a rail
         // reached across the same part under two restriction sets is listed
@@ -1686,9 +1689,10 @@ impl Design {
                     }
                 }
                 // A rail or large net is never expanded. Another net is
-                // expanded again only under fewer restrictions than every
-                // time before, within `max_net_expansions` (see `reexpand`),
-                // and that expansion is not drawn.
+                // expanded again only under a set that no kept set is a
+                // subset of, within `max_net_expansions` unless it is a
+                // strict subset of a kept set (see `reexpand`), and that
+                // expansion is not drawn.
                 let Some(seen) = expanded.get(&net_idx) else {
                     continue;
                 };
@@ -2348,6 +2352,13 @@ impl Design {
             );
         }
 
+        // A dropped route may have been shorter than the one found.
+        let capped_note = || {
+            data.expansions_capped.then(|| {
+                "some routes were dropped at max_net_expansions, so a shorter path may exist"
+                    .to_string()
+            })
+        };
         if let Some(ep) = data.endpoints.iter().find(|e| e.pin == to_canonical) {
             let to_net = to_pin.net.as_ref().expect("a reached pin has a net").0;
             return Self::path_between_envelope(
@@ -2356,7 +2367,7 @@ impl Design {
                 true,
                 Some(ep.distance),
                 ep.via.to_vec(),
-                None,
+                capped_note(),
                 None,
                 topology(to_net),
             );
@@ -2378,7 +2389,7 @@ impl Design {
                 true,
                 Some(c.distance),
                 c.via.to_vec(),
-                None,
+                capped_note(),
                 None,
                 topology(to_net),
             );
@@ -7115,6 +7126,27 @@ mod through_tests {
         assert!(v["note"].as_str().unwrap().contains("max_net_expansions"), "{v}");
         let v = path(&design, "J4:1", "U3:8");
         assert_eq!(v["connected"], true, "{v}");
+    }
+
+    // 5->10 reaches /BUFRC first, under {U3:10}, which blocks 10->8. The
+    // chain pair 5->7 then R60 reach /BUFRC later under no restriction, a
+    // strict subset, so at cap 1 it is still walked and crosses 10->8. With
+    // 5->7 not chained its set {U3:7} is incomparable and is dropped.
+    #[test]
+    fn strict_subset_route_is_walked_at_the_cap() {
+        let run = |chain: bool| -> Value {
+            let design = with_refdes_model(
+                "U3",
+                json!([{"pins": ["5", "10"]}, {"pins": ["5", "7"], "chain": chain}, {"pins": ["10", "8"]}]),
+            );
+            serde_json::from_str(&design.path_between("J4:1", "U3:8", false, 50, 1).expect("path"))
+                .unwrap()
+        };
+        let v = run(true);
+        assert_eq!(v["connected"], true, "{v}");
+        let v = run(false);
+        assert_eq!(v["connected"], false, "{v}");
+        assert!(v["note"].as_str().unwrap().contains("max_net_expansions"), "{v}");
     }
 
     // The same model through walk: the dropped second walk of /BUFMID sets

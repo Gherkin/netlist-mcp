@@ -158,13 +158,15 @@ struct GetPinParams {
 /// The `max_net_expansions` parameter doc, shared by the four walk tools.
 macro_rules! max_net_expansions_doc {
     () => {
-        "Max times one net is walked (default 8, minimum 1; 0 is read as 1). \
-        Only matters with sidecar through-models: a net reached by routes \
-        that came out of different through pairs is walked once per such \
-        route, and this caps it so the call stays fast. Past the cap routes \
-        are dropped, so an endpoint or path can be missing; raise it to \
-        search further. walk sets `truncated` and `expansions_capped`; \
-        path_between says so in its `note` when not connected."
+        "Max restriction sets kept per net (default 8, minimum 1; 0 is read \
+        as 1). Only matters with sidecar through-models: a net reached by \
+        routes that came out of different through pairs is walked once per \
+        such route, and this caps it so the call stays fast. A route with a \
+        subset of a kept route's restrictions is still walked, so a net can \
+        be walked more times than this. Other routes past the cap are \
+        dropped, so an endpoint or path can be missing or longer; raise it \
+        to search further. walk sets `truncated` and `expansions_capped`; \
+        path_between says so in its `note`."
     };
 }
 

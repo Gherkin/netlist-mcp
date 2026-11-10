@@ -3581,7 +3581,8 @@ fn path_subgraph(
 #[derive(Debug, Serialize)]
 struct Topology {
     /// True when `max_topology_parts` cut parts from the graph. Separate from
-    /// the top-level `truncated`, which the depth and endpoint limits set.
+    /// the top-level `truncated`, which the depth, endpoint and
+    /// `max_net_expansions` limits set.
     /// `max_endpoints` does not cut the graph (issue #35), so false means
     /// every part the walk reached is listed. Parts past the depth limit or a
     /// rail were never reached and are not counted.
@@ -7077,6 +7078,9 @@ mod through_tests {
         assert_eq!(reexpand(&[a.clone()], &b, 8), Reexpand::Yes);
         assert_eq!(reexpand(&[a.clone()], &b, 1), Reexpand::Capped);
         assert_eq!(reexpand(&[a.clone(), b.clone()], &[(5, 6)], 2), Reexpand::Capped);
+        // A set no seen set is a subset of is capped, also when it is a
+        // strict subset of one of them.
+        assert_eq!(reexpand(&[vec![(1, 2), (3, 4)]], &a, 1), Reexpand::Capped);
     }
 
     // Order B of the mux above needs /BUFMID walked twice. With
@@ -7096,6 +7100,22 @@ mod through_tests {
         assert!(v["note"].as_str().unwrap().contains("max_net_expansions"), "{v}");
         let v = path(&design, "J4:1", "U3:8");
         assert_eq!(v["connected"], true, "{v}");
+    }
+
+    // The same model through walk: the dropped second walk of /BUFMID sets
+    // the top-level `truncated`.
+    #[test]
+    fn max_net_expansions_cap_sets_walk_truncated() {
+        let design = with_refdes_model(
+            "U3",
+            json!([{"pins": ["5", "10"]}, {"pins": ["5", "7"]}, {"pins": ["10", "8"]}]),
+        );
+        let run = |cap| -> Value {
+            serde_json::from_str(&design.walk("J4:1", 6, 50, true, false, 200, cap).expect("walk"))
+                .unwrap()
+        };
+        assert_eq!(run(1)["truncated"], true);
+        assert_eq!(run(super::DEFAULT_MAX_NET_EXPANSIONS)["truncated"], false);
     }
 
     // Only 5->10 and 10->8, no chain. U3:8 is reached only by crossing U3

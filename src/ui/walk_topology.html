@@ -745,8 +745,9 @@ function render(data) {
     note("Drawing cut by max_topology_parts: " + topo.omitted_parts + " parts and " +
       topo.omitted_nets + " nets left out.");
   }
-  if (data.truncated) note("The walk hit its depth or endpoint limit. The endpoint limit cuts only the endpoint " +
-    "list in the result, not the drawing. Nets marked \"depth limit\" were not walked past.");
+  if (data.truncated) note("The walk hit its depth, endpoint or max_net_expansions limit. The endpoint limit cuts " +
+    "only the endpoint list in the result, not the drawing. Nets marked \"depth limit\" were not walked past. " +
+    "The max_net_expansions limit drops routes past through-model parts, so an endpoint can be missing.");
   if (data.path && data.note) note(data.note);
   if (!topo.parts.length) note("No parts to draw.");
 

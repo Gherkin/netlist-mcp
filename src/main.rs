@@ -162,9 +162,9 @@ macro_rules! max_net_expansions_doc {
         Only matters with sidecar through-models: a net reached by routes \
         that came out of different through pairs is walked once per such \
         route, and this caps it so the call stays fast. Past the cap routes \
-        are dropped and `truncated` is set (path_between says so in its \
-        `note`), so an endpoint or path can be missing; raise it to search \
-        further."
+        are dropped, so an endpoint or path can be missing; raise it to \
+        search further. walk sets `truncated`; path_between has no \
+        `truncated` and says so in its `note` when not connected."
     };
 }
 

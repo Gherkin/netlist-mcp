@@ -196,8 +196,8 @@ struct WalkParams {
     #[serde(default)]
     include_topology: Option<bool>,
     /// Max parts in `topology` (default 200, minimum 1; 0 is read as 1),
-    /// nearest to the start first. A part with no pin left to draw is cut and
-    /// takes no slot. A part whose pin was on a cut through-pair box comes
+    /// nearest to the start first. A part with no pin left to draw takes no
+    /// slot; it comes back past the cap if a later slot gives it one. A part whose pin was on a cut through-pair box comes
     /// back past the cap when that pin sits on a drawn net that is not a
     /// rail, so `parts` can be longer.
     /// Nets only the cut parts reach are left out too. `topology.truncated`
@@ -229,8 +229,8 @@ struct DrawWalkParams {
     #[serde(default)]
     stop_at_power: Option<bool>,
     /// Max parts drawn (default 200, minimum 1; 0 is read as 1), nearest to
-    /// the start first. A part with no pin left to draw is cut and takes no
-    /// slot. A part whose pin was on a cut through-pair box is drawn past the
+    /// the start first. A part with no pin left to draw takes no slot; it
+    /// comes back past the cap if a later slot gives it one. A part whose pin was on a cut through-pair box is drawn past the
     /// cap when that pin sits on a drawn net that is not a rail. The drawing
     /// says when parts were cut.
     #[serde(default)]

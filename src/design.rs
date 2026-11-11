@@ -2189,7 +2189,8 @@ impl Design {
     /// hold every such net. A dropped entry comes back, past the cap, when
     /// the cap cut the box of one of its pins on a drawn net that is not a
     /// rail. A part entry the cut leaves with no pin to draw is cut too, and
-    /// its slot goes to the next entry, so every slot draws a pin.
+    /// its slot goes to the next entry, so every slot draws a pin. If a later
+    /// slot then gives it a pin to draw, it comes back past the cap too.
     /// `truncated`, `omitted_parts` (distinct parts with no kept entry) and
     /// `omitted_nets` report the cut. Each net's own `omitted_parts` counts
     /// the distinct cut parts with a pin on it that no kept entry draws.
@@ -2313,12 +2314,13 @@ impl Design {
         // with no pin to draw (kept only for a net a cut part brings in).
         // Those are skipped and take no slot; the freed slot goes to the
         // next entry, and the check runs again, since a refilled series
-        // part or pair adds nets. A skipped entry is not looked at again.
-        // Series and pair entries list all their pins, so only part entries
-        // are skipped, and each pass skips one or more: at most
+        // part or pair adds nets. A skipped entry is not looked at again
+        // inside the loop; one that a later pass gave a pin comes back
+        // below. Series and pair entries list all their pins, so only part
+        // entries are skipped, and each pass skips one or more: at most
         // `order.len()` passes.
         let mut skipped: HashSet<(usize, Option<usize>)> = HashSet::new();
-        let (mut order, cut, kept_nets, boxed) = loop {
+        let (mut order, mut cut, kept_nets, boxed) = loop {
             let (mut kept, mut cut) = (Vec::new(), Vec::new());
             for e in &order {
                 if kept.len() < max_parts && !skipped.contains(&e.key()) {
@@ -2357,6 +2359,13 @@ impl Design {
                     && net_of(p).is_some_and(|n| kept_nets.contains(&n) && !rail_nets.contains(&n))
             })
         }));
+        // A skipped entry that a later pass gave a pin to draw comes back
+        // the same way: past the cap, no slot, no net and no box added.
+        let (restored, still_cut): (Vec<TopoEntry>, Vec<TopoEntry>) = cut.into_iter().partition(|e| {
+            skipped.contains(&e.key()) && !listed_pins(e, &kept_nets, &boxed).is_empty()
+        });
+        order.extend(restored);
+        cut = still_cut;
         // Every kept entry has a pin to draw: the cap loop skipped the
         // others, and a restored entry lists the pin it came back for.
         let order_pins: Vec<(TopoEntry, Vec<usize>)> =
@@ -8836,25 +8845,66 @@ mod walk_oracle_tests {
     }
 
     /// PR #69 round 3: when the capped drawing has fewer than `cap` parts, a
-    /// slot is free, so the cap cut no series part or pair box: each of
-    /// `full`'s is in `capped`. (Restored entries can fill the count, which
-    /// only skips the check.)
+    /// slot is free, so the cap cut nothing: each of `full`'s entries is in
+    /// `capped`, part entries too (round 4: a skipped part entry that a later
+    /// pass gave a pin comes back). (Restored entries can fill the count,
+    /// which only skips the check.)
     fn check_free_slot(full: &serde_json::Value, capped: &serde_json::Value, cap: usize) -> Result<(), String> {
         let key = |p: &serde_json::Value| (p["refdes"].to_string(), p["role"].to_string(), p["pair"]["pins"].to_string());
-        let wired = |t: &serde_json::Value| -> BTreeSet<_> {
-            t["parts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|p| p["role"] == "series" || p["role"] == "through")
-                .map(key)
-                .collect()
-        };
+        let wired = |t: &serde_json::Value| -> BTreeSet<_> { t["parts"].as_array().unwrap().iter().map(key).collect() };
         if capped["parts"].as_array().unwrap().len() >= cap {
-            return Ok(());
+            return check_skipped_restored(full, capped);
         }
         let missing: Vec<_> = wired(full).difference(&wired(capped)).cloned().collect();
         if missing.is_empty() { Ok(()) } else { Err(format!("free slot, but cut: {missing:?}")) }
+    }
+
+    /// PR #69 round 4: series parts and pair boxes are never restored, so
+    /// each one in `capped` took a slot, and every entry ahead of it in the
+    /// order (`full`'s list) was kept or skipped. A skipped part entry with a
+    /// pin to draw in `capped` comes back, so a part entry ahead of the last
+    /// kept series part or box, with a pin on a drawn net that is not a rail
+    /// and not on one of its own boxes, is in `capped`.
+    fn check_skipped_restored(full: &serde_json::Value, capped: &serde_json::Value) -> Result<(), String> {
+        let key = |p: &serde_json::Value| (p["refdes"].to_string(), p["role"].to_string(), p["pair"]["pins"].to_string());
+        let fparts = full["parts"].as_array().unwrap();
+        let cparts = capped["parts"].as_array().unwrap();
+        let ckeys: BTreeSet<_> = cparts.iter().map(key).collect();
+        let Some(last) = cparts
+            .iter()
+            .filter(|p| p["role"] == "series" || p["role"] == "through")
+            .filter_map(|p| fparts.iter().position(|f| key(f) == key(p)))
+            .max()
+        else {
+            return Ok(());
+        };
+        let nets: BTreeSet<&str> = capped["nets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| n["rail"] != true)
+            .map(|n| n["name"].as_str().unwrap())
+            .collect();
+        let boxed: BTreeSet<(String, String)> = cparts
+            .iter()
+            .filter(|p| p["role"] == "through")
+            .flat_map(|p| {
+                p["pins"].as_array().unwrap().iter().map(|x| (p["refdes"].to_string(), x["pin"].to_string()))
+            })
+            .collect();
+        for f in &fparts[..last] {
+            if f["role"] == "series" || f["role"] == "through" || ckeys.contains(&key(f)) {
+                continue;
+            }
+            let drawable = f["pins"].as_array().unwrap().iter().any(|x| {
+                x["net"].as_str().is_some_and(|n| nets.contains(n))
+                    && !boxed.contains(&(f["refdes"].to_string(), x["pin"].to_string()))
+            });
+            if drawable {
+                return Err(format!("{} {} ahead of a kept slot and drawable, but cut", f["refdes"], f["role"]));
+            }
+        }
+        Ok(())
     }
 
     // Issue #63: the drawing goes on past through parts. Every pair in a

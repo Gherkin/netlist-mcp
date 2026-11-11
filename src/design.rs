@@ -2186,8 +2186,9 @@ impl Design {
     /// `order`. Nets are then kept only when they are in `fixed_nets` or sit
     /// on a pin of a kept series part or pair, so no node hangs loose. `nets` must
     /// hold every such net. `truncated`, `omitted_parts` and `omitted_nets`
-    /// report the cut; each net's own `omitted_parts` counts the cut parts
-    /// with a pin on it.
+    /// report the cut. A part entry the cut leaves with no pin to draw is cut
+    /// too. Each net's own `omitted_parts` counts the distinct cut parts with
+    /// a pin on it that no kept entry draws.
     fn build_topology(
         &self,
         nets: &[(usize, NetState)],
@@ -2255,7 +2256,7 @@ impl Design {
         // `max_parts` slot. Its slot goes to the boxes that hold its marked
         // pins, so a marked pin is cut no sooner than its own entry would be.
         // A pin on a box the cap then cuts is counted as cut.
-        let order = {
+        let mut order = {
             let all_nets = series_nets(&order);
             let all_boxed = boxed_by(&order);
             let dropped = |e: &TopoEntry| {
@@ -2267,18 +2268,22 @@ impl Design {
                     && entry_pins(e).iter().any(|p| all_boxed.contains(p))
                     && !listed_pins(e, &all_nets, &all_boxed).into_iter().any(keeps)
             };
+            // Per part, its pair boxes that hold a marked pin, in order.
+            let mut mark_boxes: HashMap<usize, Vec<TopoEntry>> = HashMap::new();
+            for b in order.iter().filter(|b| b.pair.is_some()) {
+                if entry_pins(b).iter().any(|p| marked.contains(p)) {
+                    mark_boxes.entry(b.comp).or_default().push(*b);
+                }
+            }
             let mut placed: HashSet<(usize, Option<usize>)> = HashSet::new();
             let mut out = Vec::with_capacity(order.len());
             for e in &order {
-                if !dropped(e) {
-                    if placed.insert(e.key()) {
-                        out.push(*e);
-                    }
-                    continue;
-                }
-                let holds_mark =
-                    |b: &&TopoEntry| b.comp == e.comp && b.pair.is_some() && entry_pins(b).iter().any(|p| marked.contains(p));
-                for b in order.iter().filter(holds_mark) {
+                let moved: &[TopoEntry] = if dropped(e) {
+                    mark_boxes.get(&e.comp).map_or(&[], Vec::as_slice)
+                } else {
+                    std::slice::from_ref(e)
+                };
+                for b in moved {
                     if placed.insert(b.key()) {
                         out.push(*b);
                     }
@@ -2286,14 +2291,9 @@ impl Design {
             }
             out
         };
-        let mut order = order;
-        let cut = order.split_off(max_parts.min(order.len()));
-        let omitted_parts = cut.len();
+        let mut cut = order.split_off(max_parts.min(order.len()));
 
         let kept_nets = series_nets(&order);
-        // The nets only the cut parts would add: a pin on one of these that
-        // is not drawn was cut by `max_parts`.
-        let cut_nets = series_nets(&cut);
         // `kept_nets` is a subset of `nets`: `walk_bfs` notes every net it
         // pops and every far-side net of a series part or pair it crosses,
         // and `path_topology` keeps every net of the parts it keeps.
@@ -2302,13 +2302,26 @@ impl Design {
 
         // Pins drawn on a kept pair's box, not again on their part's box.
         let boxed = boxed_by(&order);
-        // Per kept net: how many cut parts have a pin on it that is not
-        // drawn on a kept pair box. A part cut in several entries counts once.
+        // A part entry kept only for a net that a cut part brings in has no
+        // pin left to draw: it is cut too. Series and pair entries list all
+        // their pins, so `kept_nets` and `boxed` stay as they are.
+        let (order, empty): (Vec<TopoEntry>, Vec<TopoEntry>) =
+            order.into_iter().partition(|e| !listed_pins(e, &kept_nets, &boxed).is_empty());
+        cut.extend(empty);
+        let omitted_parts = cut.len();
+        // The nets only the cut parts would add: a pin on one of these that
+        // is not drawn was cut by `max_parts`.
+        let cut_nets = series_nets(&cut);
+
+        // Pins drawn on a kept entry.
+        let drawn: HashSet<usize> = order.iter().flat_map(|e| listed_pins(e, &kept_nets, &boxed)).collect();
+        // Per kept net: how many cut parts have a pin on it that no kept
+        // entry draws. A part cut in several entries counts once.
         let mut cut_on_net: HashMap<usize, HashSet<usize>> = HashMap::new();
         for e in &cut {
             for n in entry_pins(e)
                 .into_iter()
-                .filter(|p| !boxed.contains(p))
+                .filter(|p| !drawn.contains(p))
                 .filter_map(net_of)
                 .filter(|n| kept_nets.contains(n))
             {
@@ -3874,7 +3887,8 @@ fn path_subgraph(
             _ => SELF,
         })
         .collect();
-    let shunt = edges_on_st_paths(&shunt_edges, ROUTE, RAIL);
+    let shunt_blocks = edges_on_st_paths(&shunt_edges, ROUTE, RAIL);
+    let shunt = route_obeying_chain(&shunt_edges, pairs, &shunt_blocks, ROUTE, RAIL).unwrap_or(shunt_blocks);
 
     let roles = (0..parts.len())
         .map(|i| {
@@ -3917,7 +3931,8 @@ struct TopoNet {
     rail: bool,
     /// "expanded", "rail", "large_net", "depth_limit" or "dangling".
     state: &'static str,
-    /// Parts with a pin on this net that `max_topology_parts` cut. Above 0,
+    /// Distinct parts with a pin on this net that `max_topology_parts` cut
+    /// and that no kept part or pair box draws. Above 0,
     /// this node's edges in the graph are incomplete. `max_endpoints` cuts
     /// nothing here (issue #35). Left out when 0. Absent does not mean complete: a node whose `state`
     /// is not "expanded" was never walked past, so its other members are

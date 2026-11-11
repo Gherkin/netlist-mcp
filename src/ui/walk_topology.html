@@ -627,10 +627,14 @@ function render(data) {
   };
 
   // A pair box is highlighted only when it holds a marked pin, so the
-  // start channel of a multi-channel part stands out from its others.
+  // start channel of a multi-channel part stands out from its others. A
+  // part's own box is highlighted when it lists a marked pin, or when the
+  // part is marked and none of its pair boxes holds the mark.
+  const holdsMark = (part) => part.pins.some((p) => marked.has(part.refdes + ":" + p.pin));
+  const boxedMarkRefs = new Set((data.topology.parts || []).filter((p) => p.pair && holdsMark(p)).map((p) => p.refdes));
   const isMarked = (part) => part.pair
-    ? part.pins.some((p) => marked.has(part.refdes + ":" + p.pin))
-    : markedRefs.has(part.refdes) || part.role === "start";
+    ? holdsMark(part)
+    : holdsMark(part) || ((markedRefs.has(part.refdes) || part.role === "start") && !boxedMarkRefs.has(part.refdes));
   const partGroup = (part) => {
     const cls = [part.dnp ? "dnp" : "", isMarked(part) ? "start" : ""].join(" ").trim();
     const g = el("g", { class: cls || undefined }, body);

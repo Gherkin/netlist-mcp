@@ -2296,7 +2296,9 @@ impl Design {
             // Ends first: the first entry that draws each marked pin goes to
             // the front, in its order, so the cap never cuts a marked pin
             // (path_between's minimum of 2 covers from and to). Other boxes
-            // that share the pin (a mux COM) keep their place.
+            // that share the pin (a mux COM) keep their place in `out`; when
+            // the pin's own entry was dropped, that place is already the
+            // dropped entry's slot (`mark_boxes` above).
             let mut front: Vec<usize> = marked
                 .iter()
                 .filter_map(|&m| out.iter().position(|e| listed_pins(e, &all_nets, &all_boxed).contains(&m)))
@@ -2332,12 +2334,16 @@ impl Design {
         // A part entry kept only for a net that a cut part brings in has no
         // pin left to draw: it is cut too. Series and pair entries list all
         // their pins, so `kept_nets` and `boxed` stay as they are.
-        let (order, empty): (Vec<TopoEntry>, Vec<TopoEntry>) =
-            order.into_iter().partition(|e| !listed_pins(e, &kept_nets, &boxed).is_empty());
-        cut.extend(empty);
+        let mut order_pins: Vec<(TopoEntry, Vec<usize>)> = Vec::with_capacity(order.len());
+        for e in order {
+            match listed_pins(&e, &kept_nets, &boxed) {
+                pins if pins.is_empty() => cut.push(e),
+                pins => order_pins.push((e, pins)),
+            }
+        }
         // Distinct parts with no kept entry at all. A part drawn in another
         // entry is not counted, so `truncated` can be set with this at 0.
-        let kept_comps: HashSet<usize> = order.iter().map(|e| e.comp).collect();
+        let kept_comps: HashSet<usize> = order_pins.iter().map(|(e, _)| e.comp).collect();
         let omitted_parts =
             cut.iter().map(|e| e.comp).filter(|c| !kept_comps.contains(c)).collect::<HashSet<_>>().len();
         // The nets only the cut parts would add: a pin on one of these that
@@ -2345,7 +2351,7 @@ impl Design {
         let cut_nets = series_nets(&cut);
 
         // Pins drawn on a kept entry.
-        let drawn: HashSet<usize> = order.iter().flat_map(|e| listed_pins(e, &kept_nets, &boxed)).collect();
+        let drawn: HashSet<usize> = order_pins.iter().flat_map(|(_, pins)| pins.iter().copied()).collect();
         // Per kept net: how many cut parts have a pin on it that no kept
         // entry draws. A part cut in several entries counts once.
         let mut cut_on_net: HashMap<usize, HashSet<usize>> = HashMap::new();
@@ -2377,10 +2383,10 @@ impl Design {
             .collect();
 
         let mut parts: Vec<TopoPart> = Vec::new();
-        for e in order {
+        for (e, listed) in order_pins {
             let comp = self.component(&CompId(e.comp));
             let pair = pair_of(&e);
-            let mut pins: Vec<TopoPin> = listed_pins(&e, &kept_nets, &boxed)
+            let mut pins: Vec<TopoPin> = listed
                 .into_iter()
                 .map(|p| self.pin(&PinId(p)))
                 .map(|p| TopoPin {
@@ -3959,9 +3965,10 @@ struct Topology {
     /// Distinct parts the walk reached that the cap left out entirely. A
     /// part with a cut pair box but another entry drawn is not counted.
     omitted_parts: usize,
-    /// path_between only: the rule 4b route search (`route_obeying_chain`)
-    /// ran out of steps, so the drawing can show a route through two pairs
-    /// of one part that the walk does not take. Left out when false.
+    /// path_between only: the rule 4b search (`route_obeying_chain`) for the
+    /// route or the shunts ran out of steps, so the drawing can show a route
+    /// or a shunt through two pairs of one part that the walk does not take.
+    /// Left out when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     chain_check_capped: bool,
     /// Nets the walk reached that no kept part touches, so they are left out.

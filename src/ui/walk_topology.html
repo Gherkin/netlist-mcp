@@ -851,8 +851,10 @@ function render(data) {
   notes.innerHTML = "";
   const note = (s) => { const p = document.createElement("p"); p.textContent = s; notes.appendChild(p); };
   if (topo.truncated) {
-    note("Drawing cut by max_topology_parts: " + topo.omitted_parts + " parts and " +
-      topo.omitted_nets + " nets left out.");
+    note(topo.omitted_parts || topo.omitted_nets
+      ? "Drawing cut by max_topology_parts: " + topo.omitted_parts + " parts and " +
+        topo.omitted_nets + " nets left out."
+      : "Drawing cut by max_topology_parts: some boxes of drawn parts were left out.");
   }
   // `truncated` is also set by max_net_expansions; then the depth or
   // endpoint limit may or may not have been hit too.
@@ -862,7 +864,7 @@ function render(data) {
   if (data.expansions_capped) note("Routes past through-model parts were dropped at max_net_expansions, " +
     "so an endpoint can be missing.");
   if (topo.chain_check_capped) note("The route check through multi-pair parts ran out of steps, " +
-    "so a route the walk does not take may be drawn.");
+    "so a route or shunt the walk does not take may be drawn.");
   if (data.path && data.note) note(data.note);
   if (!topo.parts.length) note("No parts to draw.");
 

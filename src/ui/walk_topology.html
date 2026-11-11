@@ -861,6 +861,8 @@ function render(data) {
     "list in the result, not the drawing. Nets marked \"depth limit\" were not walked past.");
   if (data.expansions_capped) note("Routes past through-model parts were dropped at max_net_expansions, " +
     "so an endpoint can be missing.");
+  if (topo.chain_check_capped) note("The route check through multi-pair parts ran out of steps, " +
+    "so a route the walk does not take may be drawn.");
   if (data.path && data.note) note(data.note);
   if (!topo.parts.length) note("No parts to draw.");
 

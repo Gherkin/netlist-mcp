@@ -196,10 +196,16 @@ struct WalkParams {
     #[serde(default)]
     include_topology: Option<bool>,
     /// Max parts in `topology` (default 200, minimum 1; 0 is read as 1),
-    /// nearest to the start first.
+    /// nearest to the start first. A part with no pin left to draw takes no
+    /// slot; it is drawn in its place if a later slot gives it one. A part
+    /// whose pin was on a cut through-pair box comes back past the cap when
+    /// that pin sits on a drawn net that is not a rail. Neither takes a
+    /// slot, so `parts` can be longer.
     /// Nets only the cut parts reach are left out too. `topology.truncated`
-    /// and the `omitted_parts`/`omitted_nets` counts report the cut; a net's
-    /// own `omitted_parts` counts the cut parts on it (left out when 0).
+    /// and the `omitted_parts`/`omitted_nets` counts report the cut; the
+    /// top-level `omitted_parts` counts parts not drawn at all, a net's own
+    /// `omitted_parts` the cut parts with a pin on it that is not drawn
+    /// (left out when 0).
     #[serde(default)]
     max_topology_parts: Option<u32>,
     #[doc = max_net_expansions_doc!()]
@@ -224,7 +230,11 @@ struct DrawWalkParams {
     #[serde(default)]
     stop_at_power: Option<bool>,
     /// Max parts drawn (default 200, minimum 1; 0 is read as 1), nearest to
-    /// the start first. The drawing says when parts were cut.
+    /// the start first. A part with no pin left to draw takes no slot; it
+    /// is drawn in its place if a later slot gives it one. A part whose pin
+    /// was on a cut through-pair box is drawn past the cap when that pin sits
+    /// on a drawn net that is not a rail. Neither takes a slot, so more
+    /// parts than the cap can be drawn. The drawing says when parts were cut.
     #[serde(default)]
     max_topology_parts: Option<u32>,
     #[doc = max_net_expansions_doc!()]
@@ -251,12 +261,20 @@ struct PathBetweenParams {
     /// connectors on a route net. Branches that reach neither `to` nor a
     /// rail are left out. As in `walk`, a pin with `off_drawing` is on a net
     /// that is not a node ("outside" means outside the subgraph).
+    /// `topology.chain_check_capped: true` means the check that a route or
+    /// shunt does not pass through two pairs of one through-model part
+    /// without a chain ran out of steps, so such a route or shunt may be
+    /// drawn; treat routes through multi-pair parts as unchecked.
     #[serde(default)]
     include_topology: Option<bool>,
     /// Max parts in `topology` (default 200, minimum 2: the `from` and `to`
-    /// parts are always kept). Route parts are kept before shunts, shunts
-    /// before other ICs. `topology.truncated` and the `omitted_*` counts
-    /// report the cut.
+    /// pins are always drawn, on their part or on a through-pair box).
+    /// Route parts are kept before shunts, shunts before other ICs. A part
+    /// with no pin left to draw takes no slot; it is drawn in its place if a
+    /// later slot gives it one. A part whose pin was on a cut through-pair
+    /// box comes back past the cap when that pin sits on a drawn net that is
+    /// not a rail. Neither takes a slot, so `parts` can be longer.
+    /// `topology.truncated` and the `omitted_*` counts report the cut.
     #[serde(default)]
     max_topology_parts: Option<u32>,
     #[doc = max_net_expansions_doc!()]
@@ -272,9 +290,14 @@ struct DrawPathBetweenParams {
     from: String,
     /// Destination pin as "REFDES:PIN".
     to: String,
-    /// Max parts drawn (default 200, minimum 2: the `from` and `to` parts
-    /// are always kept). Route parts are kept before shunts, shunts before
-    /// other ICs. The drawing says when parts were cut.
+    /// Max parts drawn (default 200, minimum 2: the `from` and `to` pins
+    /// are always drawn, on their part or on a through-pair box). Route
+    /// parts are kept before shunts, shunts before other ICs. A part with no
+    /// pin left to draw takes no slot; it is drawn in its place if a later
+    /// slot gives it one. A part whose pin was on a cut through-pair box is
+    /// drawn past the cap when that pin sits on a drawn net that is not a
+    /// rail. Neither takes a slot, so more parts than the cap can be drawn.
+    /// The drawing says when parts were cut.
     #[serde(default)]
     max_topology_parts: Option<u32>,
     #[doc = max_net_expansions_doc!()]
@@ -470,7 +493,7 @@ impl NetlistServer {
         schematic but not on the built board. include_topology adds a \
         net/part graph, capped at max_topology_parts (default 200) and not by \
         max_endpoints; check topology.truncated. A net whose state is not \
-        expanded or past_through was not walked past, so parts beyond it are not listed. \
+        expanded was not walked past, so parts beyond it are not listed. \
         A part with a sidecar through-model (`through` pin pairs, e.g. an \
         op-amp channel or a choke winding) is crossed too, either way: its \
         `via` entry names the `pins` crossed and the `pair`, `against` when \
@@ -484,9 +507,12 @@ impl NetlistServer {
         one hop of distance and depth. From a pin, the \
         start part's pairs on the start net are crossed too. At equal depth \
         a route through plain series parts is taken before one through such \
-        a part. The topology graph stops at such a part and lists it in \
-        through_not_drawn (the start part too, once one of its pairs is crossed); a drawn net first walked past one is \
-        in state past_through, and its parts are not drawn.")]
+        a part. In the topology graph each crossed pair is its own part with \
+        role through and a `pair` object (`pins` as declared, input first; \
+        `conditional` and `gate` for a gate-controlled pair); it lists only \
+        the pair's pins and gate, and the graph goes on past it. A pin on \
+        such a pair is left off its part's other entry, which is dropped when \
+        it has no pin left on a drawn net that is not a rail.")]
     fn walk(&self, Parameters(p): Parameters<WalkParams>) -> String {
         let max_depth = p.max_depth.unwrap_or(4);
         let max_endpoints = p.max_endpoints.unwrap_or(50);

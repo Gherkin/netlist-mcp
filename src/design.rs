@@ -173,15 +173,15 @@ enum At {
 
 type Queued = (At, Vec<Hop>, u32);
 
-/// Pops the shallowest queued route; at equal depth a drawn one (no
+/// Pops the shallowest queued route; at equal depth a plain one (no
 /// through-model hop) before one past a through part.
 fn pop_shallowest(
-    drawn: &mut std::collections::VecDeque<Queued>,
+    plain: &mut std::collections::VecDeque<Queued>,
     past: &mut std::collections::VecDeque<Queued>,
 ) -> Option<Queued> {
-    match (drawn.front(), past.front()) {
+    match (plain.front(), past.front()) {
         (Some(a), Some(b)) if b.2 < a.2 => past.pop_front(),
-        (Some(_), _) => drawn.pop_front(),
+        (Some(_), _) => plain.pop_front(),
         (None, _) => past.pop_front(),
     }
 }
@@ -1554,15 +1554,16 @@ impl Design {
 
         let topology = include_topology.then(|| {
             let order = self.walk_part_order(&data.topo, &data.endpoints, start_comp.as_ref());
-            let mut t = self.build_topology(
+            self.build_topology(
                 &data.topo.nets,
+                &data.topo.pairs,
                 order,
                 &[start_net_id.0],
-                // At least 1, so the start part is always kept.
+                start_pin.map(|p| p.0).as_slice(),
+                // At least 1, so the start part (or its first pair box) is
+                // always kept.
                 max_topology_parts.max(1) as usize,
-            );
-            t.through_not_drawn = self.through_not_drawn(&data.topo);
-            t
+            )
         });
 
         let envelope = WalkEnvelope {
@@ -1611,7 +1612,7 @@ impl Design {
     ///    `path_between` only) and `rails_reached`.
     /// 6. Route order decides only: whether a through part's pin is listed
     ///    as an endpoint or only as `crossed` (4a for one route, not for
-    ///    another); and which route of equal depth is reported, a drawn one
+    ///    another); and which route of equal depth is reported, a plain one
     ///    (no through hop) first.
     /// 7. `max_net_expansions` limits the restriction sets kept per net (see
     ///    `DEFAULT_MAX_NET_EXPANSIONS`). A route it drops sets
@@ -1675,9 +1676,9 @@ impl Design {
         let mut truncated = false;
         let mut topo = TopoTrace::new(record_topology);
 
-        // Drawn routes (no through-model hop) and routes past a through
-        // part. At equal depth a drawn route is popped first, so a net that
-        // a plain series part reaches is drawn, and its via is the plain one.
+        // Plain routes (no through-model hop) and routes past a through
+        // part. At equal depth a plain route is popped first, so a net that
+        // a plain series part reaches has the plain via (rule 6).
         let mut queue: std::collections::VecDeque<Queued> = std::collections::VecDeque::new();
         let mut past_through: std::collections::VecDeque<Queued> = std::collections::VecDeque::new();
         queue.push_back((At::Net(start_net_idx), Vec::new(), 0));
@@ -1687,12 +1688,9 @@ impl Design {
         // cut by `popped` and lost (issue #31). Each such arrival gets
         // its own `rails_reached` entry instead.
         let mut rail_scores: HashMap<usize, f32> = HashMap::new();
-        // Every net popped so far (the visited set), with the state to note
-        // it in when a later arrival is drawn.
-        // A net first popped past a through part is not noted then; a later
-        // drawn arrival notes it, so every net a drawn series part reaches
-        // is in the topology. A rail or large net keeps its state; an
-        // expanded one is `PastThrough`, as its parts were not drawn.
+        // Every net popped so far (the visited set), with its state. The
+        // topology notes every net when first popped, past a through part
+        // too (issue #63).
         let mut popped: HashMap<usize, NetState> = HashMap::new();
 
         while let Some((at, via, depth)) = pop_shallowest(&mut queue, &mut past_through) {
@@ -1702,9 +1700,8 @@ impl Design {
                 At::Net(n) => (n, None),
                 At::Loose(p) => (usize::MAX, Some(PinId(p))),
             };
-            // The topology graph stops at a through-model part: nothing past
-            // one is recorded for it (drawing it is a follow-up to #47).
-            let mut drawn = via.iter().all(|h| h.cross.is_none());
+            // No through-model hop yet: decides only the queue (rule 6).
+            let plain = via.iter().all(|h| h.cross.is_none());
             debug_assert_eq!(via.len() as u32, depth, "depth is the via length");
             let restrict = restrictions(&via, through);
             // The key of the last part crossed, for `rail_seen`.
@@ -1721,9 +1718,6 @@ impl Design {
             });
             let first_pop = loose.is_none() && !popped.contains_key(&net_idx);
             if loose.is_none() && !first_pop {
-                if let (true, Some(&state)) = (drawn, popped.get(&net_idx)) {
-                    topo.note_net(net_idx, state);
-                }
                 if let Some(&score) = rail_scores.get(&net_idx) {
                     // A repeat arrival. Listed once per last part crossed, so
                     // the via chain is new. A repeat is kept only while the
@@ -1744,8 +1738,8 @@ impl Design {
                 // A rail or large net is never expanded. Another net is
                 // expanded again only under a set that no kept set is a
                 // subset of, within `max_net_expansions` unless it is a
-                // strict subset of a kept set (see `reexpand`), and that
-                // expansion is not drawn.
+                // strict subset of a kept set (see `reexpand`). The parts
+                // that expansion crosses are drawn too.
                 let Some(seen) = expanded.get(&net_idx) else {
                     continue;
                 };
@@ -1758,7 +1752,6 @@ impl Design {
                     }
                     Reexpand::Yes => {}
                 }
-                drawn = false;
             }
             let net = loose.is_none().then(|| self.net(&NetId(net_idx)));
 
@@ -1770,9 +1763,7 @@ impl Design {
                     let (score, _evidence) = self.rail_score(net);
                     if score >= RAIL_THRESHOLD {
                         popped.insert(net_idx, NetState::Rail);
-                        if drawn {
-                            topo.note_net(net_idx, NetState::Rail);
-                        }
+                        topo.note_net(net_idx, NetState::Rail);
                         let score = (score * 100.0).round() / 100.0;
                         rail_scores.insert(net_idx, score);
                         if let Some((c, p)) = last_part {
@@ -1788,9 +1779,7 @@ impl Design {
                 }
                 if net.pins.len() > 40 {
                     popped.insert(net_idx, NetState::LargeNet);
-                    if drawn {
-                        topo.note_net(net_idx, NetState::LargeNet);
-                    }
+                    topo.note_net(net_idx, NetState::LargeNet);
                     large_nets.push(LargeNet {
                         net: net.name.clone(),
                         fanout: net.pins.len(),
@@ -1854,10 +1843,8 @@ impl Design {
                 }
             }
             if first_pop {
-                popped.insert(net_idx, if drawn { NetState::Expanded } else { NetState::PastThrough });
-                if drawn {
-                    topo.note_net(net_idx, NetState::Expanded);
-                }
+                popped.insert(net_idx, NetState::Expanded);
+                topo.note_net(net_idx, NetState::Expanded);
             }
             let walk_pins: &[PinId] = match (&loose, net) {
                 (Some(p), _) => std::slice::from_ref(p),
@@ -1983,15 +1970,22 @@ impl Design {
                     let other_net_idx: Option<usize> = other_pin_id
                         .and_then(|p| self.pin(p).net.as_ref().map(|n| n.0))
                         .filter(|n| *n != net_idx);
-                    // The graph is drawn up to a through-model part, which is
-                    // named in the topology's `through_not_drawn`.
-                    let next_drawn = drawn && hop.cross.is_none();
-                    if drawn {
-                        match hop.cross {
-                            None => topo.note_series(comp_id.0, depth),
-                            // Also the start part: it is drawn, but what lies
-                            // past its pairs is not.
-                            Some(_) => topo.note_through(comp_id.0),
+                    let next_plain = plain && hop.cross.is_none();
+                    // A crossed pair is drawn as its own box (issue #63),
+                    // the start part's too.
+                    match hop.cross {
+                        None => topo.note_series(comp_id.0, depth, None),
+                        Some(c) => {
+                            if topo.record {
+                                let pair = &through.pairs[&comp_id.0][c.pair];
+                                topo.pairs.entry((comp_id.0, c.pair)).or_insert_with(|| TopoPair {
+                                    name: pair.name.clone(),
+                                    pins: [pair.pins[0].0, pair.pins[1].0],
+                                    gate: pair.gate.as_ref().and_then(|g| self.pin_map.get(g)).map(|p| p.0),
+                                    chain: pair.chain,
+                                });
+                            }
+                            topo.note_series(comp_id.0, depth, Some(c.pair));
                         }
                     }
                     if other_pin_has_no_net {
@@ -2047,12 +2041,12 @@ impl Design {
                         // Far pin's net has fanout 1 (only that pin) ->
                         // dangling, goes nowhere.
                         record_crossed(d);
+                        // Noted before chaining on: the pair's box has a
+                        // pin on this net.
+                        topo.note_net(other_net_idx, NetState::Dangling);
                         if chains_on {
                             queue_loose(&mut past_through, via_here);
                             continue;
-                        }
-                        if next_drawn {
-                            topo.note_net(other_net_idx, NetState::Dangling);
                         }
                         if dead_end_seen.insert(other_net.name.clone())
                             && dead_ends.len() < max_endpoints as usize
@@ -2069,13 +2063,11 @@ impl Design {
                     }
                     if d <= max_depth {
                         record_crossed(d);
-                        let q = if next_drawn { &mut queue } else { &mut past_through };
+                        let q = if next_plain { &mut queue } else { &mut past_through };
                         push(q, (At::Net(other_net_idx), via_here, d));
                     } else {
                         // Depth-limited branch.
-                        if next_drawn {
-                            topo.note_net(other_net_idx, NetState::DepthLimit);
-                        }
+                        topo.note_net(other_net_idx, NetState::DepthLimit);
                         truncated = true;
                     }
                 }
@@ -2093,9 +2085,7 @@ impl Design {
                         truncated = true;
                         // Still a graph candidate (issue #35): only
                         // `max_topology_parts` limits the graph.
-                        if drawn {
-                            topo.note_dropped_endpoint(comp_id.0, depth);
-                        }
+                        topo.note_dropped_endpoint(comp_id.0, depth);
                         continue;
                     }
                     endpoints.push(WalkEndpoint {
@@ -2114,7 +2104,6 @@ impl Design {
                         distance: depth,
                         comp_idx: comp_id.0,
                         net_idx,
-                        drawn,
                     });
                 }
             }
@@ -2140,26 +2129,23 @@ impl Design {
     /// branch structure before leaf ICs. Every net a kept series part reaches
     /// comes before any part one hop further, so a cut keeps a connected
     /// graph around the start. That includes endpoint parts `max_endpoints`
-    /// kept out of `endpoints` (issue #35). The list can repeat a part;
+    /// kept out of `endpoints` (issue #35). A crossed through pair (issue
+    /// #63) ranks as a series part. The list can repeat a part;
     /// `build_topology` keeps its first place.
     fn walk_part_order(
         &self,
         topo: &TopoTrace,
         endpoints: &[WalkEndpoint],
         start_comp: Option<&CompId>,
-    ) -> Vec<(usize, &'static str)> {
-        let mut ranked: Vec<(u32, u8, usize, &'static str)> = Vec::new();
-        for &(c, d) in &topo.series {
-            ranked.push((d, 0, c, "series"));
+    ) -> Vec<TopoEntry> {
+        let mut ranked: Vec<(u32, u8, TopoEntry)> = Vec::new();
+        for &(c, d, pair) in &topo.series {
+            ranked.push((d, 0, TopoEntry::crossed(c, pair)));
         }
         // Endpoint parts `max_endpoints` dropped from the list are still in
         // the graph (issue #35). Listed and dropped sort together by distance
         // and natural refdes, so the graph does not depend on that cap.
-        let mut ends: Vec<(usize, u32)> = endpoints
-            .iter()
-            .filter(|e| e.drawn)
-            .map(|e| (e.comp_idx, e.distance))
-            .collect();
+        let mut ends: Vec<(usize, u32)> = endpoints.iter().map(|e| (e.comp_idx, e.distance)).collect();
         ends.extend(topo.dropped_endpoints.iter().copied());
         // The part index breaks `pin_sort_key` ties (R1 vs R01), so listed
         // parts do not sort ahead of dropped ones.
@@ -2167,86 +2153,263 @@ impl Design {
             (d, Self::pin_sort_key(&self.component(&CompId(c)).refdes), c)
         });
         for (c, d) in ends {
-            ranked.push((d, 1, c, "endpoint"));
+            ranked.push((d, 1, TopoEntry::new(c, "endpoint")));
         }
         // Stable: series keep BFS order, endpoints keep the order above.
-        ranked.sort_by_key(|&(d, r, _, _)| (d, r));
+        ranked.sort_by_key(|&(d, r, _)| (d, r));
         start_comp
-            .map(|c| (c.0, "start"))
+            .map(|c| TopoEntry::new(c.0, "start"))
             .into_iter()
-            .chain(ranked.into_iter().map(|(_, _, c, role)| (c, role)))
+            .chain(ranked.into_iter().map(|(_, _, e)| e))
             .collect()
     }
 
     /// Build a topology graph from nets the BFS recorded and parts in keep
     /// order (`walk_part_order`, `path_topology`). Nets are the nodes; parts
-    /// are the edges. A "series" part lists all its pins; any other part
+    /// are the edges. A "series" part lists all its pins; a "through" entry
+    /// (one crossed pair, issue #63, described in `pairs`) lists its two
+    /// pins in declared order, then its gate; any other part
     /// lists only the pins on a kept net (in any state, rail and depth_limit
     /// included), so a 100-pin IC shows only its pins in the graph. A
     /// two-pin part other than a test point lists both pins, and a pin off
     /// the kept nets says why in `off_drawing`. A part
-    /// listed twice keeps its first place and role.
+    /// listed twice keeps its first place and role; each of its pairs is
+    /// listed once more.
+    ///
+    /// A pin on a kept "through" entry is left off its part's start or
+    /// endpoint entry, so no pin is drawn twice. That entry is dropped,
+    /// before the cap, when no pin of it is left on a net that is not a
+    /// rail, unless it still lists a `marked` pin (the walk's start pin, or
+    /// path_between's from and to), so a marked pin is always drawn.
     ///
     /// At most `max_parts` parts are kept (issue #34), from the front of
-    /// `order`. Nets are then kept only when they are in `fixed_nets` or sit
-    /// on a pin of a kept series part, so no node hangs loose. `nets` must
-    /// hold every such net. `truncated`, `omitted_parts` and `omitted_nets`
-    /// report the cut; each net's own `omitted_parts` counts the cut parts
-    /// with a pin on it.
+    /// `order`, after the first entry drawing each marked pin is moved to the
+    /// front. Nets are then kept only when they are in `fixed_nets` or sit
+    /// on a pin of a kept series part or pair, so no node hangs loose. `nets` must
+    /// hold every such net. A dropped entry comes back, past the cap, when
+    /// the cap cut the box of one of its pins on a drawn net that is not a
+    /// rail. A part entry the cut leaves with no pin to draw is cut too, and
+    /// its slot goes to the next entry, so every slot draws a pin. If a later
+    /// slot then gives it a pin to draw, it comes back in its place, past the
+    /// cap.
+    /// `truncated`, `omitted_parts` (distinct parts with no kept entry) and
+    /// `omitted_nets` report the cut. Each net's own `omitted_parts` counts
+    /// the distinct cut parts with a pin on it that no kept entry draws.
     fn build_topology(
         &self,
         nets: &[(usize, NetState)],
-        order: Vec<(usize, &'static str)>,
+        pairs: &HashMap<(usize, usize), TopoPair>,
+        order: Vec<TopoEntry>,
         fixed_nets: &[usize],
+        marked: &[usize],
         max_parts: usize,
     ) -> Topology {
         // Deduplicate: an endpoint part shows up once per reached pin, and
         // the start part can also be traversed as a series part from its far
         // side.
-        let mut seen: HashSet<usize> = HashSet::new();
-        let mut order: Vec<(usize, &'static str)> =
-            order.into_iter().filter(|&(c, _)| seen.insert(c)).collect();
-        let cut = order.split_off(max_parts.min(order.len()));
-        let omitted_parts = cut.len();
+        let mut seen: HashSet<(usize, Option<usize>)> = HashSet::new();
+        let order: Vec<TopoEntry> = order.into_iter().filter(|e| seen.insert(e.key())).collect();
 
-        // Nets on a kept series part, plus the fixed nets. Other parts add no
-        // nets: their pins are filtered to this set below.
-        let series_nets = |parts: &[(usize, &'static str)]| -> HashSet<usize> {
+        let pair_of = |e: &TopoEntry| e.pair.map(|p| &pairs[&(e.comp, p)]);
+        // The pins an entry can list: a pair's own pins and gate, or every
+        // pin of the part.
+        let entry_pins = |e: &TopoEntry| -> Vec<usize> {
+            match pair_of(e) {
+                Some(pair) => pair.pins.iter().copied().chain(pair.gate).collect(),
+                None => self.component(&CompId(e.comp)).pins.iter().map(|p| p.0).collect(),
+            }
+        };
+        let net_of = |p: usize| self.pin(&PinId(p)).net.as_ref().map(|n| n.0);
+        // Nets on a kept series part or pair (not its gate), plus the fixed
+        // nets. Other parts add no nets: their pins are filtered to this set
+        // below.
+        let series_nets = |parts: &[TopoEntry]| -> HashSet<usize> {
             let mut out: HashSet<usize> = fixed_nets.iter().copied().collect();
-            for &(c, role) in parts {
-                if role == "series" {
-                    for p in &self.component(&CompId(c)).pins {
-                        if let Some(n) = &self.pin(p).net {
-                            out.insert(n.0);
-                        }
-                    }
-                }
+            for e in parts {
+                let pins: Vec<usize> = match pair_of(e) {
+                    Some(pair) => pair.pins.to_vec(),
+                    None if e.role == "series" => entry_pins(e),
+                    None => continue,
+                };
+                out.extend(pins.into_iter().filter_map(net_of));
             }
             out
         };
-        let kept_nets = series_nets(&order);
-        // The nets only the cut parts would add: a pin on one of these that
-        // is not drawn was cut by `max_parts`.
-        let cut_nets = series_nets(&cut);
+        let rail_nets: HashSet<usize> =
+            nets.iter().filter(|(_, s)| *s == NetState::Rail).map(|(n, _)| *n).collect();
+        // Pins on the pair boxes among `parts`.
+        let boxed_by = |parts: &[TopoEntry]| -> HashSet<usize> {
+            parts.iter().filter(|e| e.pair.is_some()).flat_map(|e| entry_pins(e)).collect()
+        };
+        // The pins an entry lists, given the drawn nets and the pins on pair
+        // boxes. A two-pin part keeps the pin whose net is not drawn, with
+        // the reason, so the page can draw that lead (a symbol's second lead,
+        // or a box pin). A test point is drawn with one lead only.
+        let listed_pins = |e: &TopoEntry, drawn: &HashSet<usize>, boxed: &HashSet<usize>| -> Vec<usize> {
+            let comp = self.component(&CompId(e.comp));
+            let all_pins = e.role == "series"
+                || e.pair.is_some()
+                || (comp.pins.len() == 2 && Self::refdes_class(&comp.refdes) != "TP");
+            entry_pins(e)
+                .into_iter()
+                .filter(|&p| all_pins || net_of(p).is_some_and(|n| drawn.contains(&n)))
+                .filter(|p| e.pair.is_some() || !boxed.contains(p))
+                .collect()
+        };
+
+        // Drop the part entries that pair boxes leave nothing to draw,
+        // judged against the whole order, so a dropped entry takes no
+        // `max_parts` slot. Its slot goes to the boxes that hold its marked
+        // pins.
+        let all_nets = series_nets(&order);
+        let all_boxed = boxed_by(&order);
+        let mut dropped_entries: Vec<TopoEntry> = Vec::new();
+        let mut order = {
+            let dropped = |e: &TopoEntry| {
+                let keeps = |p: usize| {
+                    marked.contains(&p)
+                        || net_of(p).is_some_and(|n| all_nets.contains(&n) && !rail_nets.contains(&n))
+                };
+                e.pair.is_none()
+                    && entry_pins(e).iter().any(|p| all_boxed.contains(p))
+                    && !listed_pins(e, &all_nets, &all_boxed).into_iter().any(keeps)
+            };
+            // Per part, its pair boxes that hold a marked pin, in order.
+            let mut mark_boxes: HashMap<usize, Vec<TopoEntry>> = HashMap::new();
+            for b in order.iter().filter(|b| b.pair.is_some()) {
+                if entry_pins(b).iter().any(|p| marked.contains(p)) {
+                    mark_boxes.entry(b.comp).or_default().push(*b);
+                }
+            }
+            let mut placed: HashSet<(usize, Option<usize>)> = HashSet::new();
+            let mut out = Vec::with_capacity(order.len());
+            for e in &order {
+                let moved: &[TopoEntry] = if dropped(e) {
+                    dropped_entries.push(*e);
+                    mark_boxes.get(&e.comp).map_or(&[], Vec::as_slice)
+                } else {
+                    std::slice::from_ref(e)
+                };
+                for b in moved {
+                    if placed.insert(b.key()) {
+                        out.push(*b);
+                    }
+                }
+            }
+            // Ends first: the first entry that draws each marked pin goes to
+            // the front, in its order, so the cap never cuts a marked pin
+            // (path_between's minimum of 2 covers from and to). Other boxes
+            // that share the pin (a mux COM) keep their place in `out`; when
+            // the pin's own entry was dropped, that place is already the
+            // dropped entry's slot (`mark_boxes` above).
+            let mut front: Vec<usize> = marked
+                .iter()
+                .filter_map(|&m| out.iter().position(|e| listed_pins(e, &all_nets, &all_boxed).contains(&m)))
+                .collect();
+            front.sort_unstable();
+            front.dedup();
+            let rest = (0..out.len()).filter(|i| front.binary_search(i).is_err());
+            front.iter().copied().chain(rest).map(|i| out[i]).collect::<Vec<_>>()
+        };
+        // The cap: the first `max_parts` entries, minus part entries left
+        // with no pin to draw (kept only for a net a cut part brings in).
+        // Those are skipped and take no slot; the freed slot goes to the
+        // next entry, and the check runs again, since a refilled series
+        // part or pair adds nets. A skipped entry is not looked at again
+        // inside the loop; one that a later pass gave a pin comes back after
+        // the loop, at its index in `order`. Series and pair entries list
+        // all their pins, so only part entries are skipped. Each pass but
+        // the last skips one or more: at most `order.len() + 1` passes.
+        let mut skipped: HashSet<(usize, Option<usize>)> = HashSet::new();
+        let (end, kept_nets, boxed) = loop {
+            // `end`: just past the last kept entry.
+            let (mut kept, mut end) = (Vec::new(), 0);
+            for (i, e) in order.iter().enumerate() {
+                if kept.len() == max_parts {
+                    break;
+                }
+                if !skipped.contains(&e.key()) {
+                    kept.push(*e);
+                    end = i + 1;
+                }
+            }
+            let kept_nets = series_nets(&kept);
+            let boxed = boxed_by(&kept);
+            let before = skipped.len();
+            skipped.extend(
+                kept.iter().filter(|e| listed_pins(e, &kept_nets, &boxed).is_empty()).map(TopoEntry::key),
+            );
+            if skipped.len() == before {
+                break (end, kept_nets, boxed);
+            }
+        };
+        // Every entry before `end` was kept or skipped. The kept ones have a
+        // pin to draw; a skipped one that a later pass gave a pin comes back
+        // in its place. Part entries add no net and no box, so `kept_nets`
+        // and `boxed` stay as they are.
+        let mut cut = order.split_off(end);
+        let mut order_pins: Vec<(TopoEntry, Vec<usize>)> = Vec::new();
+        for e in order {
+            let pins = listed_pins(&e, &kept_nets, &boxed);
+            if pins.is_empty() {
+                cut.push(e);
+            } else {
+                order_pins.push((e, pins));
+            }
+        }
+
         // `kept_nets` is a subset of `nets`: `walk_bfs` notes every net it
-        // pops and every far-side net of a series part it traverses, and
-        // `path_topology` keeps every net of the parts it keeps.
+        // pops and every far-side net of a series part or pair it crosses,
+        // and `path_topology` keeps every net of the parts it keeps.
         debug_assert!(kept_nets.iter().all(|n| nets.iter().any(|(t, _)| t == n)));
         let omitted_nets = nets.len().saturating_sub(kept_nets.len());
 
-        // Per kept net: how many cut parts have a pin on it.
-        let mut cut_on_net: HashMap<usize, usize> = HashMap::new();
-        let mut on: HashSet<usize> = HashSet::new();
-        for &(c, _) in &cut {
-            on.clear();
-            on.extend(self
-                .component(&CompId(c))
-                .pins
-                .iter()
-                .filter_map(|p| self.pin(p).net.as_ref().map(|n| n.0))
-                .filter(|n| kept_nets.contains(n)));
-            for &n in &on {
-                *cut_on_net.entry(n).or_default() += 1;
+        // `boxed`: pins drawn on a kept pair's box, not again on their part's
+        // box. A dropped entry comes back when the cap cut the box of one of its
+        // pins and that pin sits on a drawn net that is not a rail. It takes
+        // no slot, so the drawing can then list more than `max_parts`
+        // entries. It adds no net and no box, so `kept_nets` and `boxed`
+        // stay as they are.
+        order_pins.extend(
+            dropped_entries
+                .into_iter()
+                .filter(|e| {
+                    entry_pins(e).into_iter().any(|p| {
+                        all_boxed.contains(&p)
+                            && !boxed.contains(&p)
+                            && net_of(p).is_some_and(|n| kept_nets.contains(&n) && !rail_nets.contains(&n))
+                    })
+                })
+                .map(|e| {
+                    let pins = listed_pins(&e, &kept_nets, &boxed);
+                    (e, pins)
+                }),
+        );
+        // Every kept entry has a pin to draw: the loop above cut the others,
+        // and a restored dropped entry lists the pin it came back for.
+        debug_assert!(order_pins.iter().all(|(_, pins)| !pins.is_empty()));
+        // Distinct parts with no kept entry at all. A part drawn in another
+        // entry is not counted, so `truncated` can be set with this at 0.
+        let kept_comps: HashSet<usize> = order_pins.iter().map(|(e, _)| e.comp).collect();
+        let omitted_parts =
+            cut.iter().map(|e| e.comp).filter(|c| !kept_comps.contains(c)).collect::<HashSet<_>>().len();
+        // The nets only the cut parts would add: a pin on one of these that
+        // is not drawn was cut by `max_parts`.
+        let cut_nets = series_nets(&cut);
+
+        // Pins drawn on a kept entry.
+        let drawn: HashSet<usize> = order_pins.iter().flat_map(|(_, pins)| pins.iter().copied()).collect();
+        // Per kept net: how many cut parts have a pin on it that no kept
+        // entry draws. A part cut in several entries counts once.
+        let mut cut_on_net: HashMap<usize, HashSet<usize>> = HashMap::new();
+        for e in &cut {
+            for n in entry_pins(e)
+                .into_iter()
+                .filter(|p| !drawn.contains(p))
+                .filter_map(net_of)
+                .filter(|n| kept_nets.contains(n))
+            {
+                cut_on_net.entry(n).or_default().insert(e.comp);
             }
         }
 
@@ -2261,24 +2424,18 @@ impl Design {
                     fanout: net.pins.len(),
                     rail: score >= RAIL_THRESHOLD,
                     state: state.as_str(),
-                    omitted_parts: cut_on_net.get(idx).copied().unwrap_or(0),
+                    omitted_parts: cut_on_net.get(idx).map_or(0, HashSet::len),
                 }
             })
             .collect();
 
         let mut parts: Vec<TopoPart> = Vec::new();
-        for (comp_idx, role) in order {
-            let comp = self.component(&CompId(comp_idx));
-            // A two-pin part keeps the pin whose net is not drawn, with the
-            // reason, so the page can draw that lead (a symbol's second lead,
-            // or a box pin). A test point is drawn with one lead only.
-            let all_pins = role == "series"
-                || (comp.pins.len() == 2 && Self::refdes_class(&comp.refdes) != "TP");
-            let mut pins: Vec<TopoPin> = comp
-                .pins
-                .iter()
-                .map(|p| self.pin(p))
-                .filter(|p| all_pins || p.net.as_ref().is_some_and(|n| kept_nets.contains(&n.0)))
+        for (e, listed) in order_pins {
+            let comp = self.component(&CompId(e.comp));
+            let pair = pair_of(&e);
+            let mut pins: Vec<TopoPin> = listed
+                .into_iter()
+                .map(|p| self.pin(&PinId(p)))
                 .map(|p| TopoPin {
                     pin: p.number.clone(),
                     name: p.name.clone(),
@@ -2291,24 +2448,34 @@ impl Design {
                     },
                 })
                 .collect();
-            pins.sort_by(|a, b| Self::pin_sort_key(&a.pin).cmp(&Self::pin_sort_key(&b.pin)));
+            // A pair keeps its declared order: input, output, gate.
+            if pair.is_none() {
+                pins.sort_by(|a, b| Self::pin_sort_key(&a.pin).cmp(&Self::pin_sort_key(&b.pin)));
+            }
+            let number = |p: usize| self.pin(&PinId(p)).number.clone();
             parts.push(TopoPart {
                 refdes: comp.refdes.clone(),
                 value: comp.value.clone(),
                 class: Self::refdes_class(&comp.refdes),
                 dnp: comp.dnp,
-                role,
+                role: e.role,
+                pair: pair.map(|pair| TopoPairOut {
+                    name: pair.name.clone(),
+                    pins: pair.pins.map(number),
+                    conditional: pair.gate.is_some(),
+                    gate: pair.gate.map(number),
+                }),
                 pins,
             });
         }
 
         Topology {
-            truncated: omitted_parts > 0,
+            truncated: !cut.is_empty(),
             omitted_parts,
+            chain_check_capped: false,
             omitted_nets,
             nets,
             parts,
-            through_not_drawn: Vec::new(),
         }
     }
 
@@ -2323,7 +2490,8 @@ impl Design {
     /// `include_topology` adds a `topology` object when the pins are
     /// connected: the same shape as `walk`'s, pruned to the from→to subgraph
     /// (see `path_topology`), capped at `max_topology_parts` (minimum 2, so
-    /// both end parts are kept). Without it the output is unchanged.
+    /// the from and to pins are always drawn). Without it the output is
+    /// unchanged.
     pub fn path_between(
         &self,
         from: &str,
@@ -2373,8 +2541,10 @@ impl Design {
         if same_net && self.rail_score(self.net(&from_net_id)).0 >= RAIL_THRESHOLD {
             let topology = self.build_topology(
                 &[(from_net_id.0, NetState::Rail)],
-                vec![(from_comp.0, "start"), (to_comp, "endpoint")],
+                &HashMap::new(),
+                vec![TopoEntry::new(from_comp.0, "start"), TopoEntry::new(to_comp, "endpoint")],
                 &[from_net_id.0],
+                &[from_pin_id.0, to_pin_id.0],
                 max_topology_parts.max(2) as usize,
             );
             return Self::path_between_envelope(
@@ -2401,6 +2571,7 @@ impl Design {
                     to_net,
                     from_comp.0,
                     to_comp,
+                    [from_pin_id.0, to_pin_id.0],
                     max_topology_parts.max(2) as usize,
                 )
             })
@@ -2444,7 +2615,7 @@ impl Design {
         // through-model pair the walk crossed (an op-amp output, issue #47),
         // or a pin of the start part itself. Take the shortest. `start_part`
         // goes first: `min_by_key` keeps the first of equal depth, and a
-        // `crossed` route always ends in a through hop, so a drawn route
+        // `crossed` route always ends in a through hop, so a plain route
         // wins a tie (rule 6).
         if let Some(c) = data
             .start_part
@@ -2517,7 +2688,8 @@ impl Design {
     /// part with a pin on a route or shunt net, so the part an RC filter
     /// feeds is drawn with it; branches that reach neither `to` nor
     /// a rail are left out. A passive end part counts as an edge for the
-    /// route test, but keeps its start or endpoint role in the graph.
+    /// route test, but keeps its start or endpoint role in the graph. A
+    /// crossed through pair (issue #63) is an edge between its two nets.
     ///
     /// Keep order for the cap: the `from` part, the `to` part, route parts,
     /// shunt parts (each by hop distance), then the other endpoint parts by
@@ -2530,44 +2702,61 @@ impl Design {
         to_net: usize,
         from_comp: usize,
         to_comp: usize,
+        marked: [usize; 2],
         max_parts: usize,
     ) -> Topology {
         let topo = &data.topo;
         let in_state = |want: NetState| -> HashSet<usize> {
             topo.nets.iter().filter(|(_, st)| *st == want).map(|(n, _)| *n).collect()
         };
-        let walked = in_state(NetState::Expanded);
+        // A chained route (rule 4c) crosses two pairs of one part through a
+        // pin alone on its net: that dangling net joins the two pairs. A
+        // plain part can touch it with one pin only, so no plain route goes
+        // through it, and `path_subgraph` lets a pair route through it only
+        // out of a `chain` pair.
+        let mut walked = in_state(NetState::Expanded);
+        walked.extend(in_state(NetState::Dangling));
         let rails = in_state(NetState::Rail);
 
         let part_nets: Vec<Option<(usize, usize)>> = topo
             .series
             .iter()
-            .map(|&(c, _)| {
+            .map(|&(c, _, pair)| {
                 // The end parts stay in: a passive `to` part (a cap into a
                 // rail) is itself the last route edge. `build_topology`
                 // keeps their first role, start or endpoint.
-                let nets: Vec<Option<usize>> = self
-                    .component(&CompId(c))
-                    .pins
-                    .iter()
-                    .map(|p| self.pin(p).net.as_ref().map(|n| n.0))
-                    .collect();
+                let net = |p: &PinId| self.pin(p).net.as_ref().map(|n| n.0);
+                let nets: Vec<Option<usize>> = match pair {
+                    Some(p) => topo.pairs[&(c, p)].pins.iter().map(|&p| net(&PinId(p))).collect(),
+                    None => self.component(&CompId(c)).pins.iter().map(net).collect(),
+                };
                 match nets[..] {
                     [Some(a), Some(b)] => Some((a, b)),
                     _ => None,
                 }
             })
             .collect();
-        let (roles, route_nets) = path_subgraph(&part_nets, &walked, &rails, from_net, to_net);
+        // Pin order matches `part_nets`: the pair's declared pins.
+        let pair_edges: Vec<Option<PairEdge>> = topo
+            .series
+            .iter()
+            .map(|&(c, _, pair)| {
+                let p = &topo.pairs[&(c, pair?)];
+                Some(PairEdge { comp: c, pins: p.pins, chain: p.chain })
+            })
+            .collect();
+        let (roles, route_nets, chain_check_capped) =
+            path_subgraph(&part_nets, &pair_edges, &walked, &rails, from_net, to_net);
 
         let mut kept_nets = route_nets.clone();
-        let mut route_parts: Vec<(u32, usize)> = Vec::new();
-        let mut shunt_parts: Vec<(u32, usize)> = Vec::new();
-        for (i, &(c, d)) in topo.series.iter().enumerate() {
+        let mut route_parts: Vec<(u32, TopoEntry)> = Vec::new();
+        let mut shunt_parts: Vec<(u32, TopoEntry)> = Vec::new();
+        for (i, &(c, d, pair)) in topo.series.iter().enumerate() {
             let Some((a, b)) = part_nets[i] else { continue };
+            let e = TopoEntry::crossed(c, pair);
             match roles[i] {
-                PathRole::Route => route_parts.push((d, c)),
-                PathRole::Shunt => shunt_parts.push((d, c)),
+                PathRole::Route => route_parts.push((d, e)),
+                PathRole::Shunt => shunt_parts.push((d, e)),
                 PathRole::Off => continue,
             }
             kept_nets.extend([a, b]);
@@ -2580,41 +2769,30 @@ impl Design {
             .endpoints
             .iter()
             .filter(|e| e.comp_idx != from_comp && e.comp_idx != to_comp)
-            .filter(|e| e.drawn && kept_nets.contains(&e.net_idx))
+            .filter(|e| kept_nets.contains(&e.net_idx))
             .map(|e| (e.comp_idx, e.distance))
             .collect();
         others.sort_by_cached_key(|&(c, d)| {
             (d, Self::pin_sort_key(&self.component(&CompId(c)).refdes), c)
         });
 
-        let order: Vec<(usize, &'static str)> = [(from_comp, "start"), (to_comp, "endpoint")]
-            .into_iter()
-            .chain(route_parts.into_iter().map(|(_, c)| (c, "series")))
-            .chain(shunt_parts.into_iter().map(|(_, c)| (c, "series")))
-            .chain(others.into_iter().map(|(c, _)| (c, "endpoint")))
-            .collect();
+        let order: Vec<TopoEntry> =
+            [TopoEntry::new(from_comp, "start"), TopoEntry::new(to_comp, "endpoint")]
+                .into_iter()
+                .chain(route_parts.into_iter().map(|(_, e)| e))
+                .chain(shunt_parts.into_iter().map(|(_, e)| e))
+                .chain(others.into_iter().map(|(c, _)| TopoEntry::new(c, "endpoint")))
+                .collect();
         let nets: Vec<(usize, NetState)> =
             topo.nets.iter().copied().filter(|(n, _)| kept_nets.contains(n)).collect();
-        // A `to` net reached only past a through part is not drawn (#47);
-        // its part is then drawn with its pins off the drawing.
+        // Only end nets the walk noted, as `build_topology` requires.
         let fixed: Vec<usize> = [from_net, to_net]
             .into_iter()
             .filter(|n| topo.net_pos.contains_key(n))
             .collect();
-        let mut out = self.build_topology(&nets, order, &fixed, max_parts);
-        out.through_not_drawn = self.through_not_drawn(topo);
+        let mut out = self.build_topology(&nets, &topo.pairs, order, &fixed, &marked, max_parts);
+        out.chain_check_capped = chain_check_capped;
         out
-    }
-
-    /// The through-model parts the graph stops at (issue #47), each once,
-    /// in BFS order.
-    fn through_not_drawn(&self, topo: &TopoTrace) -> Vec<String> {
-        let mut seen = HashSet::new();
-        topo.through
-            .iter()
-            .filter(|c| seen.insert(**c))
-            .map(|c| self.component(&CompId(*c)).refdes.clone())
-            .collect()
     }
 
     fn path_between_envelope(
@@ -3415,10 +3593,6 @@ enum NetState {
     DepthLimit,
     /// The far net of a series part, with fanout 1; never popped.
     Dangling,
-    /// Popped first on a route past a through-model part (issue #47), then
-    /// reached by a drawn route. The parts the first pop found are not
-    /// drawn, so the graph stops here.
-    PastThrough,
 }
 
 impl NetState {
@@ -3429,7 +3603,6 @@ impl NetState {
             NetState::LargeNet => "large_net",
             NetState::DepthLimit => "depth_limit",
             NetState::Dangling => "dangling",
-            NetState::PastThrough => "past_through",
         }
     }
 
@@ -3439,7 +3612,7 @@ impl NetState {
     fn popped(self) -> bool {
         matches!(
             self,
-            NetState::Expanded | NetState::Rail | NetState::LargeNet | NetState::PastThrough
+            NetState::Expanded | NetState::Rail | NetState::LargeNet
         )
     }
 }
@@ -3455,23 +3628,60 @@ struct TopoTrace {
     nets: Vec<(usize, NetState)>,
     /// net index -> position in `nets`.
     net_pos: HashMap<usize, usize>,
-    /// (series part, depth of the net it was traversed from).
-    series: Vec<(usize, u32)>,
+    /// (part, depth of the net it was crossed from, pair): a series part
+    /// with no pair, or one through-model pair of a part (issue #63).
+    series: Vec<(usize, u32, Option<usize>)>,
+    /// (part, pair) already in `series`. The BFS pops in depth order, so the
+    /// first crossing kept is the shallowest; a re-expansion adds nothing.
+    series_seen: HashSet<(usize, Option<usize>)>,
+    /// Every pair in `series`, keyed (part, pair index), as resolved when
+    /// crossed: the sidecar can be rewritten before the graph is built.
+    pairs: HashMap<(usize, usize), TopoPair>,
     /// (endpoint part, depth) for endpoint pins past `max_endpoints`, in
     /// BFS order. A part can appear more than once.
     dropped_endpoints: Vec<(usize, u32)>,
-    /// Through-model parts crossed from a drawn net (issue #47), in BFS
-    /// order. The graph stops at them; a part can appear more than once.
-    through: Vec<usize>,
+}
+
+/// A crossed through-model pair, for the topology graph (issue #63).
+#[derive(Debug)]
+struct TopoPair {
+    name: Option<String>,
+    /// Pin indices, as declared: first the input side.
+    pins: [usize; 2],
+    /// The controlling pin's index.
+    gate: Option<usize>,
+    /// The pair sets `chain` (rule 4b): `path_topology` needs it to tell a
+    /// real route from one the walk rules out.
+    chain: bool,
+}
+
+/// One part in a topology's keep order: a part in a role ("start",
+/// "series", "endpoint"), or one crossed through pair of a part ("through",
+/// `pair` set, issue #63).
+#[derive(Debug, Clone, Copy)]
+struct TopoEntry {
+    comp: usize,
+    role: &'static str,
+    pair: Option<usize>,
+}
+
+impl TopoEntry {
+    fn new(comp: usize, role: &'static str) -> Self {
+        TopoEntry { comp, role, pair: None }
+    }
+
+    /// A part crossed by the walk: a series passive, or one of its pairs.
+    fn crossed(comp: usize, pair: Option<usize>) -> Self {
+        TopoEntry { comp, role: if pair.is_some() { "through" } else { "series" }, pair }
+    }
+
+    /// A part is listed once, whatever its role; each of its pairs once more.
+    fn key(&self) -> (usize, Option<usize>) {
+        (self.comp, self.pair)
+    }
 }
 
 impl TopoTrace {
-    fn note_through(&mut self, comp_idx: usize) {
-        if self.record {
-            self.through.push(comp_idx);
-        }
-    }
-
     fn new(record: bool) -> Self {
         TopoTrace { record, ..Default::default() }
     }
@@ -3494,9 +3704,9 @@ impl TopoTrace {
         }
     }
 
-    fn note_series(&mut self, comp_idx: usize, depth: u32) {
-        if self.record {
-            self.series.push((comp_idx, depth));
+    fn note_series(&mut self, comp_idx: usize, depth: u32, pair: Option<usize>) {
+        if self.record && self.series_seen.insert((comp_idx, pair)) {
+            self.series.push((comp_idx, depth, pair));
         }
     }
 
@@ -3590,6 +3800,107 @@ fn edges_on_st_paths(edges: &[(usize, usize)], s: usize, t: usize) -> Vec<bool> 
     on
 }
 
+/// A crossed through pair as a `path_subgraph` edge (issue #63): its part,
+/// its pin on each of the edge's two nets (in the edge's order), and whether
+/// it sets `chain`.
+#[derive(Debug, Clone, Copy)]
+struct PairEdge {
+    comp: usize,
+    pins: [usize; 2],
+    chain: bool,
+}
+
+/// Steps `route_obeying_chain` may take before it gives up.
+const ROUTE_SEARCH_BUDGET: usize = 200_000;
+
+/// Of the `candidate` edges (those `edges_on_st_paths` found), the ones on a
+/// simple path from `s` to `t` that the walk can take: out of a pair that
+/// does not set `chain` onto pin p, it never crosses another pair of the
+/// same part from p (rule 4b). A simple path visits a net once, so that is
+/// the whole check. With rule 4b in play, "is this edge on such a path" is
+/// NP-hard in general, so this is a depth-first search over simple paths,
+/// run only when two candidate pairs of one part meet on one pin. `None`
+/// when it runs out of `ROUTE_SEARCH_BUDGET`; the caller then keeps
+/// `candidate`.
+fn route_obeying_chain(
+    edges: &[(usize, usize)],
+    pairs: &[Option<PairEdge>],
+    candidate: &[bool],
+    s: usize,
+    t: usize,
+) -> Option<Vec<bool>> {
+    // Two candidate pairs of one part on one pin: the only place rule 4b
+    // can bite.
+    let mut ends: HashMap<(usize, usize), usize> = HashMap::new();
+    for (i, p) in pairs.iter().enumerate() {
+        if let (true, Some(p)) = (candidate[i], p) {
+            for pin in p.pins {
+                *ends.entry((p.comp, pin)).or_default() += 1;
+            }
+        }
+    }
+    if ends.values().all(|&n| n < 2) {
+        return Some(candidate.to_vec());
+    }
+
+    // node -> (other node, edge, which end of the edge this node is)
+    let mut adj: HashMap<usize, Vec<(usize, usize, usize)>> = HashMap::new();
+    for (i, &(a, b)) in edges.iter().enumerate() {
+        if candidate[i] && a != b {
+            adj.entry(a).or_default().push((b, i, 0));
+            adj.entry(b).or_default().push((a, i, 1));
+        }
+    }
+    let wanted = candidate.iter().filter(|&&c| c).count();
+    let mut on = vec![false; edges.len()];
+    let mut found = 0;
+    let mut steps = 0;
+    let mut visited: HashSet<usize> = HashSet::from([s]);
+    let mut path: Vec<usize> = Vec::new();
+    // (node, the pair the route came out of: part, pin, chain; next adjacency index)
+    type Frame = (usize, Option<(usize, usize, bool)>, usize);
+    let mut stack: Vec<Frame> = vec![(s, None, 0)];
+    while let Some(&(u, came, i)) = stack.last() {
+        if found == wanted {
+            break;
+        }
+        let next = adj.get(&u).and_then(|a| a.get(i)).copied();
+        let Some((v, e, end)) = next else {
+            stack.pop();
+            visited.remove(&u);
+            path.pop();
+            continue;
+        };
+        stack.last_mut().expect("non-empty").2 += 1;
+        steps += 1;
+        if steps > ROUTE_SEARCH_BUDGET {
+            return None;
+        }
+        if visited.contains(&v) {
+            continue;
+        }
+        let pair = pairs[e];
+        if let (Some(p), Some((comp, pin, false))) = (pair, came) {
+            if p.comp == comp && p.pins[end] == pin {
+                continue;
+            }
+        }
+        if v == t {
+            for &pe in path.iter().chain([&e]) {
+                if !on[pe] {
+                    on[pe] = true;
+                    found += 1;
+                }
+            }
+            continue;
+        }
+        visited.insert(v);
+        path.push(e);
+        stack.push((v, pair.map(|p| (p.comp, p.pins[1 - end], p.chain)), 0));
+    }
+    Some(on)
+}
+
 /// What the `path_between` topology does with one series part (issue #39).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PathRole {
@@ -3606,19 +3917,24 @@ enum PathRole {
 /// the nets the BFS expanded; `rails` the rails it stopped at. `s` and `t`
 /// are the `from` and `to` nets; `t` can be a rail (a rail-only path).
 ///
-/// A route part lies on a simple path from `s` to `t` through walked nets.
+/// A route part lies on a simple path from `s` to `t` through walked nets
+/// that obeys rule 4b at the through pairs (`pairs`, one per part, `None`
+/// for a plain part; see `route_obeying_chain`).
 /// The route nets are `s`, `t` and every net of a route part; they are
-/// returned with the roles. A shunt part
+/// returned with the roles, and a flag set when `route_obeying_chain` ran
+/// out of steps on either test (the block result was kept). A shunt part
 /// lies on a simple path from any route net to any rail through walked nets
 /// off the route: the route nets are merged into one node and the rails into
 /// another, and the same test runs between the two.
 fn path_subgraph(
     parts: &[Option<(usize, usize)>],
+    pairs: &[Option<PairEdge>],
     walked: &HashSet<usize>,
     rails: &HashSet<usize>,
     s: usize,
     t: usize,
-) -> (Vec<PathRole>, HashSet<usize>) {
+) -> (Vec<PathRole>, HashSet<usize>, bool) {
+    debug_assert_eq!(parts.len(), pairs.len());
     // Edges a test leaves out become self-loops, which are never on a path.
     const SELF: (usize, usize) = (usize::MAX, usize::MAX);
     let on_route_graph = |n: usize| n == t || walked.contains(&n);
@@ -3629,7 +3945,10 @@ fn path_subgraph(
             _ => SELF,
         })
         .collect();
-    let route = edges_on_st_paths(&route_edges, s, t);
+    let blocks = edges_on_st_paths(&route_edges, s, t);
+    let route_checked = route_obeying_chain(&route_edges, pairs, &blocks, s, t);
+    let mut capped = route_checked.is_none();
+    let route = route_checked.unwrap_or(blocks);
 
     let mut route_nets: HashSet<usize> = HashSet::from([s, t]);
     for (i, p) in parts.iter().enumerate() {
@@ -3660,7 +3979,10 @@ fn path_subgraph(
             _ => SELF,
         })
         .collect();
-    let shunt = edges_on_st_paths(&shunt_edges, ROUTE, RAIL);
+    let shunt_blocks = edges_on_st_paths(&shunt_edges, ROUTE, RAIL);
+    let shunt_checked = route_obeying_chain(&shunt_edges, pairs, &shunt_blocks, ROUTE, RAIL);
+    capped |= shunt_checked.is_none();
+    let shunt = shunt_checked.unwrap_or(shunt_blocks);
 
     let roles = (0..parts.len())
         .map(|i| {
@@ -3673,7 +3995,7 @@ fn path_subgraph(
             }
         })
         .collect();
-    (roles, route_nets)
+    (roles, route_nets, capped)
 }
 
 /// The `walk` topology graph (`include_topology`): nets are nodes, parts are
@@ -3687,17 +4009,19 @@ struct Topology {
     /// every part the walk reached is listed. Parts past the depth limit or a
     /// rail were never reached and are not counted.
     truncated: bool,
-    /// Parts the walk reached but the cap left out.
+    /// Distinct parts the walk reached that the cap left out entirely. A
+    /// part with a cut pair box but another entry drawn is not counted.
     omitted_parts: usize,
+    /// path_between only: the rule 4b search (`route_obeying_chain`) for the
+    /// route or the shunts ran out of steps, so the drawing can show a route
+    /// or a shunt through two pairs of one part that the walk does not take.
+    /// Left out when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    chain_check_capped: bool,
     /// Nets the walk reached that no kept part touches, so they are left out.
     omitted_nets: usize,
     nets: Vec<TopoNet>,
     parts: Vec<TopoPart>,
-    /// Through-model parts the walk crossed (issue #47). The graph does not
-    /// draw them as edges yet: it stops at each one, and nothing past it is
-    /// listed. Left out when empty.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    through_not_drawn: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3706,14 +4030,13 @@ struct TopoNet {
     fanout: usize,
     /// Rail score at or above the rail threshold, whatever `state` is.
     rail: bool,
-    /// "expanded", "past_through", "rail", "large_net", "depth_limit" or
-    /// "dangling". "past_through": walked past, but first reached past a
-    /// through-model part, so its parts are not drawn.
+    /// "expanded", "rail", "large_net", "depth_limit" or "dangling".
     state: &'static str,
-    /// Parts with a pin on this net that `max_topology_parts` cut. Above 0,
+    /// Distinct parts with a pin on this net that `max_topology_parts` cut
+    /// and that no kept part or pair box draws. Above 0,
     /// this node's edges in the graph are incomplete. `max_endpoints` cuts
     /// nothing here (issue #35). Left out when 0. Absent does not mean complete: a node whose `state`
-    /// is not "expanded" or "past_through" was never walked past, so its other members are
+    /// is not "expanded" was never walked past, so its other members are
     /// not listed either way.
     #[serde(skip_serializing_if = "is_zero")]
     omitted_parts: usize,
@@ -3730,12 +4053,34 @@ struct TopoPart {
     class: String,
     dnp: bool,
     /// "start" (the part owning the start pin), "series" (a traversed
-    /// passthrough) or "endpoint" (an endpoint part the walk reached, listed
-    /// in `endpoints` or not).
+    /// passthrough), "through" (one crossed through-model pair, issue #63)
+    /// or "endpoint" (an endpoint part the walk reached, listed in
+    /// `endpoints` or not).
     role: &'static str,
-    /// Series parts and two-pin parts list every pin; other start and
-    /// endpoint parts only the pins on a net in `nets`.
+    /// The crossed pair, for role "through" only. A part with several
+    /// crossed pairs is listed once per pair, as well as on its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pair: Option<TopoPairOut>,
+    /// Series parts and two-pin parts list every pin; a "through" entry its
+    /// pair's two pins, then the gate; other start and endpoint parts only
+    /// the pins on a net in `nets`, less any pin a "through" entry lists.
     pins: Vec<TopoPin>,
+}
+
+/// A "through" topology entry's pair (issue #63).
+#[derive(Debug, Serialize)]
+struct TopoPairOut {
+    /// The pair's declared name (an op-amp channel, a choke winding).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// Pin numbers as declared: first the input side.
+    pins: [String; 2],
+    /// True for a pair with a `gate`: not a plain wire.
+    #[serde(skip_serializing_if = "is_false")]
+    conditional: bool,
+    /// The controlling pin's number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gate: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3815,10 +4160,6 @@ struct WalkEndpoint {
     /// The net the endpoint pin sits on, for `path_topology`. Not serialized.
     #[serde(skip)]
     net_idx: usize,
-    /// False when reached past a through-model part, which the topology
-    /// graph does not draw yet (issue #47). Not serialized.
-    #[serde(skip)]
-    drawn: bool,
 }
 
 /// A branch that fizzled out instead of reaching a real endpoint: reached
@@ -6931,19 +7272,82 @@ mod through_tests {
         assert_eq!(hop["gate"], "Q1:1");
     }
 
-    // The topology stops at a through part and names it; nothing past it is
-    // drawn yet.
+    /// The topology's parts as (refdes, role, pair pins).
+    fn topo_parts(t: &Value) -> Vec<(String, String, Value)> {
+        t["parts"].as_array().unwrap().iter()
+            .map(|p| (
+                p["refdes"].as_str().unwrap().to_string(),
+                p["role"].as_str().unwrap().to_string(),
+                p["pair"]["pins"].clone(),
+            ))
+            .collect()
+    }
+
+    fn entry(refdes: &str, role: &str, pins: Value) -> (String, String, Value) {
+        (refdes.to_string(), role.to_string(), pins)
+    }
+
+    // A path whose `to` pin is on a rail (U3:11 on GND) keeps the `to`
+    // part's own entry even when its other drawn pins are all on pair
+    // boxes, so the marked pin is still drawn.
     #[test]
-    fn topology_stops_at_through_part() {
-        let v = walk(&with_sidecar(), "/BUFIN", true);
+    fn path_to_pin_on_rail_is_drawn() {
+        let design = with_refdes_model("U3", json!([{"pins": ["5", "10"]}]));
+        let v = path_topo(&design, "J4:1", "U3:11");
+        assert_eq!(v["connected"], true, "{v}");
         let t = &v["topology"];
-        assert_eq!(t["through_not_drawn"], json!(["U3"]), "{t}");
-        let parts: Vec<&str> = t["parts"].as_array().unwrap().iter()
-            .map(|p| p["refdes"].as_str().unwrap()).collect();
-        assert!(!parts.contains(&"R60") && !parts.contains(&"TP60"), "{parts:?}");
-        // No through-model: the key is left out.
-        let v = walk(&fixture(), "/BUFIN", true);
-        assert!(v["topology"].get("through_not_drawn").is_none());
+        assert!(topo_parts(t).contains(&entry("U3", "through", json!(["5", "10"]))), "{t}");
+        let own = t["parts"].as_array().unwrap().iter()
+            .find(|p| p["refdes"] == "U3" && p["role"] != "through")
+            .unwrap_or_else(|| panic!("no own U3 entry: {t}"));
+        assert!(own["pins"].as_array().unwrap().iter().any(|p| p["pin"] == "11"), "{own}");
+    }
+
+    // Issue #63: the topology goes on past a through part. Each crossed pair
+    // is its own "through" entry, with only its own pins. U3's entry pins
+    // 5 and 10 are endpoints, but they are on the pair boxes, so U3 has no
+    // endpoint entry: its other pin on a drawn net is on GND, a rail.
+    #[test]
+    fn topology_draws_past_through_part() {
+        let v = path_topo(&with_sidecar(), "J4:1", "TP60:1");
+        let t = &v["topology"];
+        assert_eq!(topo_parts(t), [
+            entry("J4", "start", Value::Null),
+            entry("TP60", "endpoint", Value::Null),
+            entry("U3", "through", json!(["5", "7"])),
+            entry("R60", "series", Value::Null),
+            entry("U3", "through", json!(["10", "8"])),
+            entry("C60", "series", Value::Null),
+        ], "{t}");
+        let b = &t["parts"][2];
+        assert_eq!(b["pair"], json!({"name": "B", "pins": ["5", "7"]}), "{b}");
+        let pins: Vec<&str> = b["pins"].as_array().unwrap().iter().map(|p| p["pin"].as_str().unwrap()).collect();
+        assert_eq!(pins, ["5", "7"], "{b}");
+        assert!(t.get("through_not_drawn").is_none(), "{t}");
+        // walk draws the same chain.
+        let v = walk(&with_sidecar(), "/BUFIN", true);
+        let parts = topo_parts(&v["topology"]);
+        for want in [entry("U3", "through", json!(["5", "7"])), entry("U3", "through", json!(["10", "8"]))] {
+            assert!(parts.contains(&want), "{want:?} in {parts:?}");
+        }
+        assert!(parts.iter().any(|p| p.0 == "TP60"), "{parts:?}");
+    }
+
+    fn path_topo(design: &super::Design, from: &str, to: &str) -> Value {
+        serde_json::from_str(&design.path_between(from, to, true, 50, super::DEFAULT_MAX_NET_EXPANSIONS).unwrap()).unwrap()
+    }
+
+    // A gate-controlled pair is drawn conditional, its gate pin listed last
+    // and off the drawing when the walk did not reach its net.
+    #[test]
+    fn topology_pair_with_a_gate_is_conditional() {
+        let v = walk(&with_sidecar(), "EN", true);
+        let q1 = v["topology"]["parts"].as_array().unwrap().iter()
+            .find(|p| p["refdes"] == "Q1")
+            .unwrap_or_else(|| panic!("Q1: {v}"));
+        assert_eq!(q1["role"], "through", "{q1}");
+        assert_eq!(q1["pair"], json!({"pins": ["3", "2"], "conditional": true, "gate": "1"}), "{q1}");
+        assert_eq!(q1["pins"][2], json!({"pin": "1", "name": "G", "net": "GATE", "off_drawing": "outside"}), "{q1}");
     }
 
     // A pair naming a pin the part does not have is skipped, and
@@ -6995,8 +7399,8 @@ mod through_tests {
         assert_eq!(path(&design, "U4:7", "J5:1")["connected"], true);
     }
 
-    // A net first reached past a through part and then by a drawn series
-    // part is still in the topology's nets: U3.D reaches +VSENS before R30
+    // A net first reached past a through part and then by a plain series
+    // part is in the topology's nets: U3.D reaches +VSENS before R30
     // does. This tripped the `build_topology` debug_assert.
     #[test]
     fn net_reached_past_through_part_is_still_noted() {
@@ -7012,15 +7416,16 @@ mod through_tests {
         assert!(v["dead_ends"].as_array().unwrap().is_empty(), "{v}");
     }
 
-    // path_between with topology across a through part: the `to` net is
-    // past the part, so it is not drawn. This tripped the same assert.
+    // path_between with topology across a through part, which once tripped
+    // the same assert: the choke winding is drawn, and the `to` net past it.
     #[test]
     fn path_topology_across_through_part() {
-        let design = with_sidecar();
-        let v: Value =
-            serde_json::from_str(&design.path_between("U4:7", "J5:1", true, 50, super::DEFAULT_MAX_NET_EXPANSIONS).unwrap()).unwrap();
+        let v = path_topo(&with_sidecar(), "U4:7", "J5:1");
         assert_eq!(v["connected"], true, "{v}");
-        assert_eq!(v["topology"]["through_not_drawn"], json!(["L2"]), "{v}");
+        let t = &v["topology"];
+        assert!(topo_parts(t).contains(&entry("L2", "through", json!(["1", "2"]))), "{t}");
+        let nets: Vec<&str> = t["nets"].as_array().unwrap().iter().map(|n| n["name"].as_str().unwrap()).collect();
+        assert!(nets.contains(&"/CANH_J"), "{nets:?}");
     }
 
     fn with_refdes_model(refdes: &str, through: Value) -> super::Design {
@@ -7093,7 +7498,7 @@ mod through_tests {
         let c = data.crossed.iter().find(|c| c.pin == "X1:1").expect("X1:1 crossed");
         assert_eq!(c.distance, 1);
         assert_eq!(c.via[0].pins, Some(["X1:4".to_string(), "X1:1".to_string()]));
-        // C30 reaches X1:1 at the same depth, and a drawn route is reported
+        // C30 reaches X1:1 at the same depth, and a plain route is reported
         // first (rule 6).
         let v = path(&design, "X1:2", "X1:1");
         assert_eq!(v["connected"], true, "{v}");
@@ -7112,6 +7517,12 @@ mod through_tests {
         assert_eq!(pins, [&json!(["U3:5", "U3:13"]), &json!(["U3:13", "U3:8"])], "{v}");
         // The chained hop counts: distance is the via length.
         assert_eq!(v["distance"], 2, "{v}");
+        // The path drawing goes through the dangling /SENSREF (issue #63).
+        let t = &path_topo(&design, "J4:1", "U3:8")["topology"];
+        let parts = topo_parts(t);
+        for want in [entry("U3", "through", json!(["5", "13"])), entry("U3", "through", json!(["13", "8"]))] {
+            assert!(parts.contains(&want), "{want:?} in {parts:?}");
+        }
         // The lone pin led on, so it is no dead end.
         let w = walk(&design, "/BUFIN", false);
         let dead = w["dead_ends"].as_array().unwrap().iter().any(|d| d["net"] == "/SENSREF");
@@ -7133,13 +7544,49 @@ mod through_tests {
         }
     }
 
-    // A walk from a through part's pin draws the part as the start, and
-    // lists it in through_not_drawn too: what lies past its pairs (TP60
-    // here) is not drawn.
+    // A mux on U3 with COM 10 (/BUFRC) and no chain. J4:1 -> U3:7
+    // (/BUFMID) goes 5->10, then R60. 5->10->7 is no route (rule 4b), so
+    // pair 10-7 is not drawn, though it joins two route nets.
     #[test]
-    fn start_part_in_through_not_drawn() {
+    fn path_drawing_skips_unchained_mux_route() {
+        let design = with_refdes_model("U3", json!([{"pins": ["10", "5"]}, {"pins": ["10", "7"]}]));
+        let v = path_topo(&design, "J4:1", "U3:7");
+        assert_eq!(v["connected"], true, "{v}");
+        let parts = topo_parts(&v["topology"]);
+        assert!(parts.contains(&entry("U3", "through", json!(["10", "5"]))), "{parts:?}");
+        assert!(!parts.contains(&entry("U3", "through", json!(["10", "7"]))), "{parts:?}");
+    }
+
+    // A walk from a through part's pin draws the start part's crossed pairs
+    // and what lies past them (TP60). Every start-part pin on a drawn net
+    // that is not a rail is on a pair box, so there is no start entry.
+    #[test]
+    fn start_part_pairs_are_drawn() {
         let v = walk(&with_sidecar(), "U3:5", true);
-        assert_eq!(v["topology"]["through_not_drawn"], json!(["U3"]), "{}", v["topology"]);
+        let parts = topo_parts(&v["topology"]);
+        assert!(parts.contains(&entry("U3", "through", json!(["5", "7"]))), "{parts:?}");
+        assert!(parts.contains(&entry("U3", "through", json!(["10", "8"]))), "{parts:?}");
+        assert!(parts.iter().any(|p| p.0 == "TP60"), "{parts:?}");
+        assert!(!parts.iter().any(|p| p.1 == "start"), "{parts:?}");
+    }
+
+    // The dropped start entry takes no `max_topology_parts` slot: its slot
+    // goes to the box with the start pin, and three parts fill the cap. The
+    // cap cuts pair C, so U3:10 lost its box while /BUFRC is drawn: the
+    // start entry comes back, past the cap, with pin 10 alone (PR #69 round
+    // 2). U3 is drawn, so `omitted_parts` does not count it.
+    #[test]
+    fn dropped_start_entry_takes_no_slot() {
+        let raw = with_sidecar().walk("U3:5", 6, 50, true, true, 3, super::DEFAULT_MAX_NET_EXPANSIONS).expect("walk");
+        let t = &serde_json::from_str::<Value>(&raw).unwrap()["topology"];
+        let parts = topo_parts(t);
+        assert_eq!(parts.len(), 4, "{parts:?}");
+        assert_eq!(parts[0], entry("U3", "through", json!(["5", "7"])), "{parts:?}");
+        assert_eq!((parts[3].0.as_str(), parts[3].1.as_str()), ("U3", "start"), "{parts:?}");
+        assert_eq!(t["parts"][3]["pins"].as_array().map(|p| p.len()), Some(1), "{t}");
+        assert_eq!(t["parts"][3]["pins"][0]["pin"], "10", "{t}");
+        assert_eq!(t["truncated"], true, "{t}");
+        assert_eq!(t["omitted_parts"], 2, "{t}");
     }
 
     // A mux on U3: COM 10, NO1 5, NO2 8, no chain. From /BUFIN, pair 5->10
@@ -7619,6 +8066,61 @@ mod walk_topology_tests {
         assert_eq!(edges_on_st_paths(&[(0, 1), (1, 0)], 0, 0), [false, false]);
     }
 
+    /// Rule 4b in the path drawing (PR #69 review): a mux U7 with COM pin 20
+    /// on net 2 and pairs to net 0 (s) and net 1 (t). R joins 0 and 1.
+    /// NO1->COM->NO2 is a route only when the pair it comes out of, the
+    /// one from s, sets `chain`.
+    #[test]
+    fn path_subgraph_obeys_chain() {
+        use PathRole::*;
+        let walked: HashSet<usize> = [0, 1, 2].into();
+        let parts = [Some((0, 1)), Some((0, 2)), Some((2, 1))];
+        let mux = |x_chain: bool, y_chain: bool| {
+            [
+                None,
+                Some(PairEdge { comp: 7, pins: [21, 20], chain: x_chain }),
+                Some(PairEdge { comp: 7, pins: [20, 22], chain: y_chain }),
+            ]
+        };
+        let roles = |x, y| path_subgraph(&parts, &mux(x, y), &walked, &HashSet::new(), 0, 1).0;
+        assert_eq!(roles(false, false), [Route, Off, Off]);
+        assert_eq!(roles(true, false), [Route, Route, Route]);
+        // Only the pair out of which the route comes counts.
+        assert_eq!(roles(false, true), [Route, Off, Off]);
+        // Different pins of one part never block each other.
+        let apart = [
+            None,
+            Some(PairEdge { comp: 7, pins: [21, 20], chain: false }),
+            Some(PairEdge { comp: 7, pins: [23, 22], chain: false }),
+        ];
+        let r = path_subgraph(&parts, &apart, &walked, &HashSet::new(), 0, 1).0;
+        assert_eq!(r, [Route, Route, Route]);
+    }
+
+    /// Rule 4b in the shunt test too (PR #69 round 2): R is the route from
+    /// net 0 to net 1. Mux U7 has a pair from net 1 onto COM pin 20 (net 2)
+    /// and a pair from COM to rail 100. They form a shunt only when the pair
+    /// out of the route net sets `chain`.
+    #[test]
+    fn path_subgraph_shunt_obeys_chain() {
+        use PathRole::*;
+        let walked: HashSet<usize> = [0, 1, 2].into();
+        let rails: HashSet<usize> = [100].into();
+        let parts = [Some((0, 1)), Some((1, 2)), Some((2, 100))];
+        let mux = |x_chain: bool| {
+            [
+                None,
+                Some(PairEdge { comp: 7, pins: [21, 20], chain: x_chain }),
+                Some(PairEdge { comp: 7, pins: [20, 22], chain: false }),
+            ]
+        };
+        let (roles, _, capped) = path_subgraph(&parts, &mux(false), &walked, &rails, 0, 1);
+        assert_eq!(roles, [Route, Off, Off]);
+        assert!(!capped);
+        let (roles, _, _) = path_subgraph(&parts, &mux(true), &walked, &rails, 0, 1);
+        assert_eq!(roles, [Route, Shunt, Shunt]);
+    }
+
     /// Issue #39: route parts, shunts down to a rail, and everything else
     /// left out.
     #[test]
@@ -7639,17 +8141,17 @@ mod walk_topology_tests {
             None,             // a pin with no net
             Some((100, 101)), // between two rails
         ];
-        let (roles, route_nets) = path_subgraph(&parts, &walked, &rails, 0, 1);
+        let (roles, route_nets, _) = path_subgraph(&parts, &[None; 9], &walked, &rails, 0, 1);
         assert_eq!(roles, [Route, Route, Shunt, Shunt, Shunt, Off, Off, Off, Off]);
         assert_eq!(route_nets, [0, 1].into());
 
         // A rail-only path: t is GND. A part into GND is a route part, and
         // a part to the other rail is a shunt.
-        let (roles, _) = path_subgraph(&[Some((0, 100)), Some((0, 101))], &walked, &rails, 0, 100);
+        let (roles, _, _) = path_subgraph(&[Some((0, 100)), Some((0, 101))], &[None; 2], &walked, &rails, 0, 100);
         assert_eq!(roles, [Route, Shunt]);
 
         // s == t (same net): no route parts, shunts still found.
-        let (roles, route_nets) = path_subgraph(&[Some((0, 100)), Some((0, 3))], &walked, &rails, 0, 0);
+        let (roles, route_nets, _) = path_subgraph(&[Some((0, 100)), Some((0, 3))], &[None; 2], &walked, &rails, 0, 0);
         assert_eq!(roles, [Shunt, Off]);
         assert_eq!(route_nets, [0].into());
     }
@@ -8274,9 +8776,9 @@ mod walk_oracle_tests {
     }
 
     // A start-part pin reached at equal depth through the part's own pair
-    // and through a resistor: the drawn route (R1) is reported (rule 6).
+    // and through a resistor: the plain route (R1) is reported (rule 6).
     #[test]
-    fn path_between_prefers_drawn_route_at_equal_depth() {
+    fn path_between_prefers_plain_route_at_equal_depth() {
         let mut d = design_of(&[("U1", &[1, 2, 1]), ("R1", &[1, 2])], &["/A", "/B"]);
         let file = crate::sidecar::SidecarFile::parse(
             &serde_json::json!({"refdes": {"U1": {"through": [{"pins": ["3", "2"]}]}}}).to_string(),
@@ -8290,6 +8792,219 @@ mod walk_oracle_tests {
         assert_eq!(v["connected"], true, "{v}");
         assert_eq!(v["distance"], 1, "{v}");
         assert_eq!(v["via"][0]["refdes"], "R1", "{v}");
+    }
+
+    /// The pairs in a `via` list, as (refdes, its two pin numbers sorted).
+    fn via_pairs(via: &serde_json::Value, out: &mut BTreeSet<(String, Vec<String>)>) {
+        for hop in via.as_array().into_iter().flatten() {
+            let Some(pins) = hop["pins"].as_array() else { continue };
+            let mut p: Vec<String> = pins
+                .iter()
+                .map(|x| x.as_str().unwrap().rsplit(':').next().unwrap().to_string())
+                .collect();
+            p.sort();
+            out.insert((hop["refdes"].as_str().unwrap().to_string(), p));
+        }
+    }
+
+    /// Issue #63: every pair in `want` is drawn as a "through" entry, each
+    /// once; a pin on a pair box is not on its part's own entry, and that
+    /// entry is listed once (pairs that share a pin, a mux COM, each list
+    /// it); a listed pin's net is a node unless the pin says it is off the
+    /// drawing.
+    fn check_topology(
+        t: &serde_json::Value,
+        want: &BTreeSet<(String, Vec<String>)>,
+        marked: &[&str],
+    ) -> Result<(), String> {
+        let nets: BTreeSet<&str> = t["nets"].as_array().unwrap().iter().map(|n| n["name"].as_str().unwrap()).collect();
+        let pin_numbers = |p: &serde_json::Value| -> Vec<String> {
+            p["pins"].as_array().unwrap().iter().map(|x| x["pin"].as_str().unwrap().to_string()).collect()
+        };
+        let mut drawn = BTreeSet::new();
+        let mut own_entries = BTreeSet::new();
+        let mut on_pairs = BTreeSet::new();
+        let mut listed = BTreeSet::new();
+        for p in t["parts"].as_array().unwrap() {
+            let refdes = p["refdes"].as_str().unwrap().to_string();
+            listed.extend(pin_numbers(p).into_iter().map(|n| format!("{refdes}:{n}")));
+            if p["role"] == "through" {
+                let mut pins: Vec<String> =
+                    p["pair"]["pins"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
+                pins.sort();
+                if !drawn.insert((refdes.clone(), pins.clone())) {
+                    return Err(format!("pair {refdes} {pins:?} drawn twice"));
+                }
+                on_pairs.extend(pin_numbers(p).into_iter().map(|n| (refdes.clone(), n)));
+            } else if !own_entries.insert(refdes.clone()) {
+                return Err(format!("{refdes} listed twice"));
+            }
+        }
+        for p in t["parts"].as_array().unwrap() {
+            let refdes = p["refdes"].as_str().unwrap().to_string();
+            for pin in p["pins"].as_array().unwrap() {
+                let number = pin["pin"].as_str().unwrap().to_string();
+                if p["role"] != "through" && on_pairs.contains(&(refdes.clone(), number.clone())) {
+                    return Err(format!("{refdes}:{number} on a pair box and on {refdes}'s own entry"));
+                }
+                if let (true, Some(net)) = (pin["off_drawing"].is_null(), pin["net"].as_str()) {
+                    if !nets.contains(net) {
+                        return Err(format!("{refdes}:{number} on {net}, which is no node"));
+                    }
+                }
+            }
+        }
+        if let Some(m) = marked.iter().find(|m| !listed.contains(**m)) {
+            return Err(format!("marked pin {m} is on no part"));
+        }
+        let missing: Vec<_> = want.difference(&drawn).collect();
+        if missing.is_empty() { Ok(()) } else { Err(format!("pairs not drawn: {missing:?}")) }
+    }
+
+    /// A topology entry's identity: refdes, role and pair pins.
+    fn entry_key(p: &serde_json::Value) -> (String, String, String) {
+        (p["refdes"].to_string(), p["role"].to_string(), p["pair"]["pins"].to_string())
+    }
+
+    /// PR #69 round 3: when the capped drawing has fewer than `cap` parts, a
+    /// slot is free, so the cap cut nothing: each of `full`'s entries is in
+    /// `capped`, part entries too (round 4: a skipped part entry that a later
+    /// pass gave a pin comes back). Restored entries can fill the count; then
+    /// `check_skipped_restored` runs instead.
+    fn check_free_slot(full: &serde_json::Value, capped: &serde_json::Value, cap: usize) -> Result<(), String> {
+        check_kept_order(full, capped)?;
+        let wired =
+            |t: &serde_json::Value| -> BTreeSet<_> { t["parts"].as_array().unwrap().iter().map(entry_key).collect() };
+        if capped["parts"].as_array().unwrap().len() >= cap {
+            return check_skipped_restored(full, capped);
+        }
+        let missing: Vec<_> = wired(full).difference(&wired(capped)).cloned().collect();
+        if missing.is_empty() { Ok(()) } else { Err(format!("free slot, but cut: {missing:?}")) }
+    }
+
+    /// PR #69 round 6: the cap keeps `full`'s order, restored skipped
+    /// entries included. A restored dropped entry is never in `full` (the
+    /// drop does not depend on the cap, and nothing is cut there), so the
+    /// entries of `capped` that are in `full` come in `full`'s order.
+    fn check_kept_order(full: &serde_json::Value, capped: &serde_json::Value) -> Result<(), String> {
+        let fparts = full["parts"].as_array().unwrap();
+        let at: Vec<usize> = capped["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| fparts.iter().position(|f| entry_key(f) == entry_key(p)))
+            .collect();
+        if at.windows(2).all(|w| w[0] < w[1]) { Ok(()) } else { Err(format!("order changed: {at:?}")) }
+    }
+
+    /// PR #69 round 4: series parts and pair boxes are never restored, so
+    /// each one in `capped` took a slot, and every entry ahead of it in the
+    /// order (`full`'s list) was kept or skipped. A skipped part entry with a
+    /// pin to draw in `capped` comes back, so a part entry ahead of the last
+    /// kept series part or box, with a pin on a drawn net (rails too, as in
+    /// the cap loop) and not on one of its own boxes, is in `capped`.
+    fn check_skipped_restored(full: &serde_json::Value, capped: &serde_json::Value) -> Result<(), String> {
+        let fparts = full["parts"].as_array().unwrap();
+        let cparts = capped["parts"].as_array().unwrap();
+        let ckeys: BTreeSet<_> = cparts.iter().map(entry_key).collect();
+        let Some(last) = cparts
+            .iter()
+            .filter(|p| p["role"] == "series" || p["role"] == "through")
+            .filter_map(|p| fparts.iter().position(|f| entry_key(f) == entry_key(p)))
+            .max()
+        else {
+            return Ok(());
+        };
+        let nets: BTreeSet<&str> = capped["nets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["name"].as_str().unwrap())
+            .collect();
+        let boxed: BTreeSet<(String, String)> = cparts
+            .iter()
+            .filter(|p| p["role"] == "through")
+            .flat_map(|p| {
+                p["pins"].as_array().unwrap().iter().map(|x| (p["refdes"].to_string(), x["pin"].to_string()))
+            })
+            .collect();
+        for f in &fparts[..last] {
+            if f["role"] == "series" || f["role"] == "through" || ckeys.contains(&entry_key(f)) {
+                continue;
+            }
+            let drawable = f["pins"].as_array().unwrap().iter().any(|x| {
+                x["net"].as_str().is_some_and(|n| nets.contains(n))
+                    && !boxed.contains(&(f["refdes"].to_string(), x["pin"].to_string()))
+            });
+            if drawable {
+                return Err(format!("{} {} ahead of a kept slot and drawable, but cut", f["refdes"], f["role"]));
+            }
+        }
+        Ok(())
+    }
+
+    // Issue #63: the drawing goes on past through parts. Every pair in a
+    // reported via is drawn, by `walk` and by `path_between`, and the graph
+    // is consistent (the debug_asserts in `build_topology` run too).
+    #[test]
+    fn topology_draws_every_crossed_pair_on_random_designs() {
+        let mut failures = Vec::new();
+        for seed in 1..=400u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let d = random_design(&mut rng);
+            let max_depth = 2 + rng.below(4) as u32;
+            let pins: Vec<String> = d.pins.iter().map(|p| d.pin_name(&p.id)).collect();
+            for start in &pins {
+                let v: serde_json::Value =
+                    serde_json::from_str(&d.walk(start, max_depth, 100_000, true, true, 100_000, 8).unwrap()).unwrap();
+                let mut want = BTreeSet::new();
+                for list in ["endpoints", "rails_reached", "large_nets", "dead_ends"] {
+                    for e in v[list].as_array().unwrap() {
+                        via_pairs(&e["via"], &mut want);
+                    }
+                }
+                if let Err(e) = check_topology(&v["topology"], &want, &[start]) {
+                    failures.push(format!("seed {seed} walk {start}: {e}\n{}", describe(&d)));
+                }
+                // Every slot draws a pin (PR #69 round 3): only part entries
+                // left with no pin are skipped, so a drawing with a free slot
+                // kept every entry of the uncapped one; a full one kept every
+                // skipped entry that has a pin to draw (round 4).
+                let cap = 1 + rng.below(4) as u32;
+                let c: serde_json::Value =
+                    serde_json::from_str(&d.walk(start, max_depth, 100_000, true, true, cap, 8).unwrap()).unwrap();
+                if let Err(e) = check_topology(&c["topology"], &BTreeSet::new(), &[start])
+                    .and_then(|()| check_free_slot(&v["topology"], &c["topology"], cap as usize))
+                {
+                    failures.push(format!("seed {seed} walk {start} cap {cap}: {e}\n{}", describe(&d)));
+                }
+                for to in &pins {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&d.path_between(start, to, true, 100_000, 8).unwrap()).unwrap();
+                    if v["connected"] != true {
+                        continue;
+                    }
+                    let mut want = BTreeSet::new();
+                    via_pairs(&v["via"], &mut want);
+                    if let Err(e) = check_topology(&v["topology"], &want, &[start, to]) {
+                        failures.push(format!("seed {seed} path {start} -> {to}: {e}\n{}", describe(&d)));
+                    }
+                    // At the minimum cap of 2 both marked pins are still
+                    // drawn (PR #69 round 2: marked pins go first).
+                    let capped: serde_json::Value =
+                        serde_json::from_str(&d.path_between(start, to, true, 2, 8).unwrap()).unwrap();
+                    if let Err(e) = check_topology(&capped["topology"], &BTreeSet::new(), &[start, to])
+                        .and_then(|()| check_free_slot(&v["topology"], &capped["topology"], 2))
+                    {
+                        failures.push(format!("seed {seed} path {start} -> {to} cap 2: {e}\n{}", describe(&d)));
+                    }
+                }
+            }
+            if failures.len() >= 3 {
+                break;
+            }
+        }
+        assert!(failures.is_empty(), "{} failures, first:\n{}", failures.len(), failures.join("\n\n"));
     }
 
     #[test]

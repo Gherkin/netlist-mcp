@@ -112,7 +112,9 @@
 <div class="notes" id="notes"></div>
 <div id="message">Waiting for the walk result…</div>
 <div id="canvas" class="fit"></div>
-<footer id="footer" hidden>Dashed part = DNP (not fitted). Lines that cross without a dot are not connected.</footer>
+<footer id="footer" hidden>Dashed part = DNP (not fitted). Lines that cross without a dot are not connected.
+  A small box is one through pair of a part (an op-amp channel, a choke winding): ▷ points from its input pin to its output pin,
+  a switch means the pair conducts only while its gate turns it on.</footer>
 <script>
 "use strict";
 
@@ -229,13 +231,18 @@ function onToolInput(params) {
   else if (a.from && a.to) showMessage("Tracing from " + a.from + " to " + a.to + "…");
 }
 
-// The net a "REFDES:PIN" handle sits on, read from the topology's parts.
+// The net a "REFDES:PIN" handle sits on, read from the topology's parts. A
+// part can be listed more than once: once per crossed through pair, and on
+// its own.
 function netOfPin(topo, handle) {
   const [ref, ...rest] = String(handle || "").split(":");
   const pin = rest.join(":");
-  const part = (topo.parts || []).find((p) => p.refdes === ref);
-  const p = part && part.pins.find((x) => x.pin === pin);
-  return p ? p.net : null;
+  for (const part of topo.parts || []) {
+    if (part.refdes !== ref) continue;
+    const p = part.pins.find((x) => x.pin === pin);
+    if (p) return p.net;
+  }
+  return null;
 }
 
 // A path_between result has `from`/`to` where a walk has `start`/`start_net`.
@@ -302,6 +309,10 @@ function showMessage(text) {
 //   - A two-terminal part with one bus pin hangs down from that bus in the
 //     gap to its right ("shunt"); its other end is a rail symbol, a no-connect,
 //     or an open lead for a pin that is not on a walked net.
+//   - A crossed through-model pair (role "through") is a small box on one
+//     row, like a series part: between its two buses, or right of its one
+//     bus with the other end a rail symbol or an open lead. Its gate, if
+//     any, hangs below the box.
 //   - Every other part is a box with its pins on the side facing its buses.
 //     Boxes on the first bus only sit left of it; the rest sit right of their
 //     right-most bus.
@@ -310,6 +321,8 @@ function showMessage(text) {
 // without a dot are not connected to it, as on a schematic.
 // ---------------------------------------------------------------------------
 const COLW = 210, ROW = 34, TOP = 74, BOXW = 112, PAD = 16;
+// A through pair's box.
+const THRW = 56, THRH = 22;
 const TWO_TERMINAL = new Set(["R", "C", "L", "FB", "D"]);
 
 function layout(data) {
@@ -355,6 +368,28 @@ function layout(data) {
   const items = [];
   const shuntsByGap = new Map();
   parts.forEach((part, idx) => {
+    if (part.role === "through" && part.pair) {
+      const byNum = (n) => part.pins.find((p) => p.pin === n);
+      const a = endOf(byNum(part.pair.pins[0]));
+      let b = endOf(byNum(part.pair.pins[1]));
+      if (a.kind === "bus" && b.kind === "bus" && a.col === b.col) b = { kind: "open", pin: b.pin, same: true };
+      // Bus ends left to right; with one bus end, that end on the left.
+      let [l, r] = [a, b];
+      if (b.kind === "bus" && (a.kind !== "bus" || b.col < a.col)) [l, r] = [b, a];
+      const gate = part.pair.gate != null ? endOf(byNum(part.pair.gate)) : null;
+      const from = l.kind === "bus" ? l.col : 0;
+      const gap = r.kind === "bus" ? r.col - 1 : from;
+      // A rail name or open-lead label right of the box runs into the next gap.
+      const labelRight = r.kind === "open" || (r.kind === "rail" && railHasLabel(r.net));
+      // Two rows: the box is taller than a series symbol, and the next
+      // row's label sits above its wire.
+      items.push({
+        type: "through", part, idx, left: l, right: r, gate, from, gap,
+        to: labelRight ? Math.min(gap + 1, Math.max(order.length - 1, 0)) : undefined,
+        h: gate ? 3 : 2,
+      });
+      return;
+    }
     const ends = part.pins.map(endOf);
     if (TWO_TERMINAL.has(part.class) && ends.length >= 1 && ends.length <= 2) {
       let a = ends[0], b = ends[1] || { kind: "open", pin: null };
@@ -560,7 +595,12 @@ function partLabel(part) {
   return part.refdes + (part.dnp ? " DNP" : "");
 }
 function partTitle(part) {
+  const pair = part.pair;
+  const pairLine = pair ? "through pair" + (pair.name ? " " + pair.name : "") + ": pin " + pair.pins[0] +
+    " (input) to pin " + pair.pins[1] + (pair.gate != null ? ", only while gate pin " + pair.gate + " turns it on" : "") +
+    "\n" : "";
   return part.refdes + " " + part.value + " (" + part.class + ", " + part.role + (part.dnp ? ", DNP" : "") + ")\n" +
+    pairLine +
     part.pins.map((p) => "pin " + p.pin + (p.name && p.name !== "~" ? " " + p.name : "") + ": " + (p.net == null ? "unconnected" : p.net)).join("\n");
 }
 
@@ -586,8 +626,17 @@ function render(data) {
     if (pin && marked.has(part.refdes + ":" + pin.pin)) el("circle", { class: "dot startpin", cx: x, cy: y, r: 3 }, dots);
   };
 
+  // A pair box is highlighted only when it holds a marked pin, so the
+  // start channel of a multi-channel part stands out from its others. A
+  // part's own box is highlighted when it lists a marked pin, or when the
+  // part is marked and none of its pair boxes holds the mark.
+  const holdsMark = (part) => part.pins.some((p) => marked.has(part.refdes + ":" + p.pin));
+  const boxedMarkRefs = new Set((data.topology.parts || []).filter((p) => p.pair && holdsMark(p)).map((p) => p.refdes));
+  const isMarked = (part) => part.pair
+    ? holdsMark(part)
+    : holdsMark(part) || ((markedRefs.has(part.refdes) || part.role === "start") && !boxedMarkRefs.has(part.refdes));
   const partGroup = (part) => {
-    const cls = [part.dnp ? "dnp" : "", markedRefs.has(part.refdes) || part.role === "start" ? "start" : ""].join(" ").trim();
+    const cls = [part.dnp ? "dnp" : "", isMarked(part) ? "start" : ""].join(" ").trim();
     const g = el("g", { class: cls || undefined }, body);
     title(g, partTitle(part));
     return g;
@@ -643,6 +692,67 @@ function render(data) {
         text(g, x + 14, y0 + 39, clip(sh.part.value, 9), "val");
         maxX = Math.max(maxX, x + 70);
       });
+    } else if (it.type === "through") {
+      const part = it.part, pair = part.pair;
+      const g = partGroup(part);
+      const l = it.left, r = it.right;
+      // Far enough from the right bus that the value label stays clear of it.
+      const bx = r.kind === "bus" ? busX(r.col) - 64 - THRW
+        : l.kind === "bus" ? busX(l.col) + 40 : busX(it.from) + 56;
+      const xr = bx + THRW, top = y0 - THRH / 2;
+      if (l.kind === "bus") {
+        line(g, busX(l.col), y0, bx, y0);
+        addAttach(l.col, y0);
+      } else {
+        line(g, bx - 16, y0, bx, y0);
+        terminal(g, bx - 16, y0, l, "left", lead);
+      }
+      if (r.kind === "bus") {
+        line(g, xr, y0, busX(r.col), y0);
+        addAttach(r.col, y0);
+      } else {
+        line(g, xr, y0, xr + 16, y0);
+        terminal(g, xr + 16, y0, r, "right", lead);
+      }
+      el("rect", { class: "box", x: bx, y: top, width: THRW, height: THRH, rx: 3 }, g);
+      // Inside: a triangle from the input pin toward the output pin, or an
+      // open switch for a gate-controlled pair.
+      const inLeft = l.pin && l.pin.pin === pair.pins[0];
+      const cx = bx + THRW / 2;
+      if (pair.conditional) {
+        el("circle", { class: "sym", cx: cx - 12, cy: y0 + 3, r: 2 }, g);
+        el("circle", { class: "sym", cx: cx + 12, cy: y0 + 3, r: 2 }, g);
+        line(g, cx - 10, y0 + 2, cx + 10, y0 - 6, "sym");
+      } else {
+        const d = inLeft ? 1 : -1;
+        el("path", { class: "sym", d: `M${cx - 6 * d},${y0 - 6} L${cx + 6 * d},${y0} L${cx - 6 * d},${y0 + 6} Z` }, g);
+      }
+      text(g, cx, top - 4, partLabel(part) + (pair.name ? " " + pair.name : ""), "ref", "end");
+      text(g, cx + 4, top - 4, clip(part.value, 12), "val");
+      const pinNum = (end, x, anchor) => {
+        if (!end.pin) return;
+        const isMarked = marked.has(part.refdes + ":" + end.pin.pin);
+        text(g, x, y0 - 4, end.pin.pin, "pnum" + (isMarked ? " startpin" : ""), anchor);
+      };
+      pinNum(l, bx - 3, "end");
+      pinNum(r, xr + 3, "start");
+      markPin(part, l.pin, bx, y0);
+      markPin(part, r.pin, xr, y0);
+      if (it.gate) {
+        const yb = top + THRH, yg = yb + 14;
+        line(g, cx, yb, cx, yg);
+        const gp = it.gate.pin;
+        if (gp) text(g, cx + 4, yb + 10, gp.pin, "pnum" + (marked.has(part.refdes + ":" + gp.pin) ? " startpin" : ""));
+        if (it.gate.kind === "bus") {
+          // The gate's net is drawn as a bus elsewhere: name it here.
+          const t = text(g, cx, yg + 12, clip(shortRail(gp.net), 16), "netname", "middle");
+          title(t, "gate on " + gp.net);
+        } else {
+          terminal(g, cx, yg, it.gate, "down", lead);
+        }
+        markPin(part, gp, cx, yg);
+      }
+      maxX = Math.max(maxX, xr + (r.kind === "bus" ? 0 : 90));
     } else if (it.type === "box") {
       const part = it.part;
       const g = partGroup(part);
@@ -713,7 +823,6 @@ function render(data) {
     else if (n.state === "depth_limit") notes.push("depth limit");
     else if (n.state === "dangling") notes.push("dangling");
     else if (n.state === "rail") notes.push("rail");
-    else if (n.state === "past_through") notes.push("reached past a through part, parts not drawn");
     if (n.omitted_parts) notes.push("+" + n.omitted_parts + " parts cut");
     if (notes.length) text(g, x, TOP - 33, notes.join(", "), "note", "middle");
     if (n.state !== "expanded") line(g, x, yBot, x, yBot + 14, "bus cont");
@@ -742,8 +851,10 @@ function render(data) {
   notes.innerHTML = "";
   const note = (s) => { const p = document.createElement("p"); p.textContent = s; notes.appendChild(p); };
   if (topo.truncated) {
-    note("Drawing cut by max_topology_parts: " + topo.omitted_parts + " parts and " +
-      topo.omitted_nets + " nets left out.");
+    note(topo.omitted_parts || topo.omitted_nets
+      ? "Drawing cut by max_topology_parts: " + topo.omitted_parts + " parts and " +
+        topo.omitted_nets + " nets left out. Boxes or pins of drawn parts may be missing too."
+      : "Drawing cut by max_topology_parts: some boxes or pins of drawn parts were left out.");
   }
   // `truncated` is also set by max_net_expansions; then the depth or
   // endpoint limit may or may not have been hit too.
@@ -752,6 +863,8 @@ function render(data) {
     "list in the result, not the drawing. Nets marked \"depth limit\" were not walked past.");
   if (data.expansions_capped) note("Routes past through-model parts were dropped at max_net_expansions, " +
     "so an endpoint can be missing.");
+  if (topo.chain_check_capped) note("The route check through multi-pair parts ran out of steps, " +
+    "so a route or shunt the walk does not take may be drawn.");
   if (data.path && data.note) note(data.note);
   if (!topo.parts.length) note("No parts to draw.");
 

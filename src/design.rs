@@ -2316,8 +2316,8 @@ impl Design {
         // next entry, and the check runs again, since a refilled series
         // part or pair adds nets. A skipped entry is not looked at again
         // inside the loop; one that a later pass gave a pin is kept after
-        // it, in its place. Series and pair entries list all their pins, so only part
-        // entries are skipped, and each pass skips one or more: at most
+        // it, in its place. Series and pair entries list all their pins, so
+        // only part entries are skipped, and each pass skips one or more: at most
         // `order.len()` passes.
         let mut skipped: HashSet<(usize, Option<usize>)> = HashSet::new();
         let (end, kept_nets, boxed) = loop {

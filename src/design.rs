@@ -2318,7 +2318,7 @@ impl Design {
         // are skipped, and each pass skips one or more: at most
         // `order.len()` passes.
         let mut skipped: HashSet<(usize, Option<usize>)> = HashSet::new();
-        let (mut order, cut) = loop {
+        let (mut order, cut, kept_nets, boxed) = loop {
             let (mut kept, mut cut) = (Vec::new(), Vec::new());
             for e in &order {
                 if kept.len() < max_parts && !skipped.contains(&e.key()) {
@@ -2334,20 +2334,18 @@ impl Design {
                 kept.iter().filter(|e| listed_pins(e, &kept_nets, &boxed).is_empty()).map(TopoEntry::key),
             );
             if skipped.len() == before {
-                break (kept, cut);
+                break (kept, cut, kept_nets, boxed);
             }
         };
 
-        let kept_nets = series_nets(&order);
         // `kept_nets` is a subset of `nets`: `walk_bfs` notes every net it
         // pops and every far-side net of a series part or pair it crosses,
         // and `path_topology` keeps every net of the parts it keeps.
         debug_assert!(kept_nets.iter().all(|n| nets.iter().any(|(t, _)| t == n)));
         let omitted_nets = nets.len().saturating_sub(kept_nets.len());
 
-        // Pins drawn on a kept pair's box, not again on their part's box.
-        let boxed = boxed_by(&order);
-        // A dropped entry comes back when the cap cut the box of one of its
+        // `boxed`: pins drawn on a kept pair's box, not again on their part's
+        // box. A dropped entry comes back when the cap cut the box of one of its
         // pins and that pin sits on a drawn net that is not a rail. It takes
         // no slot, so the drawing can then list more than `max_parts`
         // entries. It adds no net and no box, so `kept_nets` and `boxed`

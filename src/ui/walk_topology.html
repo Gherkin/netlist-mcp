@@ -853,8 +853,8 @@ function render(data) {
   if (topo.truncated) {
     note(topo.omitted_parts || topo.omitted_nets
       ? "Drawing cut by max_topology_parts: " + topo.omitted_parts + " parts and " +
-        topo.omitted_nets + " nets left out."
-      : "Drawing cut by max_topology_parts: some boxes of drawn parts were left out.");
+        topo.omitted_nets + " nets left out. Boxes or pins of drawn parts may be missing too."
+      : "Drawing cut by max_topology_parts: some boxes or pins of drawn parts were left out.");
   }
   // `truncated` is also set by max_net_expansions; then the depth or
   // endpoint limit may or may not have been hit too.

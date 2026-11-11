@@ -197,9 +197,10 @@ struct WalkParams {
     include_topology: Option<bool>,
     /// Max parts in `topology` (default 200, minimum 1; 0 is read as 1),
     /// nearest to the start first. A part with no pin left to draw takes no
-    /// slot; it comes back past the cap if a later slot gives it one. A part whose pin was on a cut through-pair box comes
-    /// back past the cap when that pin sits on a drawn net that is not a
-    /// rail, so `parts` can be longer.
+    /// slot; it is drawn in its place if a later slot gives it one. A part
+    /// whose pin was on a cut through-pair box comes back past the cap when
+    /// that pin sits on a drawn net that is not a rail, so `parts` can be
+    /// longer.
     /// Nets only the cut parts reach are left out too. `topology.truncated`
     /// and the `omitted_parts`/`omitted_nets` counts report the cut; the
     /// top-level `omitted_parts` counts parts not drawn at all, a net's own
@@ -230,9 +231,10 @@ struct DrawWalkParams {
     stop_at_power: Option<bool>,
     /// Max parts drawn (default 200, minimum 1; 0 is read as 1), nearest to
     /// the start first. A part with no pin left to draw takes no slot; it
-    /// comes back past the cap if a later slot gives it one. A part whose pin was on a cut through-pair box is drawn past the
-    /// cap when that pin sits on a drawn net that is not a rail. The drawing
-    /// says when parts were cut.
+    /// is drawn in its place if a later slot gives it one. A part whose pin
+    /// was on a cut through-pair box is drawn past the cap when that pin sits
+    /// on a drawn net that is not a rail. The drawing says when parts were
+    /// cut.
     #[serde(default)]
     max_topology_parts: Option<u32>,
     #[doc = max_net_expansions_doc!()]
@@ -267,7 +269,10 @@ struct PathBetweenParams {
     include_topology: Option<bool>,
     /// Max parts in `topology` (default 200, minimum 2: the `from` and `to`
     /// pins are always drawn, on their part or on a through-pair box).
-    /// Route parts are kept before shunts, shunts before other ICs.
+    /// Route parts are kept before shunts, shunts before other ICs. A part
+    /// with no pin left to draw takes no slot. A part whose pin was on a cut
+    /// through-pair box comes back past the cap when that pin sits on a drawn
+    /// net that is not a rail, so `parts` can be longer.
     /// `topology.truncated` and the `omitted_*` counts report the cut.
     #[serde(default)]
     max_topology_parts: Option<u32>,
@@ -286,8 +291,10 @@ struct DrawPathBetweenParams {
     to: String,
     /// Max parts drawn (default 200, minimum 2: the `from` and `to` pins
     /// are always drawn, on their part or on a through-pair box). Route
-    /// parts are kept before shunts, shunts before other ICs. The drawing
-    /// says when parts were cut.
+    /// parts are kept before shunts, shunts before other ICs. A part with no
+    /// pin left to draw takes no slot. A part whose pin was on a cut
+    /// through-pair box is drawn past the cap when that pin sits on a drawn
+    /// net that is not a rail. The drawing says when parts were cut.
     #[serde(default)]
     max_topology_parts: Option<u32>,
     #[doc = max_net_expansions_doc!()]

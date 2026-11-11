@@ -2315,18 +2315,21 @@ impl Design {
         // Those are skipped and take no slot; the freed slot goes to the
         // next entry, and the check runs again, since a refilled series
         // part or pair adds nets. A skipped entry is not looked at again
-        // inside the loop; one that a later pass gave a pin comes back
-        // below. Series and pair entries list all their pins, so only part
+        // inside the loop; one that a later pass gave a pin is kept after
+        // it, in its place. Series and pair entries list all their pins, so only part
         // entries are skipped, and each pass skips one or more: at most
         // `order.len()` passes.
         let mut skipped: HashSet<(usize, Option<usize>)> = HashSet::new();
-        let (mut order, mut cut, kept_nets, boxed) = loop {
-            let (mut kept, mut cut) = (Vec::new(), Vec::new());
-            for e in &order {
-                if kept.len() < max_parts && !skipped.contains(&e.key()) {
+        let (end, kept_nets, boxed) = loop {
+            // `end`: just past the last kept entry.
+            let (mut kept, mut end) = (Vec::new(), 0);
+            for (i, e) in order.iter().enumerate() {
+                if kept.len() == max_parts {
+                    break;
+                }
+                if !skipped.contains(&e.key()) {
                     kept.push(*e);
-                } else {
-                    cut.push(*e);
+                    end = i + 1;
                 }
             }
             let kept_nets = series_nets(&kept);
@@ -2336,9 +2339,17 @@ impl Design {
                 kept.iter().filter(|e| listed_pins(e, &kept_nets, &boxed).is_empty()).map(TopoEntry::key),
             );
             if skipped.len() == before {
-                break (kept, cut, kept_nets, boxed);
+                break (end, kept_nets, boxed);
             }
         };
+        // Every entry before `end` was kept or skipped. The kept ones have a
+        // pin to draw; a skipped one that a later pass gave a pin comes back
+        // in its place. Part entries add no net and no box, so `kept_nets`
+        // and `boxed` stay as they are.
+        let mut cut = order.split_off(end);
+        let (mut order, pinless): (Vec<TopoEntry>, Vec<TopoEntry>) =
+            order.into_iter().partition(|e| !listed_pins(e, &kept_nets, &boxed).is_empty());
+        cut.extend(pinless);
 
         // `kept_nets` is a subset of `nets`: `walk_bfs` notes every net it
         // pops and every far-side net of a series part or pair it crosses,
@@ -2359,15 +2370,8 @@ impl Design {
                     && net_of(p).is_some_and(|n| kept_nets.contains(&n) && !rail_nets.contains(&n))
             })
         }));
-        // A skipped entry that a later pass gave a pin to draw comes back
-        // the same way: past the cap, no slot, no net and no box added.
-        let (restored, still_cut): (Vec<TopoEntry>, Vec<TopoEntry>) = cut.into_iter().partition(|e| {
-            skipped.contains(&e.key()) && !listed_pins(e, &kept_nets, &boxed).is_empty()
-        });
-        order.extend(restored);
-        cut = still_cut;
-        // Every kept entry has a pin to draw: the cap loop skipped the
-        // others, and a restored entry lists the pin it came back for.
+        // Every kept entry has a pin to draw: the partition above cut the
+        // others, and a restored dropped entry lists the pin it came back for.
         let order_pins: Vec<(TopoEntry, Vec<usize>)> =
             order.into_iter().map(|e| (e, listed_pins(&e, &kept_nets, &boxed))).collect();
         debug_assert!(order_pins.iter().all(|(_, pins)| !pins.is_empty()));
@@ -8844,14 +8848,19 @@ mod walk_oracle_tests {
         if missing.is_empty() { Ok(()) } else { Err(format!("pairs not drawn: {missing:?}")) }
     }
 
+    /// A topology entry's identity: refdes, role and pair pins.
+    fn entry_key(p: &serde_json::Value) -> (String, String, String) {
+        (p["refdes"].to_string(), p["role"].to_string(), p["pair"]["pins"].to_string())
+    }
+
     /// PR #69 round 3: when the capped drawing has fewer than `cap` parts, a
     /// slot is free, so the cap cut nothing: each of `full`'s entries is in
     /// `capped`, part entries too (round 4: a skipped part entry that a later
-    /// pass gave a pin comes back). (Restored entries can fill the count,
-    /// which only skips the check.)
+    /// pass gave a pin comes back). Restored entries can fill the count; then
+    /// `check_skipped_restored` runs instead.
     fn check_free_slot(full: &serde_json::Value, capped: &serde_json::Value, cap: usize) -> Result<(), String> {
-        let key = |p: &serde_json::Value| (p["refdes"].to_string(), p["role"].to_string(), p["pair"]["pins"].to_string());
-        let wired = |t: &serde_json::Value| -> BTreeSet<_> { t["parts"].as_array().unwrap().iter().map(key).collect() };
+        let wired =
+            |t: &serde_json::Value| -> BTreeSet<_> { t["parts"].as_array().unwrap().iter().map(entry_key).collect() };
         if capped["parts"].as_array().unwrap().len() >= cap {
             return check_skipped_restored(full, capped);
         }
@@ -8863,10 +8872,10 @@ mod walk_oracle_tests {
     /// each one in `capped` took a slot, and every entry ahead of it in the
     /// order (`full`'s list) was kept or skipped. A skipped part entry with a
     /// pin to draw in `capped` comes back, so a part entry ahead of the last
-    /// kept series part or box, with a pin on a drawn net that is not a rail
-    /// and not on one of its own boxes, is in `capped`.
+    /// kept series part or box, with a pin on a drawn net (rails too, as in
+    /// the cap loop) and not on one of its own boxes, is in `capped`.
     fn check_skipped_restored(full: &serde_json::Value, capped: &serde_json::Value) -> Result<(), String> {
-        let key = |p: &serde_json::Value| (p["refdes"].to_string(), p["role"].to_string(), p["pair"]["pins"].to_string());
+        let key = entry_key;
         let fparts = full["parts"].as_array().unwrap();
         let cparts = capped["parts"].as_array().unwrap();
         let ckeys: BTreeSet<_> = cparts.iter().map(key).collect();
@@ -8882,7 +8891,6 @@ mod walk_oracle_tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|n| n["rail"] != true)
             .map(|n| n["name"].as_str().unwrap())
             .collect();
         let boxed: BTreeSet<(String, String)> = cparts
@@ -8932,7 +8940,8 @@ mod walk_oracle_tests {
                 }
                 // Every slot draws a pin (PR #69 round 3): only part entries
                 // left with no pin are skipped, so a drawing with a free slot
-                // kept every series part and pair box of the uncapped one.
+                // kept every entry of the uncapped one; a full one kept every
+                // skipped entry that has a pin to draw (round 4).
                 let cap = 1 + rng.below(4) as u32;
                 let c: serde_json::Value =
                     serde_json::from_str(&d.walk(start, max_depth, 100_000, true, true, cap, 8).unwrap()).unwrap();
